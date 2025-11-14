@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import joblib
+import io
 
 from features import (
     get_r2_client,
@@ -32,10 +33,15 @@ def load_models_and_meta(s3, bucket):
     cls_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_cls.pkl")
     meta_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_meta.json")
 
-    reg = joblib.load(reg_obj["Body"])
-    cls = joblib.load(cls_obj["Body"])
-    meta = json.loads(meta_obj["Body"].read())
+    # Read raw bytes from S3
+    reg_bytes = reg_obj["Body"].read()
+    cls_bytes = cls_obj["Body"].read()
 
+    # Wrap in BytesIO so joblib can seek
+    reg = joblib.load(io.BytesIO(reg_bytes))
+    cls = joblib.load(io.BytesIO(cls_bytes))
+
+    meta = json.loads(meta_obj["Body"].read())
     return reg, cls, meta
 
 
