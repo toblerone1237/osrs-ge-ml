@@ -23,8 +23,9 @@ MARGIN = 0.002            # extra 0.2% above tax for "profitable"
 
 def build_training_dataframe(s3, bucket):
     now = datetime.now(timezone.utc)
-    start_date = (now - timedelta(days=WINDOW_DAYS)).date()
-    end_date = (now - timedelta(days=1)).date()
+    start_date = (now - timedelta(days=WINDOW_DAYS - 1)).date()
+    end_date = now.date()  # include today
+
 
     chunks = []
     d = start_date
