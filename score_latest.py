@@ -1,11 +1,11 @@
 import os
 import json
-from datetime import datetime, timezone
+import io
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
 import joblib
-import io
 
 from features import (
     get_r2_client,
@@ -14,41 +14,14 @@ from features import (
     add_basic_features,
 )
 
-def load_latest_mapping(s3, bucket):
-    # Get all daily snapshot keys
-    keys = list_keys_with_prefix(s3, bucket, "daily/")
-    if not keys:
-        return {}
-
-    keys.sort()
-    latest_key = keys[-1]  # last one is the most recent date
-    obj = s3.get_object(Bucket=bucket, Key=latest_key)
-    snap = json.loads(obj["Body"].read())
-
-    mapping = snap.get("mapping", [])
-    id_to_meta = {}
-
-    for item in mapping:
-        # item looks like {"id": 4151, "name": "Abyssal whip", "members": true, "limit": 70, ...}
-        item_id = item.get("id")
-        if item_id is None:
-            continue
-        # ensure int
-        try:
-            iid = int(item_id)
-        except ValueError:
-            continue
-
-        id_to_meta[iid] = item
-
-    return id_to_meta
-    
 
 def get_latest_5m_key(s3, bucket):
+    """
+    Find the latest 5m snapshot key by looking at today then yesterday.
+    """
     now = datetime.now(timezone.utc)
-    # try today, then yesterday
     for delta in [0, 1]:
-        d = (now - pd.Timedelta(days=delta)).date()
+        d = (now - timedelta(days=delta)).date()
         prefix = f"5m/{d.year}/{d.month:02d}/{d.day:02d}/"
         keys = list_keys_with_prefix(s3, bucket, prefix)
         if keys:
@@ -58,26 +31,71 @@ def get_latest_5m_key(s3, bucket):
 
 
 def load_models_and_meta(s3, bucket):
+    """
+    Load the latest regression + classification models and meta from R2.
+    """
     reg_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_reg.pkl")
     cls_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_cls.pkl")
     meta_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_meta.json")
 
-    # Read raw bytes from S3
+    # Read raw bytes and wrap in BytesIO so joblib can seek
     reg_bytes = reg_obj["Body"].read()
     cls_bytes = cls_obj["Body"].read()
 
-    # Wrap in BytesIO so joblib can seek
     reg = joblib.load(io.BytesIO(reg_bytes))
     cls = joblib.load(io.BytesIO(cls_bytes))
-
     meta = json.loads(meta_obj["Body"].read())
+
     return reg, cls, meta
+
+
+def load_item_name_map(s3, bucket):
+    """
+    Load the latest daily snapshot from R2 and build {item_id: name}.
+    Assumes daily keys like daily/YYYY/MM/DD.json or similar.
+    Looks back up to 7 days just in case.
+    """
+    now = datetime.now(timezone.utc)
+    daily_key = None
+
+    for delta in range(0, 7):
+        d = (now - timedelta(days=delta)).date()
+        prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        contents = resp.get("Contents")
+        if contents:
+            # Take the first key we see for that day
+            daily_key = contents[0]["Key"]
+            break
+
+    if not daily_key:
+        print("No daily snapshot found for mapping.")
+        return {}
+
+    print("Using daily snapshot for mapping:", daily_key)
+    obj = s3.get_object(Bucket=bucket, Key=daily_key)
+    daily = json.loads(obj["Body"].read())
+
+    mapping_list = daily.get("mapping", [])
+    id_to_name = {}
+    for entry in mapping_list:
+        try:
+            item_id = int(entry.get("id"))
+        except (TypeError, ValueError):
+            continue
+        name = entry.get("name")
+        if name:
+            id_to_name[item_id] = name
+
+    print(f"Loaded {len(id_to_name)} item names from mapping.")
+    return id_to_name
 
 
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
+    # 1) latest 5m snapshot
     latest_key = get_latest_5m_key(s3, bucket)
     if not latest_key:
         print("No 5m snapshot found.")
@@ -93,12 +111,16 @@ def main():
     df = df.dropna(subset=["mid_price"])
     df = df[df["mid_price"] > 0]
 
+    # 2) load models + meta
     reg, cls, meta = load_models_and_meta(s3, bucket)
     feature_cols = meta["feature_cols"]
     H = meta["horizon_minutes"]
     tax = meta["tax_rate"]
-    item_meta = load_latest_mapping(s3, bucket)
 
+    # 3) load item name map from latest daily snapshot
+    id_to_name = load_item_name_map(s3, bucket)
+
+    # 4) build features and predictions
     X = df[feature_cols].values
 
     future_ret = reg.predict(X)
@@ -118,34 +140,29 @@ def main():
     df["expected_profit"] = profit
     df["expected_profit_per_second"] = profit_per_sec
 
+    # 5) filter and rank candidates
     mask = (df["expected_profit"] > 0) & (df["prob_profit"] > 0.55)
     candidates = df[mask].copy()
     candidates.sort_values("expected_profit_per_second", ascending=False, inplace=True)
 
+    # 6) build signals list with item names
     signals = []
     for _, row in candidates.head(200).iterrows():
         item_id = int(row["item_id"])
-        meta_info = item_meta.get(item_id, {})
-        name = meta_info.get("name")
-        limit_ = meta_info.get("limit")  # optional, used later for buy limits
-    
-        signal = {
-            "item_id": item_id,
-            "mid_now": float(row["mid_price"]),
-            "future_return_hat": float(row["future_return_hat"]),
-            "prob_profit": float(row["prob_profit"]),
-            "expected_profit": float(row["expected_profit"]),
-            "expected_profit_per_second": float(row["expected_profit_per_second"]),
-            "hold_minutes": H,
-        }
-    
-        if name is not None:
-            signal["name"] = name
-        if limit_ is not None:
-            signal["buy_limit"] = int(limit_)
-    
-        signals.append(signal)
+        name = id_to_name.get(item_id)
 
+        signals.append(
+            {
+                "item_id": item_id,
+                "name": name,  # may be null if mapping doesn't have it
+                "mid_now": float(row["mid_price"]),
+                "future_return_hat": float(row["future_return_hat"]),
+                "prob_profit": float(row["prob_profit"]),
+                "expected_profit": float(row["expected_profit"]),
+                "expected_profit_per_second": float(row["expected_profit_per_second"]),
+                "hold_minutes": H,
+            }
+        )
 
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
