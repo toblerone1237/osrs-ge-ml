@@ -49,23 +49,46 @@ def load_models_and_meta(s3, bucket):
     return reg, cls, meta
 
 
+def _find_mapping_list(obj):
+    """
+    Recursively search a nested JSON object for a list of dicts
+    that look like OSRS mapping entries (have 'id' and 'name' keys).
+    """
+    if isinstance(obj, list):
+        if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
+            return obj
+        for el in obj:
+            res = _find_mapping_list(el)
+            if res is not None:
+                return res
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            res = _find_mapping_list(v)
+            if res is not None:
+                return res
+    return None
+
+
 def load_item_name_map(s3, bucket):
     """
     Load the latest daily snapshot from R2 and build {item_id: name}.
-    Assumes daily keys like daily/YYYY/MM/DD.json or similar.
-    Looks back up to 7 days just in case.
+
+    - Looks for the most recent daily/YYYY/MM/DD* key (today, then back 7 days).
+    - Recursively searches the JSON for a list of objects with 'id' and 'name' keys.
     """
     now = datetime.now(timezone.utc)
     daily_key = None
 
+    # Try today, then up to 6 days back
     for delta in range(0, 7):
         d = (now - timedelta(days=delta)).date()
         prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
         resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
         contents = resp.get("Contents")
         if contents:
-            # Take the first key we see for that day
-            daily_key = contents[0]["Key"]
+            # sort by key and pick the last one (most specific / latest)
+            contents.sort(key=lambda x: x["Key"])
+            daily_key = contents[-1]["Key"]
             break
 
     if not daily_key:
@@ -76,7 +99,11 @@ def load_item_name_map(s3, bucket):
     obj = s3.get_object(Bucket=bucket, Key=daily_key)
     daily = json.loads(obj["Body"].read())
 
-    mapping_list = daily.get("mapping", [])
+    mapping_list = _find_mapping_list(daily)
+    if mapping_list is None:
+        print("No mapping list with id+name found inside daily snapshot.")
+        return {}
+
     id_to_name = {}
     for entry in mapping_list:
         try:
@@ -89,6 +116,7 @@ def load_item_name_map(s3, bucket):
 
     print(f"Loaded {len(id_to_name)} item names from mapping.")
     return id_to_name
+
 
 
 def main():
