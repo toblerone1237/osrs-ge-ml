@@ -14,6 +14,35 @@ from features import (
     add_basic_features,
 )
 
+def load_latest_mapping(s3, bucket):
+    # Get all daily snapshot keys
+    keys = list_keys_with_prefix(s3, bucket, "daily/")
+    if not keys:
+        return {}
+
+    keys.sort()
+    latest_key = keys[-1]  # last one is the most recent date
+    obj = s3.get_object(Bucket=bucket, Key=latest_key)
+    snap = json.loads(obj["Body"].read())
+
+    mapping = snap.get("mapping", [])
+    id_to_meta = {}
+
+    for item in mapping:
+        # item looks like {"id": 4151, "name": "Abyssal whip", "members": true, "limit": 70, ...}
+        item_id = item.get("id")
+        if item_id is None:
+            continue
+        # ensure int
+        try:
+            iid = int(item_id)
+        except ValueError:
+            continue
+
+        id_to_meta[iid] = item
+
+    return id_to_meta
+    
 
 def get_latest_5m_key(s3, bucket):
     now = datetime.now(timezone.utc)
@@ -68,6 +97,7 @@ def main():
     feature_cols = meta["feature_cols"]
     H = meta["horizon_minutes"]
     tax = meta["tax_rate"]
+    item_meta = load_latest_mapping(s3, bucket)
 
     X = df[feature_cols].values
 
@@ -94,17 +124,28 @@ def main():
 
     signals = []
     for _, row in candidates.head(200).iterrows():
-        signals.append(
-            {
-                "item_id": int(row["item_id"]),
-                "mid_now": float(row["mid_price"]),
-                "future_return_hat": float(row["future_return_hat"]),
-                "prob_profit": float(row["prob_profit"]),
-                "expected_profit": float(row["expected_profit"]),
-                "expected_profit_per_second": float(row["expected_profit_per_second"]),
-                "hold_minutes": H,
-            }
-        )
+        item_id = int(row["item_id"])
+        meta_info = item_meta.get(item_id, {})
+        name = meta_info.get("name")
+        limit_ = meta_info.get("limit")  # optional, used later for buy limits
+    
+        signal = {
+            "item_id": item_id,
+            "mid_now": float(row["mid_price"]),
+            "future_return_hat": float(row["future_return_hat"]),
+            "prob_profit": float(row["prob_profit"]),
+            "expected_profit": float(row["expected_profit"]),
+            "expected_profit_per_second": float(row["expected_profit_per_second"]),
+            "hold_minutes": H,
+        }
+    
+        if name is not None:
+            signal["name"] = name
+        if limit_ is not None:
+            signal["buy_limit"] = int(limit_)
+    
+        signals.append(signal)
+
 
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
