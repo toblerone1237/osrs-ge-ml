@@ -14,13 +14,17 @@ from features import (
     add_basic_features,
 )
 
+# --------------------------------------------------------------------
+# Helpers to find the latest 5m snapshot and to load models + item map
+# --------------------------------------------------------------------
 
-def get_latest_5m_key(s3, bucket):
+
+def get_latest_5m_key(s3, bucket: str) -> str | None:
     """
-    Find the latest 5m snapshot key by looking at today then yesterday.
+    Find the latest 5m snapshot key by checking today, then yesterday.
     """
     now = datetime.now(timezone.utc)
-    for delta in [0, 1]:
+    for delta in (0, 1):
         d = (now - timedelta(days=delta)).date()
         prefix = f"5m/{d.year}/{d.month:02d}/{d.day:02d}/"
         keys = list_keys_with_prefix(s3, bucket, prefix)
@@ -30,10 +34,14 @@ def get_latest_5m_key(s3, bucket):
     return None
 
 
-def load_models_and_meta(s3, bucket):
+def load_models_and_meta(s3, bucket: str):
     """
-    Load the latest regression models (dict of horizon -> regressor),
-    the 60m classifier, and meta from R2.
+    Load multi-horizon regressors + classifier + meta from R2.
+
+    Assumes:
+      - models/xgb/latest_reg.pkl     => dict[horizon_minutes] -> XGBRegressor
+      - models/xgb/latest_cls.pkl     => XGBClassifier
+      - models/xgb/latest_meta.json   => metadata dict
     """
     reg_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_reg.pkl")
     cls_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_cls.pkl")
@@ -42,17 +50,17 @@ def load_models_and_meta(s3, bucket):
     reg_bytes = reg_obj["Body"].read()
     cls_bytes = cls_obj["Body"].read()
 
-    reg_models = joblib.load(io.BytesIO(reg_bytes))  # dict: {horizon_minutes: model}
+    reg_by_horizon = joblib.load(io.BytesIO(reg_bytes))
     cls = joblib.load(io.BytesIO(cls_bytes))
     meta = json.loads(meta_obj["Body"].read())
 
-    return reg_models, cls, meta
+    return reg_by_horizon, cls, meta
 
 
 def _find_mapping_list(obj):
     """
-    Recursively search a nested JSON object for a list of dicts
-    that look like OSRS mapping entries (have 'id' and 'name' keys).
+    Recursively search a nested JSON object for a list of dicts that look
+    like OSRS wiki 'mapping' entries (must have 'id' and 'name').
     """
     if isinstance(obj, list):
         if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
@@ -69,16 +77,15 @@ def _find_mapping_list(obj):
     return None
 
 
-def load_item_name_map(s3, bucket):
+def load_item_name_map(s3, bucket: str) -> dict[int, str]:
     """
-    Load the latest daily snapshot from R2 and build {item_id: name}.
-
-    - Looks for the most recent daily/YYYY/MM/DD* key (today, then back 7 days).
-    - Recursively searches the JSON for a list of objects with 'id' and 'name' keys.
+    Load the latest daily snapshot and build {item_id: name} from the wiki
+    mapping it contains.
     """
     now = datetime.now(timezone.utc)
     daily_key = None
 
+    # Try today and up to 6 days back
     for delta in range(0, 7):
         d = (now - timedelta(days=delta)).date()
         prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
@@ -102,7 +109,7 @@ def load_item_name_map(s3, bucket):
         print("No mapping list with id+name found inside daily snapshot.")
         return {}
 
-    id_to_name = {}
+    id_to_name: dict[int, str] = {}
     for entry in mapping_list:
         try:
             item_id = int(entry.get("id"))
@@ -116,23 +123,16 @@ def load_item_name_map(s3, bucket):
     return id_to_name
 
 
-def _get_reg_for_horizon(reg_models, h):
-    """
-    Robustly fetch the regressor for a given horizon (int minutes),
-    handling both int and string keys just in case.
-    """
-    if h in reg_models:
-        return reg_models[h]
-    if str(h) in reg_models:
-        return reg_models[str(h)]
-    return None
+# --------------------------------------------------------------------
+# Main scoring
+# --------------------------------------------------------------------
 
 
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
-    # 1) latest 5m snapshot
+    # 1) Get the latest 5m snapshot and flatten it
     latest_key = get_latest_5m_key(s3, bucket)
     if not latest_key:
         print("No 5m snapshot found.")
@@ -144,128 +144,154 @@ def main():
         print("Snapshot empty.")
         return
 
+    # 2) Basic features + clean
     df = add_basic_features(df)
     df = df.dropna(subset=["mid_price"])
     df = df[df["mid_price"] > 0].copy()
 
-    # 2) load models + meta
-    reg_models, cls, meta = load_models_and_meta(s3, bucket)
+    # At this point we expect:
+    #   columns: timestamp, item_id, avg_high_price, avg_low_price,
+    #   high_volume, low_volume, mid_price, spread, spread_pct,
+    #   total_volume_5m, log_volume_5m
+
+    # 3) Load models + meta
+    reg_by_horizon, cls, meta = load_models_and_meta(s3, bucket)
+
     feature_cols = meta["feature_cols"]
-    H_main = int(meta["horizon_minutes"])
-    tax = float(meta["tax_rate"])
-    path_horizons = meta.get("path_horizons_minutes", [H_main])
-    path_horizons = [int(h) for h in path_horizons]
+    tax = float(meta.get("tax_rate", 0.02))
+    main_horizon = int(meta.get("horizon_minutes", 60))
 
-    # Only keep horizons we actually have models for
-    path_horizons = [h for h in path_horizons if _get_reg_for_horizon(reg_models, h) is not None]
-    if H_main not in path_horizons:
-        path_horizons.append(H_main)
-    path_horizons = sorted(set(path_horizons))
+    # Horizons for the path (list of minutes, e.g. [5,10,...,120])
+    path_horizons = meta.get("path_horizons_minutes")
+    if not path_horizons:
+        # fall back to whatever keys the reg dict has
+        # (keys might be ints or strings)
+        keys = []
+        for k in reg_by_horizon.keys():
+            try:
+                keys.append(int(k))
+            except Exception:
+                continue
+        path_horizons = sorted(set(keys))
 
-    # 3) load item name map from latest daily snapshot
-    id_to_name = load_item_name_map(s3, bucket)
+    print("Main horizon:", main_horizon, "minutes.")
+    print("Path horizons:", path_horizons)
 
-    # 4) build features
+    # 4) Build feature matrix
     X = df[feature_cols].values
-    mid = df["mid_price"].values
 
-    # 4a) main horizon prediction (for profit / ranking)
-    main_reg = _get_reg_for_horizon(reg_models, H_main)
-    if main_reg is None:
-        print(f"No regression model found for main horizon {H_main}m.")
-        return
+    # 5) Predict returns for each horizon
+    # reg_by_horizon keys may be ints or strings; support both.
+    def _get_reg(h):
+        if h in reg_by_horizon:
+            return reg_by_horizon[h]
+        if str(h) in reg_by_horizon:
+            return reg_by_horizon[str(h)]
+        return None
 
-    future_ret_main = main_reg.predict(X)
-    prob_profit = cls.predict_proba(X)[:, 1]
-
-    # 4b) full path predictions for all horizons
-    path_predictions = {}
+    path_preds: dict[int, np.ndarray] = {}
     for h in path_horizons:
-        reg_h = _get_reg_for_horizon(reg_models, h)
+        reg_h = _get_reg(h)
         if reg_h is None:
+            print(f"[warn] No regressor for horizon {h}m in model dict.")
             continue
-        path_predictions[h] = reg_h.predict(X)
+        print(f"[score] Predicting horizon {h}m for {len(df)} rows.")
+        path_preds[h] = reg_h.predict(X)
 
-    # Align predictions with df index for easy lookup
-    path_pred_series = {
-        h: pd.Series(path_predictions[h], index=df.index) for h in path_predictions
-    }
+    # Main horizon: use its predictions if present, otherwise whatever reg is available
+    main_ret = path_preds.get(main_horizon)
+    if main_ret is None:
+        print(f"[warn] main_horizon {main_horizon}m not found in path_preds; "
+              f"using first available reg instead.")
+        # Pick the first available
+        if path_preds:
+            some_h = next(iter(path_preds.keys()))
+            main_ret = path_preds[some_h]
+        else:
+            # Absolute fallback: try any reg in dict
+            some_reg = next(iter(reg_by_horizon.values()))
+            main_ret = some_reg.predict(X)
 
-    # 5) profit metrics at main horizon
-    df["future_return_hat"] = future_ret_main
+    # 6) Probability of profit from classifier (main horizon)
+    try:
+        prob_profit = cls.predict_proba(X)[:, 1]
+    except Exception as e:
+        print("[warn] classifier predict_proba failed:", e)
+        prob_profit = np.full(len(df), 0.5, dtype=float)
+
+    df["future_return_hat"] = main_ret
     df["prob_profit"] = prob_profit
 
-    mid_future = mid * (1.0 + future_ret_main)
+    mid = df["mid_price"].values.astype(float)
     buy_price = mid
+    mid_future = buy_price * (1.0 + main_ret)
     net_sell = mid_future * (1.0 - tax)
     profit = net_sell - buy_price
-    hold_seconds = H_main * 60.0
+    hold_seconds = main_horizon * 60.0
     profit_per_sec = profit / hold_seconds
 
     df["expected_profit"] = profit
     df["expected_profit_per_second"] = profit_per_sec
 
-    # 6) filter and rank candidates
-        # 5) filter and rank candidates
-    # Primary filter: positive expected profit AND reasonably high probability
-    PROB_THRESHOLD = 0.55
-    candidates = df[(df["expected_profit"] > 0) & (df["prob_profit"] > PROB_THRESHOLD)].copy()
+    # 7) Load item -> name map
+    id_to_name = load_item_name_map(s3, bucket)
 
-    # Fallback: if we don't have at least 10, relax the probability filter
-    if len(candidates) < 10:
-        print(
-            f"Only {len(candidates)} candidates with prob_profit > {PROB_THRESHOLD}, "
-            "falling back to all with positive expected_profit."
-        )
-        candidates = df[df["expected_profit"] > 0].copy()
-
-    candidates.sort_values("expected_profit_per_second", ascending=False, inplace=True)
-
-
-    # 7) build signals list with item names + full path
+    # 8) Build multi-horizon path predictions per row
+    # path_preds[h] is a numpy array aligned with df.index
     signals = []
-    top_n = 200
-    for idx, row in candidates.head(top_n).iterrows():
+
+    # For convenience when iterating
+    path_horizons_sorted = sorted(path_horizons)
+
+    for idx, row in df.iterrows():
         item_id = int(row["item_id"])
         name = id_to_name.get(item_id)
-        mid_now = float(row["mid_price"])
 
-        # Build this item's path from all horizons we have
         path = []
-        for h in sorted(path_pred_series.keys()):
-            val = path_pred_series[h].loc[idx]
-            if not np.isfinite(val):
+        for h in path_horizons_sorted:
+            preds_h = path_preds.get(h)
+            if preds_h is None:
                 continue
+            r = float(preds_h[idx])
             path.append(
                 {
                     "minutes": int(h),
-                    "future_return_hat": float(val),
+                    "future_return_hat": r,
                 }
             )
 
         signals.append(
             {
                 "item_id": item_id,
-                "name": name,  # may be null if mapping doesn't have it
-                "mid_now": mid_now,
-                "future_return_hat": float(row["future_return_hat"]),  # main horizon
+                "name": name,  # may be None if not found in mapping
+                "mid_now": float(row["mid_price"]),
+                "future_return_hat": float(row["future_return_hat"]),
                 "prob_profit": float(row["prob_profit"]),
                 "expected_profit": float(row["expected_profit"]),
-                "expected_profit_per_second": float(row["expected_profit_per_second"]),
-                "hold_minutes": int(H_main),
+                "expected_profit_per_second": float(
+                    row["expected_profit_per_second"]
+                ),
+                "hold_minutes": int(main_horizon),
                 "path": path,
             }
         )
 
+    # Sort signals mainly for convenience (UI resorts anyway)
+    signals.sort(
+        key=lambda s: s.get("expected_profit_per_second", 0.0),
+        reverse=True,
+    )
+
+    # 9) Write signals/latest.json + dated copy
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
     time_part = now.strftime("%H-%M")
 
     out = {
         "generated_at_iso": now.isoformat(),
-        "horizon_minutes": int(H_main),
-        "tax_rate": tax,
-        "path_horizons_minutes": sorted(path_pred_series.keys()),
+        "horizon_minutes": int(main_horizon),
+        "tax_rate": float(tax),
+        "path_horizons_minutes": [int(h) for h in path_horizons_sorted],
         "signals": signals,
     }
     body = json.dumps(out).encode("utf-8")
@@ -273,10 +299,20 @@ def main():
     latest_key = "signals/latest.json"
     dated_key = f"signals/{date_part}/{time_part}.json"
 
-    s3.put_object(Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json")
-    s3.put_object(Bucket=bucket, Key=dated_key, Body=body, ContentType="application/json")
+    s3.put_object(
+        Bucket=bucket,
+        Key=latest_key,
+        Body=body,
+        ContentType="application/json",
+    )
+    s3.put_object(
+        Bucket=bucket,
+        Key=dated_key,
+        Body=body,
+        ContentType="application/json",
+    )
 
-    print(f"Wrote {len(signals)} signals.")
+    print(f"Wrote {len(signals)} signals (all items in latest snapshot).")
 
 
 if __name__ == "__main__":
