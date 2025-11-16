@@ -38,8 +38,10 @@ def load_models_and_meta(s3, bucket: str):
     """
     Load multi-horizon regressors + classifier + meta from R2.
 
-    Assumes:
-      - models/xgb/latest_reg.pkl     => dict[horizon_minutes] -> XGBRegressor
+    Expected layout (from updated train_model.py):
+      - models/xgb/latest_reg.pkl     => either:
+            * dict[horizon_minutes] -> XGBRegressor
+            * or dict with key "regs" containing that mapping
       - models/xgb/latest_cls.pkl     => XGBClassifier
       - models/xgb/latest_meta.json   => metadata dict
     """
@@ -50,9 +52,23 @@ def load_models_and_meta(s3, bucket: str):
     reg_bytes = reg_obj["Body"].read()
     cls_bytes = cls_obj["Body"].read()
 
-    reg_by_horizon = joblib.load(io.BytesIO(reg_bytes))
+    reg_bundle = joblib.load(io.BytesIO(reg_bytes))
     cls = joblib.load(io.BytesIO(cls_bytes))
     meta = json.loads(meta_obj["Body"].read())
+
+    # Normalise to a dict[horizon] -> regressor
+    if hasattr(reg_bundle, "predict"):
+        # Single model only – treat as dict with one horizon (main horizon).
+        main_h = int(meta.get("horizon_minutes", 60))
+        reg_by_horizon = {main_h: reg_bundle}
+    elif isinstance(reg_bundle, dict):
+        # Could be {h: reg} or {"regs": {h: reg}, ...}
+        if "regs" in reg_bundle and isinstance(reg_bundle["regs"], dict):
+            reg_by_horizon = reg_bundle["regs"]
+        else:
+            reg_by_horizon = reg_bundle
+    else:
+        raise TypeError("Unsupported reg_bundle type: %r" % type(reg_bundle))
 
     return reg_by_horizon, cls, meta
 
@@ -148,11 +164,8 @@ def main():
     df = add_basic_features(df)
     df = df.dropna(subset=["mid_price"])
     df = df[df["mid_price"] > 0].copy()
-
-    # At this point we expect:
-    #   columns: timestamp, item_id, avg_high_price, avg_low_price,
-    #   high_volume, low_volume, mid_price, spread, spread_pct,
-    #   total_volume_5m, log_volume_5m
+    # Very important: make index 0..N-1 so prediction arrays align with row positions
+    df.reset_index(drop=True, inplace=True)
 
     # 3) Load models + meta
     reg_by_horizon, cls, meta = load_models_and_meta(s3, bucket)
@@ -161,11 +174,10 @@ def main():
     tax = float(meta.get("tax_rate", 0.02))
     main_horizon = int(meta.get("horizon_minutes", 60))
 
-    # Horizons for the path (list of minutes, e.g. [5,10,...,120])
+    # Horizons for the path (e.g. [5,10,...,120])
     path_horizons = meta.get("path_horizons_minutes")
     if not path_horizons:
-        # fall back to whatever keys the reg dict has
-        # (keys might be ints or strings)
+        # Fall back to any keys we can parse as ints
         keys = []
         for k in reg_by_horizon.keys():
             try:
@@ -181,7 +193,6 @@ def main():
     X = df[feature_cols].values
 
     # 5) Predict returns for each horizon
-    # reg_by_horizon keys may be ints or strings; support both.
     def _get_reg(h):
         if h in reg_by_horizon:
             return reg_by_horizon[h]
@@ -198,17 +209,17 @@ def main():
         print(f"[score] Predicting horizon {h}m for {len(df)} rows.")
         path_preds[h] = reg_h.predict(X)
 
-    # Main horizon: use its predictions if present, otherwise whatever reg is available
+    # Main horizon: use its predictions if present, otherwise first available
     main_ret = path_preds.get(main_horizon)
     if main_ret is None:
-        print(f"[warn] main_horizon {main_horizon}m not found in path_preds; "
-              f"using first available reg instead.")
-        # Pick the first available
+        print(
+            f"[warn] main_horizon {main_horizon}m not found in path_preds; "
+            f"using first available reg instead."
+        )
         if path_preds:
             some_h = next(iter(path_preds.keys()))
             main_ret = path_preds[some_h]
         else:
-            # Absolute fallback: try any reg in dict
             some_reg = next(iter(reg_by_horizon.values()))
             main_ret = some_reg.predict(X)
 
@@ -236,23 +247,25 @@ def main():
     # 7) Load item -> name map
     id_to_name = load_item_name_map(s3, bucket)
 
-    # 8) Build multi-horizon path predictions per row
-    # path_preds[h] is a numpy array aligned with df.index
+    # 8) Build multi-horizon path predictions per row (ALL items)
     signals = []
-
-    # For convenience when iterating
+    N = len(df)
     path_horizons_sorted = sorted(path_horizons)
 
-    for idx, row in df.iterrows():
+    for i in range(N):
+        row = df.iloc[i]
         item_id = int(row["item_id"])
         name = id_to_name.get(item_id)
 
+        # For each horizon we stored predictions for,
+        # grab the i-th prediction from path_preds[h].
         path = []
         for h in path_horizons_sorted:
             preds_h = path_preds.get(h)
             if preds_h is None:
                 continue
-            r = float(preds_h[idx])
+            # preds_h is length N, indexed 0..N-1
+            r = float(preds_h[i])
             path.append(
                 {
                     "minutes": int(h),
@@ -263,7 +276,7 @@ def main():
         signals.append(
             {
                 "item_id": item_id,
-                "name": name,  # may be None if not found in mapping
+                "name": name,  # may be None if mapping doesn't have it
                 "mid_now": float(row["mid_price"]),
                 "future_return_hat": float(row["future_return_hat"]),
                 "prob_profit": float(row["prob_profit"]),
@@ -276,13 +289,13 @@ def main():
             }
         )
 
-    # Sort signals mainly for convenience (UI resorts anyway)
+    # 9) Sort signals by expected_profit_per_second (UI still picks top 10)
     signals.sort(
         key=lambda s: s.get("expected_profit_per_second", 0.0),
         reverse=True,
     )
 
-    # 9) Write signals/latest.json + dated copy
+    # 10) Write signals/latest.json + dated copy
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
     time_part = now.strftime("%H-%M")
