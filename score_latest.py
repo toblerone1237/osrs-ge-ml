@@ -206,9 +206,21 @@ def main():
     df["expected_profit_per_second"] = profit_per_sec
 
     # 6) filter and rank candidates
-    mask = (df["expected_profit"] > 0) & (df["prob_profit"] > 0.55)
-    candidates = df[mask].copy()
+        # 5) filter and rank candidates
+    # Primary filter: positive expected profit AND reasonably high probability
+    PROB_THRESHOLD = 0.55
+    candidates = df[(df["expected_profit"] > 0) & (df["prob_profit"] > PROB_THRESHOLD)].copy()
+
+    # Fallback: if we don't have at least 10, relax the probability filter
+    if len(candidates) < 10:
+        print(
+            f"Only {len(candidates)} candidates with prob_profit > {PROB_THRESHOLD}, "
+            "falling back to all with positive expected_profit."
+        )
+        candidates = df[df["expected_profit"] > 0].copy()
+
     candidates.sort_values("expected_profit_per_second", ascending=False, inplace=True)
+
 
     # 7) build signals list with item names + full path
     signals = []
