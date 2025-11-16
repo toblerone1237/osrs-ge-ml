@@ -32,21 +32,21 @@ def get_latest_5m_key(s3, bucket):
 
 def load_models_and_meta(s3, bucket):
     """
-    Load the latest regression + classification models and meta from R2.
+    Load the latest regression models (dict of horizon -> regressor),
+    the 60m classifier, and meta from R2.
     """
     reg_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_reg.pkl")
     cls_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_cls.pkl")
     meta_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_meta.json")
 
-    # Read raw bytes and wrap in BytesIO so joblib can seek
     reg_bytes = reg_obj["Body"].read()
     cls_bytes = cls_obj["Body"].read()
 
-    reg = joblib.load(io.BytesIO(reg_bytes))
+    reg_models = joblib.load(io.BytesIO(reg_bytes))  # dict: {horizon_minutes: model}
     cls = joblib.load(io.BytesIO(cls_bytes))
     meta = json.loads(meta_obj["Body"].read())
 
-    return reg, cls, meta
+    return reg_models, cls, meta
 
 
 def _find_mapping_list(obj):
@@ -79,14 +79,12 @@ def load_item_name_map(s3, bucket):
     now = datetime.now(timezone.utc)
     daily_key = None
 
-    # Try today, then up to 6 days back
     for delta in range(0, 7):
         d = (now - timedelta(days=delta)).date()
         prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
         resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
         contents = resp.get("Contents")
         if contents:
-            # sort by key and pick the last one (most specific / latest)
             contents.sort(key=lambda x: x["Key"])
             daily_key = contents[-1]["Key"]
             break
@@ -118,6 +116,17 @@ def load_item_name_map(s3, bucket):
     return id_to_name
 
 
+def _get_reg_for_horizon(reg_models, h):
+    """
+    Robustly fetch the regressor for a given horizon (int minutes),
+    handling both int and string keys just in case.
+    """
+    if h in reg_models:
+        return reg_models[h]
+    if str(h) in reg_models:
+        return reg_models[str(h)]
+    return None
+
 
 def main():
     bucket = os.environ["R2_BUCKET"]
@@ -137,58 +146,102 @@ def main():
 
     df = add_basic_features(df)
     df = df.dropna(subset=["mid_price"])
-    df = df[df["mid_price"] > 0]
+    df = df[df["mid_price"] > 0].copy()
 
     # 2) load models + meta
-    reg, cls, meta = load_models_and_meta(s3, bucket)
+    reg_models, cls, meta = load_models_and_meta(s3, bucket)
     feature_cols = meta["feature_cols"]
-    H = meta["horizon_minutes"]
-    tax = meta["tax_rate"]
+    H_main = int(meta["horizon_minutes"])
+    tax = float(meta["tax_rate"])
+    path_horizons = meta.get("path_horizons_minutes", [H_main])
+    path_horizons = [int(h) for h in path_horizons]
+
+    # Only keep horizons we actually have models for
+    path_horizons = [h for h in path_horizons if _get_reg_for_horizon(reg_models, h) is not None]
+    if H_main not in path_horizons:
+        path_horizons.append(H_main)
+    path_horizons = sorted(set(path_horizons))
 
     # 3) load item name map from latest daily snapshot
     id_to_name = load_item_name_map(s3, bucket)
 
-    # 4) build features and predictions
+    # 4) build features
     X = df[feature_cols].values
+    mid = df["mid_price"].values
 
-    future_ret = reg.predict(X)
+    # 4a) main horizon prediction (for profit / ranking)
+    main_reg = _get_reg_for_horizon(reg_models, H_main)
+    if main_reg is None:
+        print(f"No regression model found for main horizon {H_main}m.")
+        return
+
+    future_ret_main = main_reg.predict(X)
     prob_profit = cls.predict_proba(X)[:, 1]
 
-    df["future_return_hat"] = future_ret
+    # 4b) full path predictions for all horizons
+    path_predictions = {}
+    for h in path_horizons:
+        reg_h = _get_reg_for_horizon(reg_models, h)
+        if reg_h is None:
+            continue
+        path_predictions[h] = reg_h.predict(X)
+
+    # Align predictions with df index for easy lookup
+    path_pred_series = {
+        h: pd.Series(path_predictions[h], index=df.index) for h in path_predictions
+    }
+
+    # 5) profit metrics at main horizon
+    df["future_return_hat"] = future_ret_main
     df["prob_profit"] = prob_profit
 
-    mid = df["mid_price"].values
-    mid_future = mid * (1 + future_ret)
+    mid_future = mid * (1.0 + future_ret_main)
     buy_price = mid
-    net_sell = mid_future * (1 - tax)
+    net_sell = mid_future * (1.0 - tax)
     profit = net_sell - buy_price
-    hold_seconds = H * 60
+    hold_seconds = H_main * 60.0
     profit_per_sec = profit / hold_seconds
 
     df["expected_profit"] = profit
     df["expected_profit_per_second"] = profit_per_sec
 
-    # 5) filter and rank candidates
+    # 6) filter and rank candidates
     mask = (df["expected_profit"] > 0) & (df["prob_profit"] > 0.55)
     candidates = df[mask].copy()
     candidates.sort_values("expected_profit_per_second", ascending=False, inplace=True)
 
-    # 6) build signals list with item names
+    # 7) build signals list with item names + full path
     signals = []
-    for _, row in candidates.head(200).iterrows():
+    top_n = 200
+    for idx, row in candidates.head(top_n).iterrows():
         item_id = int(row["item_id"])
         name = id_to_name.get(item_id)
+        mid_now = float(row["mid_price"])
+
+        # Build this item's path from all horizons we have
+        path = []
+        for h in sorted(path_pred_series.keys()):
+            val = path_pred_series[h].loc[idx]
+            if not np.isfinite(val):
+                continue
+            path.append(
+                {
+                    "minutes": int(h),
+                    "future_return_hat": float(val),
+                }
+            )
 
         signals.append(
             {
                 "item_id": item_id,
                 "name": name,  # may be null if mapping doesn't have it
-                "mid_now": float(row["mid_price"]),
-                "future_return_hat": float(row["future_return_hat"]),
+                "mid_now": mid_now,
+                "future_return_hat": float(row["future_return_hat"]),  # main horizon
                 "prob_profit": float(row["prob_profit"]),
                 "expected_profit": float(row["expected_profit"]),
                 "expected_profit_per_second": float(row["expected_profit_per_second"]),
-                "hold_minutes": H,
+                "hold_minutes": int(H_main),
+                "path": path,
             }
         )
 
@@ -198,8 +251,9 @@ def main():
 
     out = {
         "generated_at_iso": now.isoformat(),
-        "horizon_minutes": H,
+        "horizon_minutes": int(H_main),
         "tax_rate": tax,
+        "path_horizons_minutes": sorted(path_pred_series.keys()),
         "signals": signals,
     }
     body = json.dumps(out).encode("utf-8")
