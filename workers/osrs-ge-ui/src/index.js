@@ -1277,6 +1277,7 @@ async function handlePriceSeries(env, itemId) {
         sampledOlder.push(olderKeys[i]);
       }
     }
+  }
 
     const sampledKeys = sampledOlder.concat(recentKeys);
     if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
