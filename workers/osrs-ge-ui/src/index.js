@@ -1272,6 +1272,35 @@ function sampleSnapshotKeys(selectedKeys) {
   return sampledKeys;
 }
 
+async function readSnapshotJson(env, key, maxAttempts = 2) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const obj = await env.OSRS_BUCKET.get(key).then(
+      (res) => res,
+      (err) => {
+        lastError = err;
+        return null;
+      }
+    );
+    if (!obj) return null;
+
+    const snap = await obj.json().then(
+      (json) => json,
+      (err) => {
+        lastError = err;
+        return null;
+      }
+    );
+    if (snap) return snap;
+  }
+
+  if (lastError) {
+    console.error("Failed to read snapshot", key, lastError);
+  }
+  return null;
+}
+
 async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, budgetMs) {
   const history = [];
   const BATCH_SIZE = 8;
@@ -1286,20 +1315,8 @@ async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, bud
     const batch = sampledKeys.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
       batch.map(async (key) => {
-        let snap = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            const obj = await env.OSRS_BUCKET.get(key);
-            if (!obj) return null;
-            snap = await obj.json();
-            break;
-          } catch (err) {
-            if (attempt === 1) {
-              console.error("Failed to read snapshot", key, err);
-              return null;
-            }
-          }
-        }
+        const snap = await readSnapshotJson(env, key);
+        if (!snap) return null;
 
         const fm = snap && (snap.five_minute || snap["five_minute"]);
         if (!fm || !fm.data) return null;
@@ -1332,100 +1349,50 @@ async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, bud
 
 async function buildForecast(env, itemId, history) {
   const forecast = [];
-  try {
-    const sigObj = await env.OSRS_BUCKET.get("signals/latest.json");
-    if (sigObj) {
-      const sigJson = await sigObj.json();
-      const signals = sigJson.signals || [];
-      const s = signals.find(
-        (row) => row.item_id === itemId || String(row.item_id) === String(itemId)
-      );
-      if (s && Array.isArray(s.path) && typeof s.mid_now === "number") {
-        const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
+  const sigObj = await env.OSRS_BUCKET.get("signals/latest.json").catch((err) => {
+    console.error("Error fetching signals for forecast:", err);
+    return null;
+  });
+  if (!sigObj) return forecast;
 
-        const baseTimeMs = history.length
-          ? new Date(history[history.length - 1].timestamp_iso).getTime()
-          : Date.now();
+  const sigJson = await sigObj.json().catch((err) => {
+    console.error("Error parsing signals for forecast:", err);
+    return null;
+  });
+  if (!sigJson) return forecast;
 
-        // Anchor the forecast to the last history timestamp so the lines connect
-        forecast.push({
-          timestamp_iso: new Date(baseTimeMs).toISOString(),
-          price: anchorMid
-        });
+  const signals = sigJson.signals || [];
+  const s = signals.find((row) => row.item_id === itemId || String(row.item_id) === String(itemId));
+  if (!s || !Array.isArray(s.path) || typeof s.mid_now !== "number") return forecast;
 
-    history.sort((a, b) => a.timestamp_iso.localeCompare(b.timestamp_iso));
+  const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
 
-    // Forecast from signals/latest.json path anchored to last history mid price
-    const forecast = [];
-    try {
-      const sigObj = await env.OSRS_BUCKET.get("signals/latest.json");
-      if (sigObj) {
-        const sigJson = await sigObj.json();
-        const signals = sigJson.signals || [];
-        const s = signals.find(
-          (row) => row.item_id === itemId || String(row.item_id) === String(itemId)
-        );
-        if (s && Array.isArray(s.path) && typeof s.mid_now === "number") {
-          const anchorMid = history.length
-            ? history[history.length - 1].price
-            : s.mid_now;
+  const baseTimeMs = history.length
+    ? new Date(history[history.length - 1].timestamp_iso).getTime()
+    : Date.now();
 
-          const baseTimeMs = history.length
-            ? new Date(history[history.length - 1].timestamp_iso).getTime()
-            : Date.now();
+  // Anchor the forecast to the last history timestamp so the lines connect
+  forecast.push({
+    timestamp_iso: new Date(baseTimeMs).toISOString(),
+    price: anchorMid
+  });
 
-          // Anchor the forecast to the last history timestamp so the lines connect
-          forecast.push({
-            timestamp_iso: new Date(baseTimeMs).toISOString(),
-            price: anchorMid
-          });
-
-          for (const p of s.path) {
-            if (!p || typeof p.minutes !== "number" || typeof p.future_return_hat !== "number") {
-              continue;
-            }
-            const minutes = p.minutes;
-            const ret = p.future_return_hat;
-
-            // Optional mild clamp to avoid absurd spikes
-            const clampedRet = Math.max(-0.8, Math.min(3.0, ret));
-
-            const price = anchorMid * (1 + clampedRet);
-            const tsIso = new Date(baseTimeMs + minutes * 60000).toISOString();
-            forecast.push({
-              timestamp_iso: tsIso,
-              price: price
-            });
-          }
-        }
-      }
-    } catch (err) {
-      console.error("Error building forecast from signals:", err);
+  for (const p of s.path) {
+    if (!p || typeof p.minutes !== "number" || typeof p.future_return_hat !== "number") {
+      continue;
     }
+    const minutes = p.minutes;
+    const ret = p.future_return_hat;
 
-    body = JSON.stringify({
-      item_id: itemId,
-      history: history,
-      forecast: forecast,
-      meta: { truncated, source: "fresh" }
+    // Optional mild clamp to avoid absurd spikes
+    const clampedRet = Math.max(-0.8, Math.min(3.0, ret));
+
+    const price = anchorMid * (1 + clampedRet);
+    const tsIso = new Date(baseTimeMs + minutes * 60000).toISOString();
+    forecast.push({
+      timestamp_iso: tsIso,
+      price: price
     });
-    setCachedPriceSeries(cacheKey, body);
-  } catch (err) {
-    console.error("Error building price series:", err);
-    if (stale) {
-      return new Response(stale, {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Price-Series-Stale": "1"
-        }
-      });
-    }
-
-    return new Response(
-      JSON.stringify({ error: "Failed to build price series, please retry." }),
-      { status: 503, headers: { "Content-Type": "application/json" } }
-    );
   }
 
   return forecast;
