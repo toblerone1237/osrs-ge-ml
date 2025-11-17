@@ -173,7 +173,7 @@ const HTML = `<!DOCTYPE html>
   <header>
     <h1>OSRS GE – ML Trades &amp; Price Forecast</h1>
     <p>
-      Top 10 model picks by net profit % (after tax) plus recent mid prices and a 5–120 minute price forecast.
+      Top picks weighted by win probability, expected profit, and 24h liquidity plus recent mid prices and a 5–120 minute price forecast.
       You can pin items to keep a watchlist and use search to jump to any item.
     </p>
   </header>
@@ -184,7 +184,7 @@ const HTML = `<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>Top 10 items by net profit %</h2>
+      <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
         Click a row to see roughly the last 3 hours of 5-minute mid prices and a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
@@ -540,6 +540,13 @@ const HTML = `<!DOCTYPE html>
               ? vols[s.item_id]
               : null;
 
+          const probProfit =
+            typeof s.prob_profit === "number" ? s.prob_profit : 0;
+          const liquidityBoost =
+            vol24 && vol24 > 0 ? Math.log10(vol24 + 10) : 1;
+          const probAdjustedProfit = probProfit * netProfit;
+          const score = probAdjustedProfit * liquidityBoost;
+
           const entry = pinnedState[keyStr];
           const isPinned = !!(entry && entry.pinned);
 
@@ -549,19 +556,22 @@ const HTML = `<!DOCTYPE html>
             buy_price: mid,
             target_sell_price: mid * (1 + grossRet),
             mid_now: mid,
-            prob_profit: s.prob_profit,
+            prob_profit: probProfit,
             netProfit: netProfit,
             netPct: netPct,
             grossPct: grossPct,
             vol24: vol24,
             hold_minutes: s.hold_minutes || MODEL_HORIZON,
             pinned: isPinned,
-            gpPerSec: gpPerSec
+            gpPerSec: gpPerSec,
+            score: score
           };
         });
 
       enriched.sort(function (a, b) {
-        return b.netPct - a.netPct;
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.netPct !== a.netPct) return b.netPct - a.netPct;
+        return (b.vol24 || 0) - (a.vol24 || 0);
       });
 
       const top10 = enriched.slice(0, 10);
