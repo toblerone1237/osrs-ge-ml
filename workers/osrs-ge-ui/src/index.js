@@ -1208,17 +1208,25 @@ async function handlePriceSeries(env, itemId) {
   const selectedKeys = keys.slice(-MAX_SNAPSHOTS);
 
   // Downsample snapshot fetches to avoid timeouts while still covering the full window.
-  const MAX_HISTORY_POINTS = 720; // ~30m resolution across 14 days
-  const stride = Math.max(1, Math.ceil(selectedKeys.length / MAX_HISTORY_POINTS));
-  const sampledKeys = [];
-  for (let i = 0; i < selectedKeys.length; i += stride) {
-    sampledKeys.push(selectedKeys[i]);
+  // Keep the most recent 24h at full (5m) resolution and aggressively sample the
+  // older portion to stay within a tighter fetch budget.
+  const MAX_FETCH_KEYS = 420; // hard cap on snapshot fetches per request
+  const RECENT_FULL_WINDOW = 24 * 12; // last 24h of 5m snapshots
+
+  const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
+  const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
+
+  const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
+  const sampledOlder = [];
+  if (olderKeys.length && remainingBudget > 0) {
+    const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
+    for (let i = 0; i < olderKeys.length; i += olderStride) {
+      sampledOlder.push(olderKeys[i]);
+    }
   }
-  if (sampledKeys.length === 0 && selectedKeys.length > 0) {
-    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
-  } else if (
-    sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]
-  ) {
+
+  const sampledKeys = sampledOlder.concat(recentKeys);
+  if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
     sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
   }
 
