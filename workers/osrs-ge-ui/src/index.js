@@ -173,7 +173,7 @@ const HTML = `<!DOCTYPE html>
   <header>
     <h1>OSRS GE – ML Trades &amp; Price Forecast</h1>
     <p>
-      Top 10 model picks by net profit % (after tax) plus recent mid prices and a 5–120 minute price forecast.
+      Top picks weighted by win probability, expected profit, and 24h liquidity plus recent mid prices and a 5–120 minute price forecast.
       You can pin items to keep a watchlist and use search to jump to any item.
     </p>
   </header>
@@ -184,7 +184,7 @@ const HTML = `<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>Top 10 items by net profit %</h2>
+      <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
         Click a row to see roughly the last 3 hours of 5-minute mid prices and a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
@@ -348,15 +348,43 @@ const HTML = `<!DOCTYPE html>
       mappingList = out;
     }
 
-    function togglePin(itemId, name, buttonEl) {
+    async function snapshotForecastAtStar(itemId) {
+      try {
+        const res = await fetch(
+          "/price-series?item_id=" + encodeURIComponent(itemId)
+        );
+        if (!res.ok) return null;
+        const data = await res.json();
+        const history = Array.isArray(data.history) ? data.history : [];
+        const forecast = Array.isArray(data.forecast) ? data.forecast : [];
+
+        const starTimeIso = history.length
+          ? history[history.length - 1].timestamp_iso
+          : new Date().toISOString();
+
+        return {
+          starredAtIso: starTimeIso,
+          forecastAtStar: forecast
+        };
+      } catch (err) {
+        console.error("Failed to snapshot forecast on pin:", err);
+        return null;
+      }
+    }
+
+    async function togglePin(itemId, name, buttonEl) {
       const state = loadPinnedState();
       const key = String(itemId);
       let entry = state[key];
+      const wasPinned = !!(entry && entry.pinned);
+
       if (!entry) {
         entry = {
           name: name,
           pinned: true,
-          pinnedAtIso: new Date().toISOString()
+          pinnedAtIso: new Date().toISOString(),
+          starredAtIso: null,
+          forecastAtStar: []
         };
       } else {
         entry.pinned = !entry.pinned;
@@ -365,6 +393,17 @@ const HTML = `<!DOCTYPE html>
           entry.pinnedAtIso = new Date().toISOString();
         }
       }
+
+      if (!wasPinned && entry.pinned) {
+        const snap = await snapshotForecastAtStar(itemId);
+        if (snap) {
+          entry.starredAtIso = snap.starredAtIso;
+          entry.forecastAtStar = snap.forecastAtStar;
+        } else if (!entry.starredAtIso) {
+          entry.starredAtIso = entry.pinnedAtIso;
+        }
+      }
+
       state[key] = entry;
       savePinnedState(state);
 
@@ -423,9 +462,9 @@ const HTML = `<!DOCTYPE html>
         btn.type = "button";
         btn.className = "pin-btn pinned";
         btn.textContent = "★";
-        btn.addEventListener("click", function (ev) {
+        btn.addEventListener("click", async function (ev) {
           ev.stopPropagation();
-          togglePin(row.item_id, row.name, btn);
+          await togglePin(row.item_id, row.name, btn);
         });
         tdPin.appendChild(btn);
         tr.appendChild(tdPin);
@@ -501,6 +540,13 @@ const HTML = `<!DOCTYPE html>
               ? vols[s.item_id]
               : null;
 
+          const probProfit =
+            typeof s.prob_profit === "number" ? s.prob_profit : 0;
+          const liquidityBoost =
+            vol24 && vol24 > 0 ? Math.log10(vol24 + 10) : 1;
+          const probAdjustedProfit = probProfit * netProfit;
+          const score = probAdjustedProfit * liquidityBoost;
+
           const entry = pinnedState[keyStr];
           const isPinned = !!(entry && entry.pinned);
 
@@ -510,19 +556,22 @@ const HTML = `<!DOCTYPE html>
             buy_price: mid,
             target_sell_price: mid * (1 + grossRet),
             mid_now: mid,
-            prob_profit: s.prob_profit,
+            prob_profit: probProfit,
             netProfit: netProfit,
             netPct: netPct,
             grossPct: grossPct,
             vol24: vol24,
             hold_minutes: s.hold_minutes || MODEL_HORIZON,
             pinned: isPinned,
-            gpPerSec: gpPerSec
+            gpPerSec: gpPerSec,
+            score: score
           };
         });
 
       enriched.sort(function (a, b) {
-        return b.netPct - a.netPct;
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.netPct !== a.netPct) return b.netPct - a.netPct;
+        return (b.vol24 || 0) - (a.vol24 || 0);
       });
 
       const top10 = enriched.slice(0, 10);
@@ -562,9 +611,9 @@ const HTML = `<!DOCTYPE html>
         btn.type = "button";
         btn.className = "pin-btn " + (row.pinned ? "pinned" : "unpinned");
         btn.textContent = row.pinned ? "★" : "☆";
-        btn.addEventListener("click", function (ev) {
+        btn.addEventListener("click", async function (ev) {
           ev.stopPropagation();
-          togglePin(row.item_id, row.name, btn);
+          await togglePin(row.item_id, row.name, btn);
         });
         tdPin.appendChild(btn);
         tr.appendChild(tdPin);
@@ -704,9 +753,9 @@ const HTML = `<!DOCTYPE html>
         btn.type = "button";
         btn.className = "pin-btn " + (isPinned ? "pinned" : "unpinned");
         btn.textContent = isPinned ? "★" : "☆";
-        btn.addEventListener("click", function (ev) {
+        btn.addEventListener("click", async function (ev) {
           ev.stopPropagation();
-          togglePin(id, name, btn);
+          await togglePin(id, name, btn);
         });
         tdPin.appendChild(btn);
         tr.appendChild(tdPin);
@@ -742,10 +791,11 @@ const HTML = `<!DOCTYPE html>
       searchResultsEl.appendChild(table);
     }
 
-    function buildTimeline(history, forecast) {
+    function buildTimeline(history, forecast, starInfo) {
       const tsSet = new Set();
       const histMap = new Map();
       const fcMap = new Map();
+      const oldFcMap = new Map();
 
       history.forEach(function (pt) {
         const ts = new Date(pt.timestamp_iso).getTime();
@@ -759,6 +809,36 @@ const HTML = `<!DOCTYPE html>
         fcMap.set(ts, pt.price);
       });
 
+      const starForecast =
+        starInfo && Array.isArray(starInfo.forecastAtStar)
+          ? starInfo.forecastAtStar
+          : [];
+      starForecast.forEach(function (pt) {
+        const ts = new Date(pt.timestamp_iso).getTime();
+        tsSet.add(ts);
+        oldFcMap.set(ts, pt.price);
+      });
+
+      const nowTs = history.length
+        ? new Date(history[history.length - 1].timestamp_iso).getTime()
+        : forecast.length
+        ? new Date(forecast[0].timestamp_iso).getTime()
+        : null;
+
+      const rawStarTs = starInfo && starInfo.starredAtIso
+        ? new Date(starInfo.starredAtIso).getTime()
+        : null;
+      const starTs =
+        rawStarTs != null && histMap.size && !histMap.has(rawStarTs)
+          ? new Date(history[history.length - 1].timestamp_iso).getTime()
+          : rawStarTs;
+      if (starTs != null) {
+        tsSet.add(starTs);
+      }
+      if (nowTs != null) {
+        tsSet.add(nowTs);
+      }
+
       const tsList = Array.from(tsSet);
       tsList.sort(function (a, b) {
         return a - b;
@@ -767,6 +847,9 @@ const HTML = `<!DOCTYPE html>
       const labels = [];
       const histData = [];
       const fcData = [];
+      const oldFcData = [];
+      const starMarkerData = [];
+      const nowMarkerData = [];
 
       tsList.forEach(function (ts) {
         const d = new Date(ts);
@@ -775,10 +858,31 @@ const HTML = `<!DOCTYPE html>
         labels.push(label);
 
         histData.push(histMap.has(ts) ? histMap.get(ts) : null);
-        fcData.push(fcMap.has(ts) ? fcMap.get(ts) : null);
+
+        const isFutureOrNow = nowTs == null || ts >= nowTs;
+        fcData.push(isFutureOrNow && fcMap.has(ts) ? fcMap.get(ts) : null);
+
+        const isAfterStar = starTs == null || ts >= starTs;
+        oldFcData.push(isAfterStar && oldFcMap.has(ts) ? oldFcMap.get(ts) : null);
+
+        starMarkerData.push(
+          starTs != null && ts === starTs
+            ? histMap.get(ts) || oldFcMap.get(ts) || null
+            : null
+        );
+        nowMarkerData.push(
+          nowTs != null && ts === nowTs ? histMap.get(ts) || null : null
+        );
       });
 
-      return { labels: labels, histData: histData, fcData: fcData };
+      return {
+        labels: labels,
+        histData: histData,
+        fcData: fcData,
+        oldFcData: oldFcData,
+        starMarkerData: starMarkerData,
+        nowMarkerData: nowMarkerData
+      };
     }
 
     async function loadPriceSeries(itemId, name) {
@@ -804,10 +908,22 @@ const HTML = `<!DOCTYPE html>
           return;
         }
 
-        const tl = buildTimeline(history, forecast);
+        const pinnedState = loadPinnedState();
+        const pinEntry = pinnedState[String(itemId)];
+        const starInfo = pinEntry && pinEntry.pinned
+          ? {
+              starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
+              forecastAtStar: pinEntry.forecastAtStar || []
+            }
+          : null;
+
+        const tl = buildTimeline(history, forecast, starInfo);
         const labels = tl.labels;
         const histData = tl.histData;
         const fcData = tl.fcData;
+        const oldFcData = tl.oldFcData;
+        const starMarkerData = tl.starMarkerData;
+        const nowMarkerData = tl.nowMarkerData;
 
         const allPrices = []
           .concat(histData, fcData)
@@ -827,31 +943,70 @@ const HTML = `<!DOCTYPE html>
           priceChart.destroy();
         }
 
+        const datasets = [
+          {
+            label: "Historical mid price (5m)",
+            data: histData,
+            borderColor: "rgba(59,130,246,1)",
+            backgroundColor: "rgba(59,130,246,0.2)",
+            pointRadius: 0,
+            borderWidth: 2,
+            tension: 0.15
+          },
+          {
+            label: "Forecast price (next 2h, 5m steps)",
+            data: fcData,
+            borderColor: "rgba(16,185,129,1)",
+            backgroundColor: "rgba(16,185,129,0.15)",
+            pointRadius: 0,
+            borderWidth: 2,
+            borderDash: [6, 3],
+            tension: 0.15
+          }
+        ];
+
+        if (starInfo && oldFcData.some(function (v) { return v != null; })) {
+          datasets.splice(1, 0, {
+            label: "Forecast at star time",
+            data: oldFcData,
+            borderColor: "rgba(234,179,8,1)",
+            backgroundColor: "rgba(234,179,8,0.1)",
+            pointRadius: 0,
+            borderWidth: 2,
+            borderDash: [5, 5],
+            tension: 0.15
+          });
+        }
+
+        if (starInfo) {
+          datasets.push({
+            label: "Current time",
+            data: nowMarkerData,
+            borderColor: "rgba(248,113,113,1)",
+            backgroundColor: "rgba(248,113,113,1)",
+            pointRadius: 5,
+            borderWidth: 0,
+            showLine: false
+          });
+        }
+
+        if (starInfo && starMarkerData.some(function (v) { return v != null; })) {
+          datasets.push({
+            label: "Starred at",
+            data: starMarkerData,
+            borderColor: "rgba(234,179,8,1)",
+            backgroundColor: "rgba(234,179,8,1)",
+            pointRadius: 5,
+            borderWidth: 0,
+            showLine: false
+          });
+        }
+
         priceChart = new Chart(ctx, {
           type: "line",
           data: {
             labels: labels,
-            datasets: [
-              {
-                label: "Historical mid price (5m)",
-                data: histData,
-                borderColor: "rgba(59,130,246,1)",
-                backgroundColor: "rgba(59,130,246,0.2)",
-                pointRadius: 0,
-                borderWidth: 2,
-                tension: 0.15
-              },
-              {
-                label: "Forecast price (next 2h, 5m steps)",
-                data: fcData,
-                borderColor: "rgba(16,185,129,1)",
-                backgroundColor: "rgba(16,185,129,0.15)",
-                pointRadius: 0,
-                borderWidth: 2,
-                borderDash: [6, 3],
-                tension: 0.15
-              }
-            ]
+            datasets: datasets
           },
           options: {
             responsive: true,
@@ -877,8 +1032,9 @@ const HTML = `<!DOCTYPE html>
           }
         });
 
-        priceStatusEl.textContent =
-          "Blue = actual prices; green = current forecast from the latest model (5–120 minute horizons).";
+        priceStatusEl.textContent = starInfo
+          ? "Blue = actual prices; green = current forecast from the latest model (5–120 minute horizons); yellow dashed = forecast captured when you starred the item."
+          : "Blue = actual prices; green = current forecast from the latest model (5–120 minute horizons).";
       } catch (err) {
         console.error(err);
         priceStatusEl.textContent = "Error loading price series: " + err.message;
@@ -1063,6 +1219,12 @@ async function handlePriceSeries(env, itemId) {
         const baseTimeMs = history.length
           ? new Date(history[history.length - 1].timestamp_iso).getTime()
           : Date.now();
+
+        // Anchor the forecast to the last history timestamp so the lines connect
+        forecast.push({
+          timestamp_iso: new Date(baseTimeMs).toISOString(),
+          price: anchorMid
+        });
 
         for (const p of s.path) {
           if (!p || typeof p.minutes !== "number" || typeof p.future_return_hat !== "number") {
