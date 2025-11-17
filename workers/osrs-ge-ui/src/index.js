@@ -1208,11 +1208,11 @@ async function handlePriceSeries(env, itemId) {
   const selectedKeys = keys.slice(-MAX_SNAPSHOTS);
 
   // Downsample snapshot fetches to avoid timeouts while still covering the full window.
-  // Keep the most recent 12h at full (5m) resolution and aggressively sample the
-  // older portion to stay within a tighter fetch budget. A tighter cap keeps the worker
-  // well below timeout thresholds that were still being hit at higher limits.
-  const MAX_FETCH_KEYS = 220; // hard cap on snapshot fetches per request
-  const RECENT_FULL_WINDOW = 12 * 12; // last 12h of 5m snapshots
+  // Keep the most recent 6h at full (5m) resolution and aggressively sample the
+  // older portion to stay within a tighter fetch budget. The lower cap keeps the worker
+  // comfortably within timeout thresholds observed in production.
+  const MAX_FETCH_KEYS = 150; // tighter hard cap on snapshot fetches per request
+  const RECENT_FULL_WINDOW = 6 * 12; // last 6h of 5m snapshots
 
   const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
   const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
@@ -1232,7 +1232,7 @@ async function handlePriceSeries(env, itemId) {
   }
 
   const history = [];
-  const BATCH_SIZE = 24;
+  const BATCH_SIZE = 12;
   for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
     const batch = sampledKeys.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
