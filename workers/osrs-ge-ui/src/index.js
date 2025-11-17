@@ -1431,6 +1431,38 @@ async function buildForecast(env, itemId, history) {
   return forecast;
 }
 
+async function buildPriceSeriesPayload(env, itemId, startedAt, budgetMs) {
+  const { selectedKeys, truncated: listTruncated } = await buildSnapshotKeys(
+    env,
+    startedAt,
+    budgetMs
+  );
+  let truncated = !!listTruncated;
+
+  const sampledKeys = sampleSnapshotKeys(selectedKeys);
+  const historyResult = await loadHistoryFromSnapshots(
+    env,
+    itemId,
+    sampledKeys,
+    startedAt,
+    budgetMs
+  );
+  truncated = truncated || historyResult.truncated;
+  const history = historyResult.history;
+
+  const forecast = await buildForecast(env, itemId, history);
+
+  return {
+    truncated,
+    body: JSON.stringify({
+      item_id: itemId,
+      history,
+      forecast,
+      meta: { truncated, source: "fresh" }
+    })
+  };
+}
+
 async function handlePriceSeries(env, itemId) {
   const cacheKey = String(itemId);
   const cached = getCachedPriceSeries(cacheKey);
@@ -1445,39 +1477,14 @@ async function handlePriceSeries(env, itemId) {
   const startedAt = Date.now();
   const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
 
-  let truncated = false;
-  let body;
+  const built = await buildPriceSeriesPayload(env, itemId, startedAt, BUILD_BUDGET_MS).catch(
+    (err) => {
+      console.error("Error building price series:", err);
+      return null;
+    }
+  );
 
-  try {
-    const { selectedKeys, truncated: listTruncated } = await buildSnapshotKeys(
-      env,
-      startedAt,
-      BUILD_BUDGET_MS
-    );
-    truncated = truncated || listTruncated;
-
-    const sampledKeys = sampleSnapshotKeys(selectedKeys);
-    const historyResult = await loadHistoryFromSnapshots(
-      env,
-      itemId,
-      sampledKeys,
-      startedAt,
-      BUILD_BUDGET_MS
-    );
-    truncated = truncated || historyResult.truncated;
-    const history = historyResult.history;
-
-    const forecast = await buildForecast(env, itemId, history);
-
-    body = JSON.stringify({
-      item_id: itemId,
-      history,
-      forecast,
-      meta: { truncated, source: "fresh" }
-    });
-    setCachedPriceSeries(cacheKey, body);
-  } catch (err) {
-    console.error("Error building price series:", err);
+  if (!built) {
     if (stale) {
       return new Response(stale, {
         status: 200,
@@ -1494,11 +1501,12 @@ async function handlePriceSeries(env, itemId) {
     );
   }
 
-  return new Response(body, {
+  setCachedPriceSeries(cacheKey, built.body);
+  return new Response(built.body, {
     status: 200,
     headers: {
       "Content-Type": "application/json",
-      ...(truncated ? { "X-Price-Series-Partial": "1" } : {})
+      ...(built.truncated ? { "X-Price-Series-Partial": "1" } : {})
     }
   });
 }
