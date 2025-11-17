@@ -1203,137 +1203,155 @@ async function handleDaily(env) {
 
 // Build price history (~14d of 5m mid prices) + forecast from signals.path,
 // anchoring the forecast to the last history mid price.
-async function handlePriceSeries(env, itemId) {
-  const cacheKey = String(itemId);
-  const cached = getCachedPriceSeries(cacheKey);
-  if (cached) {
-    return new Response(cached, {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
+async function buildSnapshotKeys(env, startedAt, budgetMs) {
+  const MAX_DAYS = 14;
+  const MAX_SNAPSHOTS = MAX_DAYS * 24 * 12; // 5m buckets
+  const now = new Date();
 
-  const stale = getCachedPriceSeries(cacheKey, { allowStale: true });
-  const startedAt = Date.now();
-  const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
+  const keys = [];
   let truncated = false;
-  let body;
 
-  try {
-    const MAX_DAYS = 14;
-    const MAX_SNAPSHOTS = MAX_DAYS * 24 * 12; // 5m buckets
-    const now = new Date();
+  for (let delta = 0; delta < MAX_DAYS && keys.length < MAX_SNAPSHOTS; delta++) {
+    if (Date.now() - startedAt > budgetMs) {
+      truncated = true;
+      break;
+    }
 
-    const keys = [];
+    const d = new Date(now.getTime() - delta * 86400000);
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    const prefix = "5m/" + year + "/" + month + "/" + day + "/";
 
-    // Collect snapshot keys from today backwards, up to the limit window
-    for (let delta = 0; delta < MAX_DAYS && keys.length < MAX_SNAPSHOTS; delta++) {
-      if (Date.now() - startedAt > BUILD_BUDGET_MS) {
+    let cursor;
+    while (true) {
+      const listing = await env.OSRS_BUCKET.list({ prefix, cursor, limit: 1000 });
+      for (const obj of listing.objects || []) {
+        keys.push(obj.key);
+      }
+      if (!listing.truncated) break;
+      if (Date.now() - startedAt > budgetMs) {
         truncated = true;
         break;
       }
-
-      const d = new Date(now.getTime() - delta * 86400000);
-      const year = d.getUTCFullYear();
-      const month = String(d.getUTCMonth() + 1).padStart(2, "0");
-      const day = String(d.getUTCDate()).padStart(2, "0");
-      const prefix = "5m/" + year + "/" + month + "/" + day + "/";
-
-      let cursor;
-      while (true) {
-        const listing = await env.OSRS_BUCKET.list({ prefix, cursor, limit: 1000 });
-        for (const obj of listing.objects || []) {
-          keys.push(obj.key);
-        }
-        if (!listing.truncated) break;
-        if (Date.now() - startedAt > BUILD_BUDGET_MS) {
-          truncated = true;
-          break;
-        }
-        cursor = listing.cursor;
-      }
-      if (keys.length >= MAX_SNAPSHOTS || truncated) break;
+      cursor = listing.cursor;
     }
+    if (keys.length >= MAX_SNAPSHOTS || truncated) break;
+  }
 
-    keys.sort();
-    const selectedKeys = keys.slice(-MAX_SNAPSHOTS);
+  keys.sort();
+  return { selectedKeys: keys.slice(-MAX_SNAPSHOTS), truncated };
+}
 
-    // Downsample snapshot fetches to avoid timeouts while still covering the full window.
-    // Keep the most recent 3h at full (5m) resolution and aggressively sample the
-    // older portion to stay within a tighter fetch budget. The lower cap keeps the worker
-    // comfortably within timeout thresholds observed in production and reduces cascading
-    // failures when a single item is heavy to load.
-    const MAX_FETCH_KEYS = 90; // tighter hard cap on snapshot fetches per request
-    const RECENT_FULL_WINDOW = 3 * 12; // last 3h of 5m snapshots
+function sampleSnapshotKeys(selectedKeys) {
+  // Downsample snapshot fetches to avoid timeouts while still covering the full window.
+  // Keep the most recent 3h at full (5m) resolution and aggressively sample the older
+  // portion to stay within a tighter fetch budget. The lower cap keeps the worker comfortably
+  // within observed timeout thresholds and reduces cascading failures when a single item is heavy
+  // to load.
+  const MAX_FETCH_KEYS = 90; // tighter hard cap on snapshot fetches per request
+  const RECENT_FULL_WINDOW = 3 * 12; // last 3h of 5m snapshots
 
-    const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
-    const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
+  const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
+  const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
 
-    const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
-    const sampledOlder = [];
-    if (olderKeys.length && remainingBudget > 0) {
-      const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
-      for (let i = 0; i < olderKeys.length; i += olderStride) {
-        sampledOlder.push(olderKeys[i]);
-      }
+  const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
+  const sampledOlder = [];
+  if (olderKeys.length && remainingBudget > 0) {
+    const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
+    for (let i = 0; i < olderKeys.length; i += olderStride) {
+      sampledOlder.push(olderKeys[i]);
     }
   }
 
-    const sampledKeys = sampledOlder.concat(recentKeys);
-    if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
-      sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  const sampledKeys = sampledOlder.concat(recentKeys);
+  if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
+    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  }
+
+  return sampledKeys;
+}
+
+async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, budgetMs) {
+  const history = [];
+  const BATCH_SIZE = 8;
+  let truncated = false;
+
+  for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
+    if (Date.now() - startedAt > budgetMs) {
+      truncated = true;
+      break;
     }
 
-    const history = [];
-    const BATCH_SIZE = 8;
-    for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
-      if (Date.now() - startedAt > BUILD_BUDGET_MS) {
-        truncated = true;
-        break;
-      }
-
-      const batch = sampledKeys.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(
-        batch.map(async (key) => {
-          let snap = null;
-          for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-              const obj = await env.OSRS_BUCKET.get(key);
-              if (!obj) return null;
-              snap = await obj.json();
-              break;
-            } catch (err) {
-              if (attempt === 1) {
-                console.error("Failed to read snapshot", key, err);
-                return null;
-              }
+    const batch = sampledKeys.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (key) => {
+        let snap = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const obj = await env.OSRS_BUCKET.get(key);
+            if (!obj) return null;
+            snap = await obj.json();
+            break;
+          } catch (err) {
+            if (attempt === 1) {
+              console.error("Failed to read snapshot", key, err);
+              return null;
             }
           }
+        }
 
-          const fm = snap && (snap.five_minute || snap["five_minute"]);
-          if (!fm || !fm.data) return null;
+        const fm = snap && (snap.five_minute || snap["five_minute"]);
+        if (!fm || !fm.data) return null;
 
-          const rec = fm.data[String(itemId)] || fm.data[itemId];
-          if (!rec) return null;
+        const rec = fm.data[String(itemId)] || fm.data[itemId];
+        if (!rec) return null;
 
-          const ah = rec.avgHighPrice;
-          const al = rec.avgLowPrice;
-          if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) return null;
+        const ah = rec.avgHighPrice;
+        const al = rec.avgLowPrice;
+        if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) return null;
 
-          const mid = (ah + al) / 2;
-          const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
-          if (!tsSec) return null;
+        const mid = (ah + al) / 2;
+        const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
+        if (!tsSec) return null;
 
-          return {
-            timestamp_iso: new Date(tsSec * 1000).toISOString(),
-            price: mid
-          };
-        })
-      );
-      for (const entry of results) {
-        if (entry) history.push(entry);
-      }
+        return {
+          timestamp_iso: new Date(tsSec * 1000).toISOString(),
+          price: mid
+        };
+      })
+    );
+    for (const entry of results) {
+      if (entry) history.push(entry);
     }
+  }
+
+  history.sort((a, b) => a.timestamp_iso.localeCompare(b.timestamp_iso));
+  return { history, truncated };
+}
+
+async function buildForecast(env, itemId, history) {
+  const forecast = [];
+  try {
+    const sigObj = await env.OSRS_BUCKET.get("signals/latest.json");
+    if (sigObj) {
+      const sigJson = await sigObj.json();
+      const signals = sigJson.signals || [];
+      const s = signals.find(
+        (row) => row.item_id === itemId || String(row.item_id) === String(itemId)
+      );
+      if (s && Array.isArray(s.path) && typeof s.mid_now === "number") {
+        const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
+
+        const baseTimeMs = history.length
+          ? new Date(history[history.length - 1].timestamp_iso).getTime()
+          : Date.now();
+
+        // Anchor the forecast to the last history timestamp so the lines connect
+        forecast.push({
+          timestamp_iso: new Date(baseTimeMs).toISOString(),
+          price: anchorMid
+        });
 
     history.sort((a, b) => a.timestamp_iso.localeCompare(b.timestamp_iso));
 
@@ -1389,6 +1407,72 @@ async function handlePriceSeries(env, itemId) {
       item_id: itemId,
       history: history,
       forecast: forecast,
+      meta: { truncated, source: "fresh" }
+    });
+    setCachedPriceSeries(cacheKey, body);
+  } catch (err) {
+    console.error("Error building price series:", err);
+    if (stale) {
+      return new Response(stale, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Price-Series-Stale": "1"
+        }
+      });
+    }
+
+    return new Response(
+      JSON.stringify({ error: "Failed to build price series, please retry." }),
+      { status: 503, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  return forecast;
+}
+
+async function handlePriceSeries(env, itemId) {
+  const cacheKey = String(itemId);
+  const cached = getCachedPriceSeries(cacheKey);
+  if (cached) {
+    return new Response(cached, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const stale = getCachedPriceSeries(cacheKey, { allowStale: true });
+  const startedAt = Date.now();
+  const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
+
+  let truncated = false;
+  let body;
+
+  try {
+    const { selectedKeys, truncated: listTruncated } = await buildSnapshotKeys(
+      env,
+      startedAt,
+      BUILD_BUDGET_MS
+    );
+    truncated = truncated || listTruncated;
+
+    const sampledKeys = sampleSnapshotKeys(selectedKeys);
+    const historyResult = await loadHistoryFromSnapshots(
+      env,
+      itemId,
+      sampledKeys,
+      startedAt,
+      BUILD_BUDGET_MS
+    );
+    truncated = truncated || historyResult.truncated;
+    const history = historyResult.history;
+
+    const forecast = await buildForecast(env, itemId, history);
+
+    body = JSON.stringify({
+      item_id: itemId,
+      history,
+      forecast,
       meta: { truncated, source: "fresh" }
     });
     setCachedPriceSeries(cacheKey, body);
