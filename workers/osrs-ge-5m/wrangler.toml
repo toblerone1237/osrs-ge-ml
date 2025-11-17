@@ -1,0 +1,11 @@
+name = "osrs-ge-5m"
+main = "src/index.js"
+account_id = "8ae63fcb1e098108b894021e5f72aea8"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "OSRS_BUCKET"
+bucket_name = "osrs-ge-raw"
+
+[triggers]
+crons = ["*/5 * * * *"]   # every 5 minutes

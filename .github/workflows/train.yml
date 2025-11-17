@@ -1,24 +1,15 @@
-name: Train OSRS model
+name: Train OSRS GE model
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"   # every day at 02:00 UTC
-  workflow_dispatch: {}   # allow manual trigger
+    - cron: "0 3 * * *"
 
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    env:
-      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET: ${{ secrets.R2_BUCKET }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,10 +17,17 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        working-directory: ./ml
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Train model
+        working-directory: ./ml
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           python train_model.py
