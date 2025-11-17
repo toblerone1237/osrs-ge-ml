@@ -542,10 +542,13 @@ const HTML = `<!DOCTYPE html>
 
           const probProfit =
             typeof s.prob_profit === "number" ? s.prob_profit : 0;
-          const liquidityBoost =
-            vol24 && vol24 > 0 ? Math.log10(vol24 + 10) : 1;
-          const probAdjustedProfit = probProfit * netProfit;
-          const score = probAdjustedProfit * liquidityBoost;
+          // Give liquid items a modest boost while still letting low-volume picks compete.
+          const volumeWeight = vol24 && vol24 > 0
+            ? Math.max(0.25, Math.log10(vol24 + 10) / 4)
+            : 0.25;
+          const probAdjustedProfit = Math.max(0, probProfit) * Math.max(0, netProfit);
+          // Keep a floor on probability to avoid a zeroed score for very small but non-zero odds.
+          const score = probAdjustedProfit * Math.max(0.05, probProfit) * volumeWeight;
 
           const entry = pinnedState[keyStr];
           const isPinned = !!(entry && entry.pinned);
@@ -570,6 +573,7 @@ const HTML = `<!DOCTYPE html>
 
       enriched.sort(function (a, b) {
         if (b.score !== a.score) return b.score - a.score;
+        if (b.prob_profit !== a.prob_profit) return b.prob_profit - a.prob_profit;
         if (b.netPct !== a.netPct) return b.netPct - a.netPct;
         return (b.vol24 || 0) - (a.vol24 || 0);
       });
@@ -828,12 +832,29 @@ const HTML = `<!DOCTYPE html>
       const rawStarTs = starInfo && starInfo.starredAtIso
         ? new Date(starInfo.starredAtIso).getTime()
         : null;
-      const starTs =
-        rawStarTs != null && histMap.size && !histMap.has(rawStarTs)
-          ? new Date(history[history.length - 1].timestamp_iso).getTime()
-          : rawStarTs;
+      const starTsCandidate = rawStarTs;
+      let starTs = starTsCandidate;
+      // Snap the star timestamp to the nearest history bucket so the overlay connects cleanly.
+      if (starTsCandidate != null && histMap.size && !histMap.has(starTsCandidate)) {
+        const lastHistTs = new Date(
+          history[history.length - 1].timestamp_iso
+        ).getTime();
+        let closestTs = lastHistTs;
+        let smallestDiff = Math.abs(starTsCandidate - lastHistTs);
+        histMap.forEach(function (_price, ts) {
+          const diff = Math.abs(starTsCandidate - ts);
+          if (diff < smallestDiff) {
+            smallestDiff = diff;
+            closestTs = ts;
+          }
+        });
+        starTs = closestTs;
+      }
       if (starTs != null) {
         tsSet.add(starTs);
+        if (!oldFcMap.has(starTs) && histMap.has(starTs)) {
+          oldFcMap.set(starTs, histMap.get(starTs));
+        }
       }
       if (nowTs != null) {
         tsSet.add(nowTs);
