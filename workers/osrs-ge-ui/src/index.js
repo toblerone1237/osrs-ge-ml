@@ -186,7 +186,7 @@ const HTML = `<!DOCTYPE html>
     <div class="card">
       <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
-        Click a row to see roughly the last 3 hours of 5-minute mid prices and a 5–120 minute forecast.<br/>
+        Click a row to see up to the last 14 days (or as far back as available) of 5-minute mid prices and a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
       </div>
       <div id="tableContainer">Waiting for data...</div>
@@ -211,7 +211,7 @@ const HTML = `<!DOCTYPE html>
       <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
       <div class="small" style="margin-bottom:0.4rem;">
         <ul style="margin:0; padding-left:1.2rem;">
-          <li><strong>Blue</strong>: actual mid price history (last ~3 hours, 5-minute buckets).</li>
+          <li><strong>Blue</strong>: actual mid price history (up to ~14 days, 5-minute buckets, limited by data availability).</li>
           <li><strong>Green</strong>: current forecast from the latest model, from now into the next 120 minutes.</li>
         </ul>
       </div>
@@ -1175,16 +1175,16 @@ async function handleDaily(env) {
   });
 }
 
-// Build price history (~3h of 5m mid prices) + forecast from signals.path,
+// Build price history (~14d of 5m mid prices) + forecast from signals.path,
 // anchoring the forecast to the last history mid price.
 async function handlePriceSeries(env, itemId) {
-  const MAX_DAYS = 2;
-  const MAX_SNAPSHOTS = 36; // 36 * 5m = 180 minutes
+  const MAX_DAYS = 14;
+  const MAX_SNAPSHOTS = MAX_DAYS * 24 * 12; // 5m buckets
   const now = new Date();
 
   const keys = [];
 
-  // Collect snapshot keys from today + yesterday
+  // Collect snapshot keys from today backwards, up to the limit window
   for (let delta = 0; delta < MAX_DAYS && keys.length < MAX_SNAPSHOTS; delta++) {
     const d = new Date(now.getTime() - delta * 86400000);
     const year = d.getUTCFullYear();
@@ -1207,36 +1207,69 @@ async function handlePriceSeries(env, itemId) {
   keys.sort();
   const selectedKeys = keys.slice(-MAX_SNAPSHOTS);
 
-  const history = [];
-  for (const key of selectedKeys) {
-    const obj = await env.OSRS_BUCKET.get(key);
-    if (!obj) continue;
+  // Downsample snapshot fetches to avoid timeouts while still covering the full window.
+  // Keep the most recent 6h at full (5m) resolution and aggressively sample the
+  // older portion to stay within a tighter fetch budget. The lower cap keeps the worker
+  // comfortably within timeout thresholds observed in production.
+  const MAX_FETCH_KEYS = 150; // tighter hard cap on snapshot fetches per request
+  const RECENT_FULL_WINDOW = 6 * 12; // last 6h of 5m snapshots
 
-    let snap;
-    try {
-      snap = await obj.json();
-    } catch {
-      continue;
+  const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
+  const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
+
+  const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
+  const sampledOlder = [];
+  if (olderKeys.length && remainingBudget > 0) {
+    const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
+    for (let i = 0; i < olderKeys.length; i += olderStride) {
+      sampledOlder.push(olderKeys[i]);
     }
+  }
 
-    const fm = snap.five_minute || snap["five_minute"];
-    if (!fm || !fm.data) continue;
+  const sampledKeys = sampledOlder.concat(recentKeys);
+  if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
+    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  }
 
-    const rec = fm.data[String(itemId)] || fm.data[itemId];
-    if (!rec) continue;
+  const history = [];
+  const BATCH_SIZE = 12;
+  for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
+    const batch = sampledKeys.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (key) => {
+        const obj = await env.OSRS_BUCKET.get(key);
+        if (!obj) return null;
 
-    const ah = rec.avgHighPrice;
-    const al = rec.avgLowPrice;
-    if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) continue;
+        let snap;
+        try {
+          snap = await obj.json();
+        } catch {
+          return null;
+        }
 
-    const mid = (ah + al) / 2;
-    const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
-    if (!tsSec) continue;
+        const fm = snap.five_minute || snap["five_minute"];
+        if (!fm || !fm.data) return null;
 
-    history.push({
-      timestamp_iso: new Date(tsSec * 1000).toISOString(),
-      price: mid
-    });
+        const rec = fm.data[String(itemId)] || fm.data[itemId];
+        if (!rec) return null;
+
+        const ah = rec.avgHighPrice;
+        const al = rec.avgLowPrice;
+        if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) return null;
+
+        const mid = (ah + al) / 2;
+        const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
+        if (!tsSec) return null;
+
+        return {
+          timestamp_iso: new Date(tsSec * 1000).toISOString(),
+          price: mid
+        };
+      })
+    );
+    for (const entry of results) {
+      if (entry) history.push(entry);
+    }
   }
 
   history.sort((a, b) => a.timestamp_iso.localeCompare(b.timestamp_iso));
