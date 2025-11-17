@@ -1207,36 +1207,60 @@ async function handlePriceSeries(env, itemId) {
   keys.sort();
   const selectedKeys = keys.slice(-MAX_SNAPSHOTS);
 
+  // Downsample snapshot fetches to avoid timeouts while still covering the full window.
+  const MAX_HISTORY_POINTS = 720; // ~30m resolution across 14 days
+  const stride = Math.max(1, Math.ceil(selectedKeys.length / MAX_HISTORY_POINTS));
+  const sampledKeys = [];
+  for (let i = 0; i < selectedKeys.length; i += stride) {
+    sampledKeys.push(selectedKeys[i]);
+  }
+  if (sampledKeys.length === 0 && selectedKeys.length > 0) {
+    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  } else if (
+    sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]
+  ) {
+    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  }
+
   const history = [];
-  for (const key of selectedKeys) {
-    const obj = await env.OSRS_BUCKET.get(key);
-    if (!obj) continue;
+  const BATCH_SIZE = 24;
+  for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
+    const batch = sampledKeys.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (key) => {
+        const obj = await env.OSRS_BUCKET.get(key);
+        if (!obj) return null;
 
-    let snap;
-    try {
-      snap = await obj.json();
-    } catch {
-      continue;
+        let snap;
+        try {
+          snap = await obj.json();
+        } catch {
+          return null;
+        }
+
+        const fm = snap.five_minute || snap["five_minute"];
+        if (!fm || !fm.data) return null;
+
+        const rec = fm.data[String(itemId)] || fm.data[itemId];
+        if (!rec) return null;
+
+        const ah = rec.avgHighPrice;
+        const al = rec.avgLowPrice;
+        if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) return null;
+
+        const mid = (ah + al) / 2;
+        const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
+        if (!tsSec) return null;
+
+        return {
+          timestamp_iso: new Date(tsSec * 1000).toISOString(),
+          price: mid
+        };
+      })
+    );
+    for (const entry of results) {
+      if (entry) history.push(entry);
     }
-
-    const fm = snap.five_minute || snap["five_minute"];
-    if (!fm || !fm.data) continue;
-
-    const rec = fm.data[String(itemId)] || fm.data[itemId];
-    if (!rec) continue;
-
-    const ah = rec.avgHighPrice;
-    const al = rec.avgLowPrice;
-    if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) continue;
-
-    const mid = (ah + al) / 2;
-    const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
-    if (!tsSec) continue;
-
-    history.push({
-      timestamp_iso: new Date(tsSec * 1000).toISOString(),
-      price: mid
-    });
   }
 
   history.sort((a, b) => a.timestamp_iso.localeCompare(b.timestamp_iso));
