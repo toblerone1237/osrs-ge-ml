@@ -186,7 +186,7 @@ const HTML = `<!DOCTYPE html>
     <div class="card">
       <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
-        Click a row to see roughly the last 3 hours of 5-minute mid prices and a 5–120 minute forecast.<br/>
+        Click a row to see up to the last 14 days (or as far back as available) of 5-minute mid prices and a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
       </div>
       <div id="tableContainer">Waiting for data...</div>
@@ -211,7 +211,7 @@ const HTML = `<!DOCTYPE html>
       <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
       <div class="small" style="margin-bottom:0.4rem;">
         <ul style="margin:0; padding-left:1.2rem;">
-          <li><strong>Blue</strong>: actual mid price history (last ~3 hours, 5-minute buckets).</li>
+          <li><strong>Blue</strong>: actual mid price history (up to ~14 days, 5-minute buckets, limited by data availability).</li>
           <li><strong>Green</strong>: current forecast from the latest model, from now into the next 120 minutes.</li>
         </ul>
       </div>
@@ -1175,16 +1175,16 @@ async function handleDaily(env) {
   });
 }
 
-// Build price history (~3h of 5m mid prices) + forecast from signals.path,
+// Build price history (~14d of 5m mid prices) + forecast from signals.path,
 // anchoring the forecast to the last history mid price.
 async function handlePriceSeries(env, itemId) {
-  const MAX_DAYS = 2;
-  const MAX_SNAPSHOTS = 36; // 36 * 5m = 180 minutes
+  const MAX_DAYS = 14;
+  const MAX_SNAPSHOTS = MAX_DAYS * 24 * 12; // 5m buckets
   const now = new Date();
 
   const keys = [];
 
-  // Collect snapshot keys from today + yesterday
+  // Collect snapshot keys from today backwards, up to the limit window
   for (let delta = 0; delta < MAX_DAYS && keys.length < MAX_SNAPSHOTS; delta++) {
     const d = new Date(now.getTime() - delta * 86400000);
     const year = d.getUTCFullYear();
