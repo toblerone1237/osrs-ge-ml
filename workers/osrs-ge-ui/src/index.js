@@ -542,13 +542,16 @@ const HTML = `<!DOCTYPE html>
 
           const probProfit =
             typeof s.prob_profit === "number" ? s.prob_profit : 0;
+
           // Give liquid items a modest boost while still letting low-volume picks compete.
           const volumeWeight = vol24 && vol24 > 0
             ? Math.max(0.25, Math.log10(vol24 + 10) / 4)
             : 0.25;
-          const probAdjustedProfit = Math.max(0, probProfit) * Math.max(0, netProfit);
+          const probAdjustedProfit =
+            Math.max(0, probProfit) * Math.max(0, netProfit);
           // Keep a floor on probability to avoid a zeroed score for very small but non-zero odds.
-          const score = probAdjustedProfit * Math.max(0.05, probProfit) * volumeWeight;
+          const score =
+            probAdjustedProfit * Math.max(0.05, probProfit) * volumeWeight;
 
           const entry = pinnedState[keyStr];
           const isPinned = !!(entry && entry.pinned);
@@ -571,14 +574,30 @@ const HTML = `<!DOCTYPE html>
           };
         });
 
-      enriched.sort(function (a, b) {
+      // Thresholds for "good" trades
+      const MIN_PROB = 0.55;   // at least ~55% win chance
+      const MIN_NET_PCT = 2.0; // at least 2% net return per item
+
+      function compareRows(a, b) {
         if (b.score !== a.score) return b.score - a.score;
         if (b.prob_profit !== a.prob_profit) return b.prob_profit - a.prob_profit;
         if (b.netPct !== a.netPct) return b.netPct - a.netPct;
         return (b.vol24 || 0) - (a.vol24 || 0);
+      }
+
+      const good = enriched.filter(function (row) {
+        return row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT;
       });
 
-      const top10 = enriched.slice(0, 10);
+      const rest = enriched.filter(function (row) {
+        return !(row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT);
+      });
+
+      good.sort(compareRows);
+      rest.sort(compareRows);
+
+      const ranked = good.concat(rest);
+      const top10 = ranked.slice(0, 10);
 
       const table = document.createElement("table");
       const thead = document.createElement("thead");
