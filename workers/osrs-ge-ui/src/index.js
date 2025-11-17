@@ -292,18 +292,31 @@ const HTML = `<!DOCTYPE html>
       if (p >= 0.65) {
         cls = "good";
         label = "favourable";
+      } else if (p < 0.5) {
+        cls = "bad";
+        label = "unfavourable";
+      } else {
         label = "uncertain";
       }
+      return '<span class="pill ' + cls + '">' +
+        label + " (" + formatProb(p) + ")" + "</span>";
+    }
 
     function findMappingList(obj) {
       if (!obj) return null;
       if (Array.isArray(obj)) {
         if (
           obj.length > 0 &&
+          typeof obj[0] === "object" &&
+          obj[0] !== null &&
+          "id" in obj[0] &&
           "name" in obj[0]
         ) {
           return obj;
         }
+        for (let i = 0; i < obj.length; i++) {
+          const res = findMappingList(obj[i]);
+          if (res) return res;
         }
         return null;
       }
@@ -316,6 +329,9 @@ const HTML = `<!DOCTYPE html>
       }
       return null;
     }
+
+    function buildMappingFromDaily() {
+      mappingList = [];
       if (!dailySnapshot) return;
       const list = findMappingList(dailySnapshot);
       if (!list) return;
@@ -1109,19 +1125,3 @@ export default {
     });
   }
 };
-
-    function buildMappingFromDaily() {
-      mappingList = [];
-        for (let i = 0; i < obj.length; i++) {
-          const res = findMappingList(obj[i]);
-          if (res) return res;
-          typeof obj[0] === "object" &&
-          obj[0] !== null &&
-          "id" in obj[0] &&
-      return '<span class="pill ' + cls + '">' +
-        label + " (" + formatProb(p) + ")" + "</span>";
-    }
-        cls = "bad";
-        label = "unfavourable";
-      } else {
-
