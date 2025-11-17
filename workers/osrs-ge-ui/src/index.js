@@ -1477,13 +1477,13 @@ async function handlePriceSeries(env, itemId) {
   const startedAt = Date.now();
   const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
 
-  let built = null;
-  try {
-    built = await buildPriceSeriesPayload(env, itemId, startedAt, BUILD_BUDGET_MS);
-  } catch (err) {
-    console.error("Error building price series:", err);
-    built = null;
-  }
+  const built = await buildPriceSeriesPayload(env, itemId, startedAt, BUILD_BUDGET_MS).then(
+    (payload) => payload,
+    (err) => {
+      console.error("Error building price series:", err);
+      return null;
+    }
+  );
 
   if (!built) {
     if (stale) {
