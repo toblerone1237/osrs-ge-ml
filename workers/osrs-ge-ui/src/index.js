@@ -991,7 +991,8 @@ const HTML = `<!DOCTYPE html>
             backgroundColor: "rgba(59,130,246,0.2)",
             pointRadius: 0,
             borderWidth: 2,
-            tension: 0.15
+            tension: 0.15,
+            spanGaps: true
           },
           {
             label: "Forecast price (next 2h, 5m steps)",
@@ -1001,7 +1002,8 @@ const HTML = `<!DOCTYPE html>
             pointRadius: 0,
             borderWidth: 2,
             borderDash: [6, 3],
-            tension: 0.15
+            tension: 0.15,
+            spanGaps: true
           }
         ];
 
@@ -1014,7 +1016,8 @@ const HTML = `<!DOCTYPE html>
             pointRadius: 0,
             borderWidth: 2,
             borderDash: [5, 5],
-            tension: 0.15
+            tension: 0.15,
+            spanGaps: true
           });
         }
 
@@ -1148,6 +1151,83 @@ const HTML = `<!DOCTYPE html>
 const PRICE_CACHE = new Map();
 const PRICE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const PRICE_CACHE_MAX_ITEMS = 50;
+let LAST_SIGNALS_JSON = null;
+let LAST_SIGNALS_FETCHED_AT = 0;
+const SIGNALS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes of reuse on success
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function bucketGetWithRetry(env, key, { attempts = 3, baseDelayMs = 200 } = {}) {
+  let lastError = null;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const obj = await env.OSRS_BUCKET.get(key);
+      return obj;
+    } catch (err) {
+      lastError = err;
+      const isLast = i === attempts - 1;
+      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
+      console.warn(
+        `Attempt ${i + 1} to fetch ${key} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
+      );
+      if (!isLast) {
+        await sleep(delay);
+      }
+    }
+  }
+
+  console.error(`Failed to fetch ${key} after ${attempts} attempts`, lastError);
+  return null;
+}
+
+async function bucketListWithRetry(env, options, { attempts = 3, baseDelayMs = 200 } = {}) {
+  let lastError = null;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await env.OSRS_BUCKET.list(options);
+    } catch (err) {
+      lastError = err;
+      const isLast = i === attempts - 1;
+      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
+      console.warn(
+        `Attempt ${i + 1} to list ${options?.prefix || ""} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
+      );
+      if (!isLast) {
+        await sleep(delay);
+      }
+    }
+  }
+
+  console.error(`Failed to list with options ${JSON.stringify(options)} after ${attempts} attempts`, lastError);
+  return null;
+}
+
+async function loadSignalsWithCache(env) {
+  const now = Date.now();
+  if (LAST_SIGNALS_JSON && now - LAST_SIGNALS_FETCHED_AT < SIGNALS_CACHE_TTL_MS) {
+    return { json: LAST_SIGNALS_JSON, source: "cache" };
+  }
+
+  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  if (obj) {
+    try {
+      const parsed = await obj.json();
+      if (parsed && Array.isArray(parsed.signals)) {
+        LAST_SIGNALS_JSON = parsed;
+        LAST_SIGNALS_FETCHED_AT = Date.now();
+        return { json: parsed, source: "fresh" };
+      }
+    } catch (err) {
+      console.error("Error parsing signals payload:", err);
+    }
+  }
+
+  return { json: null, source: "missing" };
+}
 
 function getCachedPriceSeries(cacheKey, { allowStale = false } = {}) {
   const entry = PRICE_CACHE.get(cacheKey);
@@ -1172,7 +1252,7 @@ function setCachedPriceSeries(cacheKey, payload) {
 }
 
 async function handleSignals(env) {
-  const obj = await env.OSRS_BUCKET.get("signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/latest.json");
   if (!obj) {
     return new Response(JSON.stringify({ error: "No signals found" }), {
       status: 404,
@@ -1187,7 +1267,7 @@ async function handleSignals(env) {
 }
 
 async function handleDaily(env) {
-  const obj = await env.OSRS_BUCKET.get("daily/latest.json");
+  const obj = await bucketGetWithRetry(env, "daily/latest.json");
   if (!obj) {
     return new Response(JSON.stringify({ error: "No daily snapshot found" }), {
       status: 404,
@@ -1225,7 +1305,11 @@ async function buildSnapshotKeys(env, startedAt, budgetMs) {
 
     let cursor;
     while (true) {
-      const listing = await env.OSRS_BUCKET.list({ prefix, cursor, limit: 1000 });
+      const listing = await bucketListWithRetry(env, { prefix, cursor, limit: 1000 });
+      if (!listing) {
+        truncated = true;
+        break;
+      }
       for (const obj of listing.objects || []) {
         keys.push(obj.key);
       }
@@ -1272,33 +1356,16 @@ function sampleSnapshotKeys(selectedKeys) {
   return sampledKeys;
 }
 
-async function readSnapshotJson(env, key, maxAttempts = 2) {
-  let lastError = null;
+async function readSnapshotJson(env, key) {
+  const obj = await bucketGetWithRetry(env, key, { attempts: 3, baseDelayMs: 250 });
+  if (!obj) return null;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const obj = await env.OSRS_BUCKET.get(key).then(
-      (res) => res,
-      (err) => {
-        lastError = err;
-        return null;
-      }
-    );
-    if (!obj) return null;
-
-    const snap = await obj.json().then(
-      (json) => json,
-      (err) => {
-        lastError = err;
-        return null;
-      }
-    );
-    if (snap) return snap;
+  try {
+    return await obj.json();
+  } catch (err) {
+    console.error("Failed to parse snapshot", key, err);
+    return null;
   }
-
-  if (lastError) {
-    console.error("Failed to read snapshot", key, lastError);
-  }
-  return null;
 }
 
 async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, budgetMs) {
@@ -1349,20 +1416,12 @@ async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, bud
 
 async function buildForecast(env, itemId, history) {
   const forecast = [];
-  const sigObj = await env.OSRS_BUCKET.get("signals/latest.json").catch((err) => {
-    console.error("Error fetching signals for forecast:", err);
-    return null;
-  });
-  if (!sigObj) return forecast;
-
-  const sigJson = await sigObj.json().catch((err) => {
-    console.error("Error parsing signals for forecast:", err);
-    return null;
-  });
+  const { json: sigJson } = await loadSignalsWithCache(env);
   if (!sigJson) return forecast;
 
   const signals = sigJson.signals || [];
   const s = signals.find((row) => row.item_id === itemId || String(row.item_id) === String(itemId));
+
   if (!s || !Array.isArray(s.path) || typeof s.mid_now !== "number") return forecast;
 
   const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
@@ -1439,8 +1498,6 @@ async function handlePriceSeries(env, itemId) {
       headers: { "Content-Type": "application/json" }
     });
   }
-
-  const stale = getCachedPriceSeries(cacheKey, { allowStale: true });
   const startedAt = Date.now();
   const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
 
@@ -1453,16 +1510,6 @@ async function handlePriceSeries(env, itemId) {
   );
 
   if (!built) {
-    if (stale) {
-      return new Response(stale, {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Price-Series-Stale": "1"
-        }
-      });
-    }
-
     return new Response(
       JSON.stringify({ error: "Failed to build price series, please retry." }),
       { status: 503, headers: { "Content-Type": "application/json" } }
