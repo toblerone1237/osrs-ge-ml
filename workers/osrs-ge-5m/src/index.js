@@ -21,24 +21,47 @@ function formatDatePath(date) {
   return { year, month, day, hour, minute };
 }
 
-// Helper: fetch JSON from OSRS API with proper headers
-async function fetchOsrsJson(path) {
-  const url = `${OSRS_API_BASE}${path}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept": "application/json",
-    },
-  });
+// Helper: pause for the given milliseconds
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `OSRS API error for ${path}: HTTP ${res.status} ${res.statusText} – ${text}`,
-    );
+// Helper: fetch JSON from OSRS API with proper headers and simple retries
+async function fetchOsrsJson(path, { attempts = 3, baseDelayMs = 500 } = {}) {
+  const url = `${OSRS_API_BASE}${path}`;
+  let lastError = null;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Accept": "application/json",
+        },
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(
+          `OSRS API error for ${path}: HTTP ${res.status} ${res.statusText} – ${text}`,
+        );
+      }
+
+      return await res.json();
+    } catch (err) {
+      lastError = err;
+      const isLast = i === attempts - 1;
+      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 200;
+      console.warn(
+        `Attempt ${i + 1} for ${path} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
+      );
+      if (!isLast) {
+        await sleep(delay);
+      }
+    }
   }
 
-  return res.json();
+  throw lastError || new Error(`Failed to fetch ${path}`);
 }
 
 // Main job: run once per cron to store a 5-minute snapshot
