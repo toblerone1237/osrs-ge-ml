@@ -1,0 +1,40 @@
+name: Deploy Cloudflare Workers
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "workers/**"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy osrs-ge-ui
+        working-directory: ./workers/osrs-ge-ui
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: wrangler deploy
+
+      - name: Deploy osrs-ge-daily
+        working-directory: ./workers/osrs-ge-daily
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: wrangler deploy
+
+      - name: Deploy osrs-ge-5m
+        working-directory: ./workers/osrs-ge-5m
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: wrangler deploy
