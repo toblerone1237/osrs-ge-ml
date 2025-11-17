@@ -186,7 +186,7 @@ const HTML = `<!DOCTYPE html>
     <div class="card">
       <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
-        Click a row to see roughly the last 3 hours of 5-minute mid prices and a 5–120 minute forecast.<br/>
+        Click a row to see up to the last 14 days (or as far back as available) of 5-minute mid prices and a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
       </div>
       <div id="tableContainer">Waiting for data...</div>
@@ -211,7 +211,7 @@ const HTML = `<!DOCTYPE html>
       <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
       <div class="small" style="margin-bottom:0.4rem;">
         <ul style="margin:0; padding-left:1.2rem;">
-          <li><strong>Blue</strong>: actual mid price history (last ~3 hours, 5-minute buckets).</li>
+          <li><strong>Blue</strong>: actual mid price history (up to ~14 days, 5-minute buckets, limited by data availability).</li>
           <li><strong>Green</strong>: current forecast from the latest model, from now into the next 120 minutes.</li>
         </ul>
       </div>
@@ -1145,6 +1145,32 @@ const HTML = `<!DOCTYPE html>
 
 // ----------------- Backend helpers -----------------
 
+const PRICE_CACHE = new Map();
+const PRICE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const PRICE_CACHE_MAX_ITEMS = 50;
+
+function getCachedPriceSeries(cacheKey, { allowStale = false } = {}) {
+  const entry = PRICE_CACHE.get(cacheKey);
+  if (!entry) return null;
+
+  const age = Date.now() - entry.cachedAt;
+  if (age > PRICE_CACHE_TTL_MS && !allowStale) {
+    PRICE_CACHE.delete(cacheKey);
+    return null;
+  }
+
+  return entry.payload;
+}
+
+function setCachedPriceSeries(cacheKey, payload) {
+  PRICE_CACHE.set(cacheKey, { cachedAt: Date.now(), payload });
+
+  if (PRICE_CACHE.size > PRICE_CACHE_MAX_ITEMS) {
+    const oldestKey = PRICE_CACHE.keys().next().value;
+    PRICE_CACHE.delete(oldestKey);
+  }
+}
+
 async function handleSignals(env) {
   const obj = await env.OSRS_BUCKET.get("signals/latest.json");
   if (!obj) {
@@ -1175,17 +1201,22 @@ async function handleDaily(env) {
   });
 }
 
-// Build price history (~3h of 5m mid prices) + forecast from signals.path,
+// Build price history (~14d of 5m mid prices) + forecast from signals.path,
 // anchoring the forecast to the last history mid price.
-async function handlePriceSeries(env, itemId) {
-  const MAX_DAYS = 2;
-  const MAX_SNAPSHOTS = 36; // 36 * 5m = 180 minutes
+async function buildSnapshotKeys(env, startedAt, budgetMs) {
+  const MAX_DAYS = 14;
+  const MAX_SNAPSHOTS = MAX_DAYS * 24 * 12; // 5m buckets
   const now = new Date();
 
   const keys = [];
+  let truncated = false;
 
-  // Collect snapshot keys from today + yesterday
   for (let delta = 0; delta < MAX_DAYS && keys.length < MAX_SNAPSHOTS; delta++) {
+    if (Date.now() - startedAt > budgetMs) {
+      truncated = true;
+      break;
+    }
+
     const d = new Date(now.getTime() - delta * 86400000);
     const year = d.getUTCFullYear();
     const month = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -1199,103 +1230,236 @@ async function handlePriceSeries(env, itemId) {
         keys.push(obj.key);
       }
       if (!listing.truncated) break;
+      if (Date.now() - startedAt > budgetMs) {
+        truncated = true;
+        break;
+      }
       cursor = listing.cursor;
     }
-    if (keys.length >= MAX_SNAPSHOTS) break;
+    if (keys.length >= MAX_SNAPSHOTS || truncated) break;
   }
 
   keys.sort();
-  const selectedKeys = keys.slice(-MAX_SNAPSHOTS);
+  return { selectedKeys: keys.slice(-MAX_SNAPSHOTS), truncated };
+}
 
+function sampleSnapshotKeys(selectedKeys) {
+  // Downsample snapshot fetches to avoid timeouts while still covering the full window.
+  // Keep the most recent 3h at full (5m) resolution and aggressively sample the older
+  // portion to stay within a tighter fetch budget. The lower cap keeps the worker comfortably
+  // within observed timeout thresholds and reduces cascading failures when a single item is heavy
+  // to load.
+  const MAX_FETCH_KEYS = 90; // tighter hard cap on snapshot fetches per request
+  const RECENT_FULL_WINDOW = 3 * 12; // last 3h of 5m snapshots
+
+  const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
+  const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
+
+  const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
+  const sampledOlder = [];
+  if (olderKeys.length && remainingBudget > 0) {
+    const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
+    for (let i = 0; i < olderKeys.length; i += olderStride) {
+      sampledOlder.push(olderKeys[i]);
+    }
+  }
+
+  const sampledKeys = sampledOlder.concat(recentKeys);
+  if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
+    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  }
+
+  return sampledKeys;
+}
+
+async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, budgetMs) {
   const history = [];
-  for (const key of selectedKeys) {
-    const obj = await env.OSRS_BUCKET.get(key);
-    if (!obj) continue;
+  const BATCH_SIZE = 8;
+  let truncated = false;
 
-    let snap;
-    try {
-      snap = await obj.json();
-    } catch {
-      continue;
+  for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
+    if (Date.now() - startedAt > budgetMs) {
+      truncated = true;
+      break;
     }
 
-    const fm = snap.five_minute || snap["five_minute"];
-    if (!fm || !fm.data) continue;
+    const batch = sampledKeys.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (key) => {
+        let snap = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const obj = await env.OSRS_BUCKET.get(key);
+            if (!obj) return null;
+            snap = await obj.json();
+            break;
+          } catch (err) {
+            if (attempt === 1) {
+              console.error("Failed to read snapshot", key, err);
+              return null;
+            }
+          }
+        }
 
-    const rec = fm.data[String(itemId)] || fm.data[itemId];
-    if (!rec) continue;
+        const fm = snap && (snap.five_minute || snap["five_minute"]);
+        if (!fm || !fm.data) return null;
 
-    const ah = rec.avgHighPrice;
-    const al = rec.avgLowPrice;
-    if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) continue;
+        const rec = fm.data[String(itemId)] || fm.data[itemId];
+        if (!rec) return null;
 
-    const mid = (ah + al) / 2;
-    const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
-    if (!tsSec) continue;
+        const ah = rec.avgHighPrice;
+        const al = rec.avgLowPrice;
+        if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) return null;
 
-    history.push({
-      timestamp_iso: new Date(tsSec * 1000).toISOString(),
-      price: mid
-    });
+        const mid = (ah + al) / 2;
+        const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
+        if (!tsSec) return null;
+
+        return {
+          timestamp_iso: new Date(tsSec * 1000).toISOString(),
+          price: mid
+        };
+      })
+    );
+    for (const entry of results) {
+      if (entry) history.push(entry);
+    }
   }
 
   history.sort((a, b) => a.timestamp_iso.localeCompare(b.timestamp_iso));
+  return { history, truncated };
+}
 
-  // Forecast from signals/latest.json path anchored to last history mid price
+async function buildForecast(env, itemId, history) {
   const forecast = [];
-  try {
-    const sigObj = await env.OSRS_BUCKET.get("signals/latest.json");
-    if (sigObj) {
-      const sigJson = await sigObj.json();
-      const signals = sigJson.signals || [];
-      const s = signals.find(
-        (row) => row.item_id === itemId || String(row.item_id) === String(itemId)
-      );
-      if (s && Array.isArray(s.path) && typeof s.mid_now === "number") {
-        const anchorMid = history.length
-          ? history[history.length - 1].price
-          : s.mid_now;
+  const sigObj = await env.OSRS_BUCKET.get("signals/latest.json").catch((err) => {
+    console.error("Error fetching signals for forecast:", err);
+    return null;
+  });
+  if (!sigObj) return forecast;
 
-        const baseTimeMs = history.length
-          ? new Date(history[history.length - 1].timestamp_iso).getTime()
-          : Date.now();
+  const sigJson = await sigObj.json().catch((err) => {
+    console.error("Error parsing signals for forecast:", err);
+    return null;
+  });
+  if (!sigJson) return forecast;
 
-        // Anchor the forecast to the last history timestamp so the lines connect
-        forecast.push({
-          timestamp_iso: new Date(baseTimeMs).toISOString(),
-          price: anchorMid
-        });
+  const signals = sigJson.signals || [];
+  const s = signals.find((row) => row.item_id === itemId || String(row.item_id) === String(itemId));
+  if (!s || !Array.isArray(s.path) || typeof s.mid_now !== "number") return forecast;
 
-        for (const p of s.path) {
-          if (!p || typeof p.minutes !== "number" || typeof p.future_return_hat !== "number") {
-            continue;
-          }
-          const minutes = p.minutes;
-          const ret = p.future_return_hat;
+  const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
 
-          // Optional mild clamp to avoid absurd spikes
-          const clampedRet = Math.max(-0.8, Math.min(3.0, ret));
+  const baseTimeMs = history.length
+    ? new Date(history[history.length - 1].timestamp_iso).getTime()
+    : Date.now();
 
-          const price = anchorMid * (1 + clampedRet);
-          const tsIso = new Date(baseTimeMs + minutes * 60000).toISOString();
-          forecast.push({
-            timestamp_iso: tsIso,
-            price: price
-          });
-        }
-      }
+  // Anchor the forecast to the last history timestamp so the lines connect
+  forecast.push({
+    timestamp_iso: new Date(baseTimeMs).toISOString(),
+    price: anchorMid
+  });
+
+  for (const p of s.path) {
+    if (!p || typeof p.minutes !== "number" || typeof p.future_return_hat !== "number") {
+      continue;
     }
-  } catch (err) {
-    console.error("Error building forecast from signals:", err);
+    const minutes = p.minutes;
+    const ret = p.future_return_hat;
+
+    // Optional mild clamp to avoid absurd spikes
+    const clampedRet = Math.max(-0.8, Math.min(3.0, ret));
+
+    const price = anchorMid * (1 + clampedRet);
+    const tsIso = new Date(baseTimeMs + minutes * 60000).toISOString();
+    forecast.push({
+      timestamp_iso: tsIso,
+      price: price
+    });
   }
 
-  return new Response(
-    JSON.stringify({ item_id: itemId, history: history, forecast: forecast }),
-    {
+  return forecast;
+}
+
+async function buildPriceSeriesPayload(env, itemId, startedAt, budgetMs) {
+  const { selectedKeys, truncated: listTruncated } = await buildSnapshotKeys(
+    env,
+    startedAt,
+    budgetMs
+  );
+  let truncated = !!listTruncated;
+
+  const sampledKeys = sampleSnapshotKeys(selectedKeys);
+  const historyResult = await loadHistoryFromSnapshots(
+    env,
+    itemId,
+    sampledKeys,
+    startedAt,
+    budgetMs
+  );
+  truncated = truncated || historyResult.truncated;
+  const history = historyResult.history;
+
+  const forecast = await buildForecast(env, itemId, history);
+
+  return {
+    truncated,
+    body: JSON.stringify({
+      item_id: itemId,
+      history,
+      forecast,
+      meta: { truncated, source: "fresh" }
+    })
+  };
+}
+
+async function handlePriceSeries(env, itemId) {
+  const cacheKey = String(itemId);
+  const cached = getCachedPriceSeries(cacheKey);
+  if (cached) {
+    return new Response(cached, {
       status: 200,
       headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const stale = getCachedPriceSeries(cacheKey, { allowStale: true });
+  const startedAt = Date.now();
+  const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
+
+  const built = await buildPriceSeriesPayload(env, itemId, startedAt, BUILD_BUDGET_MS).then(
+    (payload) => payload,
+    (err) => {
+      console.error("Error building price series:", err);
+      return null;
     }
   );
+
+  if (!built) {
+    if (stale) {
+      return new Response(stale, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Price-Series-Stale": "1"
+        }
+      });
+    }
+
+    return new Response(
+      JSON.stringify({ error: "Failed to build price series, please retry." }),
+      { status: 503, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  setCachedPriceSeries(cacheKey, built.body);
+  return new Response(built.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      ...(built.truncated ? { "X-Price-Series-Partial": "1" } : {})
+    }
+  });
 }
 
 export default {
