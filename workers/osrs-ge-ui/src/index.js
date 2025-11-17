@@ -991,7 +991,8 @@ const HTML = `<!DOCTYPE html>
             backgroundColor: "rgba(59,130,246,0.2)",
             pointRadius: 0,
             borderWidth: 2,
-            tension: 0.15
+            tension: 0.15,
+            spanGaps: true
           },
           {
             label: "Forecast price (next 2h, 5m steps)",
@@ -1001,7 +1002,8 @@ const HTML = `<!DOCTYPE html>
             pointRadius: 0,
             borderWidth: 2,
             borderDash: [6, 3],
-            tension: 0.15
+            tension: 0.15,
+            spanGaps: true
           }
         ];
 
@@ -1014,7 +1016,8 @@ const HTML = `<!DOCTYPE html>
             pointRadius: 0,
             borderWidth: 2,
             borderDash: [5, 5],
-            tension: 0.15
+            tension: 0.15,
+            spanGaps: true
           });
         }
 
