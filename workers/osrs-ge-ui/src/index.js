@@ -1,4 +1,4 @@
-// OSRS GE UI worker: top trades, search, and price history + forecast (no baseline line)
+// OSRS GE UI worker: top trades, search, and price history + forecast (using precomputed histories)
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -119,15 +119,6 @@ const HTML = `<!DOCTYPE html>
     .pin-btn.unpinned {
       color: #4b5563;
     }
-    .pill-watch {
-      display: inline-block;
-      padding: 0.1rem 0.5rem;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      background: #111827;
-      color: #e5e7eb;
-      border: 1px solid #374151;
-    }
     .search-row {
       display: flex;
       gap: 0.5rem;
@@ -151,9 +142,6 @@ const HTML = `<!DOCTYPE html>
     }
     .search-row button:hover {
       background: #1f2937;
-    }
-    .pinned-list {
-      margin-top: 0.4rem;
     }
     .pinned-list table {
       font-size: 0.8rem;
@@ -186,8 +174,8 @@ const HTML = `<!DOCTYPE html>
     <div class="card">
       <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
-        Click a row to see up to the last 14 days (or as far back as available)
-        of mid prices: 5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
+        Click a row to see up to the last 14 days (or as far back as available) of mid prices:
+        5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
       </div>
       <div id="tableContainer">Waiting for data...</div>
@@ -269,20 +257,43 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
+    function getPinnedSet() {
+      const state = loadPinnedState();
+      return new Set(Object.keys(state));
+    }
+
+    function buildMappingFromDaily(dailyJson) {
+      if (!dailyJson) return;
+      const mapping = dailyJson.mapping;
+      if (!Array.isArray(mapping)) return;
+      mappingList = mapping
+        .filter((m) => m && typeof m.id === "number" && m.name)
+        .map((m) => ({ id: m.id, name: m.name }));
+      mappingList.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
     function formatGp(x) {
       if (x === null || x === undefined || !isFinite(x)) return "-";
       const v = Math.round(x);
       return v.toLocaleString("en-US");
     }
 
-    function formatPct(x) {
-      if (x === null || x === undefined || !isFinite(x)) return "-";
-      return x.toFixed(2) + "%";
+    function formatProfitGp(p) {
+      return formatGp(p);
     }
 
-    function formatProb(p) {
+    function formatPercent(p) {
       if (p === null || p === undefined || !isFinite(p)) return "-";
       return (p * 100).toFixed(1) + "%";
+    }
+
+    function formatGpPerHour(v) {
+      if (v === null || v === undefined || !isFinite(v)) return "-";
+      const abs = Math.abs(v);
+      if (abs >= 1_000_000_000) return (v / 1_000_000_000).toFixed(1) + "b";
+      if (abs >= 1_000_000) return (v / 1_000_000).toFixed(1) + "m";
+      if (abs >= 1_000) return (v / 1_000).toFixed(1) + "k";
+      return v.toFixed(0);
     }
 
     function probPill(p) {
@@ -294,39 +305,34 @@ const HTML = `<!DOCTYPE html>
       return '<span class="' + cls + '">' + pct.toFixed(1) + "%</span>";
     }
 
-    function buildMappingFromDaily(dailyJson) {
-      // Attempt to find a list of { id, name } in daily snapshot (wiki mapping).
-      if (!dailyJson) return [];
-      function dfs(obj) {
-        if (Array.isArray(obj)) {
-          if (obj.length && typeof obj[0] === "object" && obj[0] && "id" in obj[0] && "name" in obj[0]) {
-            return obj;
-          }
-          for (const el of obj) {
-            const r = dfs(el);
-            if (r) return r;
-          }
-        } else if (obj && typeof obj === "object") {
-          for (const v of Object.values(obj)) {
-            const r = dfs(v);
-            if (r) return r;
-          }
-        }
-        return null;
+    function togglePin(itemId, name, latestForecastPath) {
+      const state = loadPinnedState();
+      const key = String(itemId);
+      if (state[key] && state[key].pinned) {
+        delete state[key];
+      } else {
+        const nowIso = new Date().toISOString();
+        state[key] = {
+          pinned: true,
+          starredAtIso: nowIso,
+          pinnedAtIso: nowIso,
+          name: name,
+          forecastAtStar: Array.isArray(latestForecastPath) ? latestForecastPath : []
+        };
       }
-      const found = dfs(dailyJson);
-      if (!found) return [];
-      return found.map((x) => ({ id: Number(x.id), name: x.name }));
+      savePinnedState(state);
+      renderPinnedList();
+      renderTopTable();
     }
 
     function renderPinnedList() {
-      const pinnedState = loadPinnedState();
-      const entries = Object.entries(pinnedState)
+      const state = loadPinnedState();
+      const entries = Object.entries(state)
         .filter(([, v]) => v && v.pinned)
         .map(([idStr, v]) => ({
           item_id: Number(idStr),
           name: v.name || ("Item " + idStr),
-          pinnedAtIso: v.starredAtIso || v.pinnedAtIso,
+          pinnedAtIso: v.pinnedAtIso || v.starredAtIso || null,
           forecastLen: Array.isArray(v.forecastAtStar) ? v.forecastAtStar.length : 0
         }));
 
@@ -335,19 +341,24 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
+      entries.sort((a, b) => {
+        const ta = a.pinnedAtIso ? new Date(a.pinnedAtIso).getTime() : 0;
+        const tb = b.pinnedAtIso ? new Date(b.pinnedAtIso).getTime() : 0;
+        return tb - ta;
+      });
+
       const table = document.createElement("table");
       const thead = document.createElement("thead");
       const tbody = document.createElement("tbody");
 
-      const hr = document.createElement("tr");
+      const trHead = document.createElement("tr");
       ["Item", "Pinned at", "Saved forecast points"].forEach((h) => {
         const th = document.createElement("th");
         th.textContent = h;
-        hr.appendChild(th);
+        trHead.appendChild(th);
       });
-      thead.appendChild(hr);
+      thead.appendChild(trHead);
 
-      entries.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
       entries.forEach((row) => {
         const tr = document.createElement("tr");
         tr.className = "clickable";
@@ -363,9 +374,9 @@ const HTML = `<!DOCTYPE html>
         tdPinned.textContent = row.pinnedAtIso || "unknown";
         tr.appendChild(tdPinned);
 
-        const tdPoints = document.createElement("td");
-        tdPoints.textContent = row.forecastLen;
-        tr.appendChild(tdPoints);
+        const tdN = document.createElement("td");
+        tdN.textContent = row.forecastLen;
+        tr.appendChild(tdN);
 
         tbody.appendChild(tr);
       });
@@ -392,10 +403,8 @@ const HTML = `<!DOCTYPE html>
       const pinnedState = loadPinnedState();
 
       const enriched = overviewSignals
-        .filter(function (s) {
-          return s.mid_now && s.mid_now > 0;
-        })
-        .map(function (s) {
+        .filter((s) => s.mid_now && s.mid_now > 0)
+        .map((s) => {
           const mid = s.mid_now;
           const grossRet =
             typeof s.future_return_hat === "number" ? s.future_return_hat : 0;
@@ -411,7 +420,6 @@ const HTML = `<!DOCTYPE html>
               : netProfit / (MODEL_HORIZON * 60);
 
           const netPct = mid > 0 ? (netProfit / mid) * 100 : 0;
-          const grossPct = grossRet * 100;
 
           const keyStr = String(s.item_id);
           const vol24 =
@@ -424,13 +432,13 @@ const HTML = `<!DOCTYPE html>
           const probProfit =
             typeof s.prob_profit === "number" ? s.prob_profit : 0;
 
-          // Give liquid items a modest boost while still letting low-volume picks compete.
-          const volumeWeight = vol24 && vol24 > 0
-            ? Math.max(0.25, Math.log10(vol24 + 10) / 4)
-            : 0.25;
+          const volumeWeight =
+            vol24 && vol24 > 0
+              ? Math.max(0.25, Math.log10(vol24 + 10) / 4)
+              : 0.25;
+
           const probAdjustedProfit =
             Math.max(0, probProfit) * Math.max(0, netProfit);
-          // Keep a floor on probability to avoid a zeroed score for very small but non-zero odds.
           const score =
             probAdjustedProfit * Math.max(0.05, probProfit) * volumeWeight;
 
@@ -442,22 +450,20 @@ const HTML = `<!DOCTYPE html>
             name: s.name || "Item " + s.item_id,
             buy_price: mid,
             target_sell_price: mid * (1 + grossRet),
-            mid_now: mid,
             prob_profit: probProfit,
-            netProfit: netProfit,
-            netPct: netPct,
-            grossPct: grossPct,
-            vol24: vol24,
+            netProfit,
+            netPct,
+            vol24,
             hold_minutes: s.hold_minutes || MODEL_HORIZON,
             pinned: isPinned,
-            gpPerSec: gpPerSec,
-            score: score
+            gpPerSec,
+            score,
+            rawPath: s.path || []
           };
         });
 
-      // Thresholds for "good" trades
-      const MIN_PROB = 0.55;   // at least ~55% win chance
-      const MIN_NET_PCT = 2.0; // at least 2% net return per item
+      const MIN_PROB = 0.55;
+      const MIN_NET_PCT = 2.0;
 
       function compareRows(a, b) {
         if (b.score !== a.score) return b.score - a.score;
@@ -466,13 +472,12 @@ const HTML = `<!DOCTYPE html>
         return (b.vol24 || 0) - (a.vol24 || 0);
       }
 
-      const good = enriched.filter(function (row) {
-        return row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT;
-      });
-
-      const rest = enriched.filter(function (row) {
-        return !(row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT);
-      });
+      const good = enriched.filter(
+        (row) => row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT
+      );
+      const rest = enriched.filter(
+        (row) => !(row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT)
+      );
 
       good.sort(compareRows);
       rest.sort(compareRows);
@@ -484,8 +489,8 @@ const HTML = `<!DOCTYPE html>
       const thead = document.createElement("thead");
       const tbody = document.createElement("tbody");
 
-      const headerRow = document.createElement("tr");
-      const headers = [
+      const trHead = document.createElement("tr");
+      [
         "★",
         "Item",
         "Buy @",
@@ -496,15 +501,14 @@ const HTML = `<!DOCTYPE html>
         "Prob.",
         "24h vol",
         "Horizon"
-      ];
-      headers.forEach(function (text) {
+      ].forEach((h) => {
         const th = document.createElement("th");
-        th.textContent = text;
-        headerRow.appendChild(th);
+        th.textContent = h;
+        trHead.appendChild(th);
       });
-      thead.appendChild(headerRow);
+      thead.appendChild(trHead);
 
-      top10.forEach(function (row) {
+      top10.forEach((row) => {
         const tr = document.createElement("tr");
         tr.className = "clickable";
 
@@ -513,21 +517,9 @@ const HTML = `<!DOCTYPE html>
         btn.className = "pin-btn " + (row.pinned ? "pinned" : "unpinned");
         btn.textContent = row.pinned ? "★" : "☆";
         btn.type = "button";
-        btn.addEventListener("click", function (ev) {
+        btn.addEventListener("click", (ev) => {
           ev.stopPropagation();
-          // When pinning, snapshot the current forecast path if the chart is loaded.
-          const pinnedState = loadPinnedState();
-          const existing = pinnedState[String(row.item_id)] || {};
-          pinnedState[String(row.item_id)] = {
-            ...existing,
-            pinned: !row.pinned,
-            name: row.name,
-            starredAtIso: new Date().toISOString(),
-            // we leave forecastAtStar untouched here; it will be updated when the chart is loaded
-          };
-          savePinnedState(pinnedState);
-          renderPinnedList();
-          renderTopTable();
+          togglePin(row.item_id, row.name, row.rawPath);
         });
         tdStar.appendChild(btn);
         tr.appendChild(tdStar);
@@ -545,17 +537,18 @@ const HTML = `<!DOCTYPE html>
         tr.appendChild(tdSell);
 
         const tdProfit = document.createElement("td");
-        tdProfit.textContent = formatGp(row.netProfit);
+        tdProfit.textContent = formatProfitGp(row.netProfit);
         tr.appendChild(tdProfit);
 
         const tdNetPct = document.createElement("td");
-        tdNetPct.textContent = formatPct(row.netPct);
+        tdNetPct.textContent = row.netPct.toFixed(2) + "%";
         tr.appendChild(tdNetPct);
 
         const tdGpSec = document.createElement("td");
-        tdGpSec.textContent = row.gpPerSec && isFinite(row.gpPerSec)
-          ? formatGp(row.gpPerSec)
-          : "-";
+        tdGpSec.textContent =
+          row.gpPerSec && isFinite(row.gpPerSec)
+            ? formatGp(row.gpPerSec)
+            : "-";
         tr.appendChild(tdGpSec);
 
         const tdProb = document.createElement("td");
@@ -563,14 +556,15 @@ const HTML = `<!DOCTYPE html>
         tr.appendChild(tdProb);
 
         const tdVol = document.createElement("td");
-        tdVol.textContent = row.vol24 != null ? row.vol24.toLocaleString("en-US") : "-";
+        tdVol.textContent =
+          row.vol24 != null ? row.vol24.toLocaleString("en-US") : "-";
         tr.appendChild(tdVol);
 
         const tdHoriz = document.createElement("td");
         tdHoriz.textContent = row.hold_minutes + "m";
         tr.appendChild(tdHoriz);
 
-        tr.addEventListener("click", function () {
+        tr.addEventListener("click", () => {
           loadPriceSeries(row.item_id, row.name);
         });
 
@@ -632,20 +626,37 @@ const HTML = `<!DOCTYPE html>
       searchResultsEl.appendChild(ul);
     }
 
+    searchButton.addEventListener("click", runSearch);
+    searchInput.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") {
+        runSearch();
+      }
+    });
+
     function buildTimeline(history, forecast, starInfo) {
       const tsSet = new Set();
       const histMap = new Map();
       const fcMap = new Map();
       const oldFcMap = new Map();
 
+      function extractTs(pt) {
+        if (!pt) return null;
+        const iso = pt.timestamp_iso || pt.timestamp || pt.time_iso || pt.time || null;
+        if (!iso) return null;
+        const ts = Date.parse(iso);
+        return Number.isFinite(ts) ? ts : null;
+      }
+
       history.forEach(function (pt) {
-        const ts = new Date(pt.timestamp_iso).getTime();
+        const ts = extractTs(pt);
+        if (ts == null) return;
         tsSet.add(ts);
         histMap.set(ts, pt.price);
       });
 
       forecast.forEach(function (pt) {
-        const ts = new Date(pt.timestamp_iso).getTime();
+        const ts = extractTs(pt);
+        if (ts == null) return;
         tsSet.add(ts);
         fcMap.set(ts, pt.price);
       });
@@ -655,34 +666,87 @@ const HTML = `<!DOCTYPE html>
           ? starInfo.forecastAtStar
           : [];
       starForecast.forEach(function (pt) {
-        const ts = new Date(pt.timestamp_iso).getTime();
+        const ts = extractTs(pt);
+        if (ts == null) return;
         tsSet.add(ts);
         oldFcMap.set(ts, pt.price);
       });
 
-      const nowTs = history.length
-        ? new Date(history[history.length - 1].timestamp_iso).getTime()
-        : forecast.length
-        ? new Date(forecast[0].timestamp_iso).getTime()
-        : Date.now();
+      let nowTs = null;
+      if (history.length) {
+        const ts = extractTs(history[history.length - 1]);
+        if (ts != null) nowTs = ts;
+      } else if (forecast.length) {
+        const ts = extractTs(forecast[0]);
+        if (ts != null) nowTs = ts;
+      }
 
-      const sortedTs = Array.from(tsSet).sort((a, b) => a - b);
-      const labels = sortedTs.map((ts) => new Date(ts).toISOString());
+      const rawStarTs =
+        starInfo && starInfo.starredAtIso
+          ? Date.parse(starInfo.starredAtIso)
+          : null;
+      let starTs = rawStarTs;
 
+      if (starTs != null && histMap.size && !histMap.has(starTs)) {
+        const histTsList = Array.from(histMap.keys());
+        let closestTs = histTsList[0];
+        let smallestDiff = Math.abs(starTs - closestTs);
+        for (const ts of histTsList) {
+          const diff = Math.abs(starTs - ts);
+          if (diff < smallestDiff) {
+            smallestDiff = diff;
+            closestTs = ts;
+          }
+        }
+        starTs = closestTs;
+      }
+
+      if (starTs != null) {
+        tsSet.add(starTs);
+        if (!oldFcMap.has(starTs) && histMap.has(starTs)) {
+          oldFcMap.set(starTs, histMap.get(starTs));
+        }
+      }
+      if (nowTs != null) {
+        tsSet.add(nowTs);
+      }
+
+      const tsList = Array.from(tsSet).filter(function (ts) {
+        return ts != null && Number.isFinite(ts);
+      });
+      tsList.sort(function (a, b) {
+        return a - b;
+      });
+
+      const labels = [];
       const histData = [];
       const fcData = [];
       const oldFcData = [];
       const starMarkerData = [];
       const nowMarkerData = [];
 
-      sortedTs.forEach(function (ts) {
+      tsList.forEach(function (ts) {
+        const d = new Date(ts);
+        const iso = isNaN(d.getTime()) ? null : d.toISOString();
+        const label = iso ? iso.slice(5, 10) + " " + iso.slice(11, 16) : String(ts);
+        labels.push(label);
+
         histData.push(histMap.has(ts) ? histMap.get(ts) : null);
-        fcData.push(fcMap.has(ts) ? fcMap.get(ts) : null);
-        oldFcData.push(oldFcMap.has(ts) ? oldFcMap.get(ts) : null);
+
+        const isFutureOrNow = nowTs == null || ts >= nowTs;
+        fcData.push(isFutureOrNow && fcMap.has(ts) ? fcMap.get(ts) : null);
+
+        const isAfterStar = starTs == null || ts >= starTs;
+        oldFcData.push(isAfterStar && oldFcMap.has(ts) ? oldFcMap.get(ts) : null);
+
         starMarkerData.push(
-          starInfo && ts === nowTs ? (histMap.get(ts) || fcMap.get(ts) || null) : null
+          starTs != null && ts === starTs
+            ? histMap.get(ts) || oldFcMap.get(ts) || null
+            : null
         );
-        nowMarkerData.push(ts === nowTs ? (histMap.get(ts) || fcMap.get(ts) || null) : null);
+        nowMarkerData.push(
+          nowTs != null && ts === nowTs ? histMap.get(ts) || null : null
+        );
       });
 
       return {
@@ -704,7 +768,10 @@ const HTML = `<!DOCTYPE html>
         if (!res.ok) {
           priceStatusEl.textContent =
             "No price data available (HTTP " + res.status + ").";
-          if (priceChart) { priceChart.destroy(); priceChart = null; }
+          if (priceChart) {
+            priceChart.destroy();
+            priceChart = null;
+          }
           return;
         }
 
@@ -714,18 +781,22 @@ const HTML = `<!DOCTYPE html>
 
         if (!history.length && !forecast.length) {
           priceStatusEl.textContent = "No price data yet for this item.";
-          if (priceChart) { priceChart.destroy(); priceChart = null; }
+          if (priceChart) {
+            priceChart.destroy();
+            priceChart = null;
+          }
           return;
         }
 
         const pinnedState = loadPinnedState();
         const pinEntry = pinnedState[String(itemId)];
-        const starInfo = pinEntry && pinEntry.pinned
-          ? {
-              starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
-              forecastAtStar: pinEntry.forecastAtStar || []
-            }
-          : null;
+        const starInfo =
+          pinEntry && pinEntry.pinned
+            ? {
+                starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
+                forecastAtStar: pinEntry.forecastAtStar || []
+              }
+            : null;
 
         const tl = buildTimeline(history, forecast, starInfo);
         const labels = tl.labels;
@@ -737,7 +808,7 @@ const HTML = `<!DOCTYPE html>
 
         const allPrices = []
           .concat(histData, fcData)
-          .filter(function (v) { return v != null && isFinite(v); });
+          .filter((v) => v != null && isFinite(v));
         let yMin = 0;
         let yMax = 1;
         if (allPrices.length) {
@@ -753,65 +824,73 @@ const HTML = `<!DOCTYPE html>
           priceChart.destroy();
         }
 
+        const datasets = [
+          {
+            label: "Historical mid price (5m last 24h, 30m older)",
+            data: histData,
+            borderColor: "rgba(59,130,246,1)",
+            backgroundColor: "rgba(59,130,246,0.2)",
+            pointRadius: 0,
+            borderWidth: 2,
+            tension: 0.15,
+            spanGaps: true
+          },
+          {
+            label: "Forecast price (next 2h, 5m steps)",
+            data: fcData,
+            borderColor: "rgba(16,185,129,1)",
+            backgroundColor: "rgba(16,185,129,0.15)",
+            pointRadius: 0,
+            borderWidth: 2,
+            borderDash: [6, 3],
+            tension: 0.15,
+            spanGaps: true
+          }
+        ];
+
+        if (starInfo && oldFcData.some((v) => v != null)) {
+          datasets.splice(1, 0, {
+            label: "Forecast at pin time",
+            data: oldFcData,
+            borderColor: "rgba(234,179,8,1)",
+            backgroundColor: "rgba(234,179,8,0.15)",
+            pointRadius: 0,
+            borderWidth: 1.5,
+            borderDash: [6, 4],
+            tension: 0.15,
+            spanGaps: true
+          });
+        }
+
+        if (starInfo && starMarkerData.some((v) => v != null)) {
+          datasets.push({
+            label: "Pin time",
+            data: starMarkerData,
+            borderColor: "rgba(250,204,21,1)",
+            backgroundColor: "rgba(250,204,21,1)",
+            pointRadius: 4,
+            borderWidth: 0,
+            showLine: false
+          });
+        }
+
+        if (nowMarkerData.some((v) => v != null)) {
+          datasets.push({
+            label: "Now",
+            data: nowMarkerData,
+            borderColor: "rgba(248,250,252,1)",
+            backgroundColor: "rgba(248,250,252,1)",
+            pointRadius: 4,
+            borderWidth: 0,
+            showLine: false
+          });
+        }
+
         priceChart = new Chart(ctx, {
           type: "line",
           data: {
-            labels: labels,
-            datasets: [
-              {
-                label: "Historical mid price (5m/30m)",
-                data: histData,
-                borderColor: "rgba(59,130,246,1)",
-                backgroundColor: "rgba(59,130,246,0.2)",
-                pointRadius: 0,
-                borderWidth: 2,
-                tension: 0.15,
-                spanGaps: true
-              },
-              {
-                label: "Forecast price (next 2h, 5m steps)",
-                data: fcData,
-                borderColor: "rgba(16,185,129,1)",
-                backgroundColor: "rgba(16,185,129,0.15)",
-                pointRadius: 0,
-                borderWidth: 2,
-                tension: 0.15,
-                spanGaps: true
-              },
-              {
-                label: "Forecast at pin time",
-                data: oldFcData,
-                borderColor: "rgba(234,179,8,1)",
-                backgroundColor: "rgba(234,179,8,0.15)",
-                pointRadius: 0,
-                borderWidth: 1.5,
-                borderDash: [6, 4],
-                tension: 0.15,
-                spanGaps: true,
-                hidden: !starInfo
-              },
-              {
-                label: "Pin time",
-                data: starMarkerData,
-                borderColor: "rgba(250,204,21,1)",
-                backgroundColor: "rgba(250,204,21,1)",
-                pointRadius: 4,
-                borderWidth: 0,
-                type: "scatter",
-                showLine: false,
-                hidden: !starInfo
-              },
-              {
-                label: "Now",
-                data: nowMarkerData,
-                borderColor: "rgba(248,250,252,1)",
-                backgroundColor: "rgba(248,250,252,1)",
-                pointRadius: 4,
-                borderWidth: 0,
-                type: "scatter",
-                showLine: false
-              }
-            ]
+            labels,
+            datasets
           },
           options: {
             animation: false,
@@ -819,10 +898,10 @@ const HTML = `<!DOCTYPE html>
             maintainAspectRatio: false,
             scales: {
               x: {
-                type: "time",
-                time: { unit: "hour" },
                 ticks: {
-                  maxTicksLimit: 12
+                  maxRotation: 45,
+                  minRotation: 45,
+                  maxTicksLimit: 16
                 }
               },
               y: {
@@ -843,16 +922,6 @@ const HTML = `<!DOCTYPE html>
             plugins: {
               legend: {
                 position: "bottom"
-              },
-              tooltip: {
-                callbacks: {
-                  label: function (ctx) {
-                    const label = ctx.dataset.label || "";
-                    const v = ctx.parsed.y;
-                    if (v == null || !isFinite(v)) return label;
-                    return label + ": " + v.toLocaleString("en-US") + " gp";
-                  }
-                }
               }
             }
           }
@@ -867,61 +936,86 @@ const HTML = `<!DOCTYPE html>
             ? data.meta.truncated
             : false;
 
-        priceStatusEl.textContent =
-          "History source: " + src + (truncated ? " (truncated)" : "") +
-          ". Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
+        const hasForecast = forecast && forecast.length > 1;
+
+        if (!hasForecast) {
+          priceStatusEl.textContent =
+            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. History source: " +
+            src +
+            (truncated ? " (truncated)" : "") +
+            ".";
+        } else if (starInfo) {
+          priceStatusEl.textContent =
+            "History source: " +
+            src +
+            (truncated ? " (truncated)" : "") +
+            ". Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
+        } else {
+          priceStatusEl.textContent =
+            "History source: " +
+            src +
+            (truncated ? " (truncated)" : "") +
+            ". Blue = history; green = current forecast (5–120 minute horizons).";
+        }
       } catch (err) {
         console.error("Error loading price series:", err);
         priceStatusEl.textContent = "Error loading price series.";
-        if (priceChart) { priceChart.destroy(); priceChart = null; }
+        if (priceChart) {
+          priceChart.destroy();
+          priceChart = null;
+        }
       }
     }
 
     async function loadOverview() {
       try {
-        statusEl.textContent = "Loading signals and daily snapshot...";
+        statusEl.textContent = "Fetching /signals and /daily...";
+
         const [sigRes, dailyRes] = await Promise.all([
           fetch("/signals"),
           fetch("/daily")
         ]);
 
         if (!sigRes.ok) {
-          statusEl.textContent = "Failed to load signals (HTTP " + sigRes.status + ").";
+          statusEl.textContent =
+            "Failed to load signals (HTTP " + sigRes.status + ").";
           return;
         }
-        const sigJson = await sigRes.json();
-        overviewSignals = Array.isArray(sigJson.signals) ? sigJson.signals : [];
-        MODEL_HORIZON = sigJson.horizon_minutes || 60;
-        MODEL_TAX = sigJson.tax_rate != null ? sigJson.tax_rate : 0.02;
-
-        if (dailyRes.ok) {
-          dailySnapshot = await dailyRes.json();
-          mappingList = buildMappingFromDaily(dailySnapshot);
-        } else {
-          dailySnapshot = null;
-          mappingList = [];
+        if (!dailyRes.ok) {
+          statusEl.textContent =
+            "Failed to load daily snapshot (HTTP " + dailyRes.status + ").";
+          return;
         }
 
-        statusEl.textContent = "";
-        const horizonMinutes = MODEL_HORIZON;
+        const sigJson = await sigRes.json();
+        const dailyJson = await dailyRes.json();
+
+        overviewSignals = sigJson.signals || [];
+        dailySnapshot = dailyJson;
+
+        MODEL_HORIZON =
+          typeof sigJson.horizon_minutes === "number"
+            ? sigJson.horizon_minutes
+            : 60;
+        MODEL_TAX =
+          typeof sigJson.tax_rate === "number" ? sigJson.tax_rate : 0.02;
+
+        statusEl.textContent = "Loaded " + overviewSignals.length + " signals.";
         metaEl.textContent =
-          "Signals computed at " +
-          (sigJson.generated_at_iso || "unknown time") +
-          " – horizon " + horizonMinutes + " minutes, tax " + (MODEL_TAX * 100).toFixed(1) + "%.";
+          "Main horizon: " +
+          MODEL_HORIZON +
+          " minutes, tax: " +
+          (MODEL_TAX * 100).toFixed(1) +
+          "%.";
+
+        buildMappingFromDaily(dailySnapshot);
         renderTopTable();
         renderPinnedList();
       } catch (err) {
         console.error("Error loading overview:", err);
-        statusEl.textContent = "Error loading signals/daily snapshot.";
+        statusEl.textContent = "Error loading overview.";
       }
     }
-
-    searchButton.addEventListener("click", runSearch);
-    searchInput.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter") {
-        runSearch();
-      }
-    });
 
     loadOverview();
   })();
@@ -929,12 +1023,19 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-const PRICE_CACHE = new Map();
-const PRICE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const PRICE_CACHE_MAX_ITEMS = 50;
+//
+// Backend (Cloudflare Worker) – R2-backed endpoints
+//
+
+// Signals cache
+const SIGNALS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 let LAST_SIGNALS_JSON = null;
 let LAST_SIGNALS_FETCHED_AT = 0;
-const SIGNALS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes of reuse on success
+
+// Simple per-item /price-series response cache
+const PRICE_CACHE = new Map();
+const PRICE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const PRICE_CACHE_MAX_ITEMS = 64;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -942,48 +1043,24 @@ function sleep(ms) {
 
 async function bucketGetWithRetry(env, key, { attempts = 3, baseDelayMs = 200 } = {}) {
   let lastError = null;
-
   for (let i = 0; i < attempts; i++) {
     try {
-      const obj = await env.OSRS_BUCKET.get(key);
-      return obj;
+      return await env.OSRS_BUCKET.get(key);
     } catch (err) {
       lastError = err;
       const isLast = i === attempts - 1;
       const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
       console.warn(
-        `Attempt ${i + 1} to fetch ${key} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
+        `Attempt ${i + 1} to fetch ${key} failed: ${err.message}${
+          isLast ? "" : `; retrying in ${delay}ms`
+        }`
       );
       if (!isLast) {
         await sleep(delay);
       }
     }
   }
-
   console.error(`Failed to fetch ${key} after ${attempts} attempts`, lastError);
-  return null;
-}
-
-async function bucketListWithRetry(env, options, { attempts = 3, baseDelayMs = 200 } = {}) {
-  let lastError = null;
-
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await env.OSRS_BUCKET.list(options);
-    } catch (err) {
-      lastError = err;
-      const isLast = i === attempts - 1;
-      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
-      console.warn(
-        `Attempt ${i + 1} to list ${options?.prefix || ""} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
-      );
-      if (!isLast) {
-        await sleep(delay);
-      }
-    }
-  }
-
-  console.error(`Failed to list with options ${JSON.stringify(options)} after ${attempts} attempts`, lastError);
   return null;
 }
 
@@ -1007,25 +1084,22 @@ async function loadSignalsWithCache(env) {
     }
   }
 
-  return { json: LAST_SIGNALS_JSON, source: LAST_SIGNALS_JSON ? "stale" : "none" };
+  return { json: LAST_SIGNALS_JSON, source: LAST_SIGNALS_JSON ? "stale" : "missing" };
 }
 
-function getCachedPriceSeries(cacheKey, { allowStale = false } = {}) {
+function getCachedPriceSeries(cacheKey) {
   const entry = PRICE_CACHE.get(cacheKey);
   if (!entry) return null;
-
   const age = Date.now() - entry.cachedAt;
-  if (age > PRICE_CACHE_TTL_MS && !allowStale) {
+  if (age > PRICE_CACHE_TTL_MS) {
     PRICE_CACHE.delete(cacheKey);
     return null;
   }
-
   return entry.payload;
 }
 
 function setCachedPriceSeries(cacheKey, payload) {
   PRICE_CACHE.set(cacheKey, { cachedAt: Date.now(), payload });
-
   if (PRICE_CACHE.size > PRICE_CACHE_MAX_ITEMS) {
     const oldestKey = PRICE_CACHE.keys().next().value;
     PRICE_CACHE.delete(oldestKey);
@@ -1048,187 +1122,62 @@ async function handleSignals(env) {
 }
 
 async function handleDaily(env) {
-  // Return the most recent daily snapshot we can find (today, or fallback to yesterday)
-  const now = new Date();
-  for (let delta = 0; delta < 7; delta++) {
-    const d = new Date(now.getTime() - delta * 86400000);
-    const year = d.getUTCFullYear();
-    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(d.getUTCDate()).padStart(2, "0");
-    const prefix = "daily/" + year + "/" + month + "/" + day;
-
-    const listing = await bucketListWithRetry(env, { prefix, limit: 1000 });
-    if (!listing || !listing.objects || !listing.objects.length) {
-      continue;
-    }
-    const objs = listing.objects.slice().sort((a, b) => (a.key < b.key ? -1 : 1));
-    const latest = objs[objs.length - 1];
-
-    const obj = await bucketGetWithRetry(env, latest.key);
-    if (!obj) continue;
-
-    const text = await obj.text();
-    return new Response(text, {
-      status: 200,
+  const obj = await bucketGetWithRetry(env, "daily/latest.json");
+  if (!obj) {
+    return new Response(JSON.stringify({ error: "No daily snapshot found" }), {
+      status: 404,
       headers: { "Content-Type": "application/json" }
     });
   }
-
-  return new Response(JSON.stringify({ error: "No daily snapshot found" }), {
-    status: 404,
+  const text = await obj.text();
+  return new Response(text, {
+    status: 200,
     headers: { "Content-Type": "application/json" }
   });
 }
 
-// The old snapshot-based history builder (buildSnapshotKeys/sampleSnapshotKeys/loadHistoryFromSnapshots/
-// buildPriceSeriesPayload) is left in the file but no longer used by /price-series now that we have
-// precomputed per-item history. It remains here as a potential fallback or reference, but is not executed
-// on normal requests.
-
-async function buildSnapshotKeys(env, startedAt, budgetMs) {
-  const MAX_DAYS = 14;
-  const MAX_SNAPSHOTS = MAX_DAYS * 24 * 12; // 5m buckets
-  const now = new Date();
-
-  const keys = [];
-  let truncated = false;
-
-  for (let delta = 0; delta < MAX_DAYS && keys.length < MAX_SNAPSHOTS; delta++) {
-    if (Date.now() - startedAt > budgetMs) {
-      truncated = true;
-      break;
-    }
-
-    const d = new Date(now.getTime() - delta * 86400000);
-    const year = d.getUTCFullYear();
-    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(d.getUTCDate()).padStart(2, "0");
-    const prefix = "5m/" + year + "/" + month + "/" + day + "/";
-
-    let cursor;
-    while (true) {
-      const listing = await bucketListWithRetry(env, { prefix, cursor, limit: 1000 });
-      if (!listing) {
-        truncated = true;
-        break;
-      }
-      for (const obj of listing.objects || []) {
-        keys.push(obj.key);
-      }
-      if (!listing.truncated) break;
-      if (Date.now() - startedAt > budgetMs) {
-        truncated = true;
-        break;
-      }
-      cursor = listing.cursor;
-    }
-    if (keys.length >= MAX_SNAPSHOTS || truncated) break;
+// Load precomputed per-item history from R2: history/{itemId}.json
+async function loadPrecomputedHistory(env, itemId) {
+  const key = `history/${itemId}.json`;
+  const obj = await bucketGetWithRetry(env, key, { attempts: 2, baseDelayMs: 150 });
+  if (!obj) {
+    return { history: [], found: false };
   }
-
-  keys.sort();
-  return { selectedKeys: keys.slice(-MAX_SNAPSHOTS), truncated };
-}
-
-function sampleSnapshotKeys(selectedKeys) {
-  // Downsample snapshot fetches to avoid timeouts while still covering the full window.
-  // Keep the most recent 3h at full (5m) resolution and aggressively sample the older
-  // portion to stay within a tighter fetch budget. The lower cap keeps the worker comfortably
-  // within observed timeout thresholds and reduces cascading failures when a single item is heavy
-  // to load.
-  const MAX_FETCH_KEYS = 90; // tighter hard cap on snapshot fetches per request
-  const RECENT_FULL_WINDOW = 3 * 12; // last 3h of 5m snapshots
-
-  const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
-  const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
-
-  const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
-  const sampledOlder = [];
-  if (olderKeys.length && remainingBudget > 0) {
-    const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
-    for (let i = 0; i < olderKeys.length; i += olderStride) {
-      sampledOlder.push(olderKeys[i]);
-    }
-  }
-
-  const sampledKeys = sampledOlder.concat(recentKeys);
-  if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
-    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
-  }
-
-  return sampledKeys;
-}
-
-async function readSnapshotJson(env, key) {
-  const obj = await bucketGetWithRetry(env, key, { attempts: 3, baseDelayMs: 250 });
-  if (!obj) return null;
-
   try {
-    return await obj.json();
+    const parsed = await obj.json();
+    if (!parsed || !Array.isArray(parsed.history)) {
+      return { history: [], found: false };
+    }
+    return { history: parsed.history, found: true };
   } catch (err) {
-    console.error("Failed to parse snapshot", key, err);
-    return null;
+    console.error("Failed to parse precomputed history", key, err);
+    return { history: [], found: false };
   }
 }
 
-async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, budgetMs) {
-  const history = [];
-  const BATCH_SIZE = 8;
-  let truncated = false;
-
-  for (let i = 0; i < sampledKeys.length; i += BATCH_SIZE) {
-    if (Date.now() - startedAt > budgetMs) {
-      truncated = true;
-      break;
-    }
-
-    const batch = sampledKeys.slice(i, i + BATCH_SIZE);
-    const results = await Promise.all(
-      batch.map(async (key) => {
-        const snap = await readSnapshotJson(env, key);
-        if (!snap || !snap.five_minute) return [];
-        const ts = snap.five_minute.timestamp;
-        const dtIso = new Date(ts * 1000).toISOString();
-        const rec = snap.five_minute.data[String(itemId)] || snap.five_minute.data[itemId];
-        if (!rec) return [];
-        const high = rec.avgHighPrice;
-        const low = rec.avgLowPrice;
-        if (high == null || low == null) return [];
-        const mid = (high + low) / 2;
-        if (!isFinite(mid) || mid <= 0) return [];
-        return [{ timestamp_iso: dtIso, price: mid }];
-      })
-    );
-
-    for (const arr of results) {
-      if (Array.isArray(arr)) {
-        for (const pt of arr) {
-          history.push(pt);
-        }
-      }
-    }
-  }
-
-  history.sort((a, b) => (a.timestamp_iso < b.timestamp_iso ? -1 : 1));
-  return { history, truncated };
-}
-
+// Build forecast path from signals, anchored to last history price (or mid_now)
 async function buildForecast(env, itemId, history) {
   const forecast = [];
   const { json: sigJson } = await loadSignalsWithCache(env);
   if (!sigJson) return forecast;
 
   const signals = sigJson.signals || [];
-  const s = signals.find((row) => row.item_id === itemId || String(row.item_id) === String(itemId));
-
-  if (!s || !Array.isArray(s.path) || typeof s.mid_now !== "number") return forecast;
+  const s = signals.find(
+    (row) => row.item_id === itemId || String(row.item_id) === String(itemId)
+  );
+  if (!s || !Array.isArray(s.path) || typeof s.mid_now !== "number") {
+    return forecast;
+  }
 
   const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
-
   const baseTimeMs = history.length
-    ? new Date(history[history.length - 1].timestamp_iso).getTime()
+    ? Date.parse(history[history.length - 1].timestamp_iso || history[history.length - 1].timestamp)
     : Date.now();
 
-  // Anchor the forecast to the last history timestamp so the lines connect
+  if (!Number.isFinite(baseTimeMs)) {
+    return forecast;
+  }
+
   forecast.push({
     timestamp_iso: new Date(baseTimeMs).toISOString(),
     price: anchorMid
@@ -1240,68 +1189,13 @@ async function buildForecast(env, itemId, history) {
     }
     const minutes = p.minutes;
     const ret = p.future_return_hat;
-
-    // Optional mild clamp to avoid absurd spikes
     const clampedRet = Math.max(-0.8, Math.min(3.0, ret));
-
     const price = anchorMid * (1 + clampedRet);
     const tsIso = new Date(baseTimeMs + minutes * 60000).toISOString();
     forecast.push({ timestamp_iso: tsIso, price });
   }
 
   return forecast;
-}
-
-async function buildPriceSeriesPayload(env, itemId, startedAt, budgetMs) {
-  const { selectedKeys, truncated: listTruncated } = await buildSnapshotKeys(
-    env,
-    startedAt,
-    budgetMs
-  );
-  let truncated = !!listTruncated;
-
-  const sampledKeys = sampleSnapshotKeys(selectedKeys);
-  const historyResult = await loadHistoryFromSnapshots(
-    env,
-    itemId,
-    sampledKeys,
-    startedAt,
-    budgetMs
-  );
-  truncated = truncated || historyResult.truncated;
-  const history = historyResult.history;
-
-  const forecast = await buildForecast(env, itemId, history);
-
-  return {
-    truncated,
-    body: JSON.stringify({
-      item_id: itemId,
-      history,
-      forecast,
-      meta: { truncated, source: "on-demand" }
-    })
-  };
-}
-
-async function loadPrecomputedHistory(env, itemId) {
-  const key = `history/${itemId}.json`;
-  const obj = await bucketGetWithRetry(env, key, { attempts: 2, baseDelayMs: 150 });
-  if (!obj) {
-    return { history: [], found: false };
-  }
-
-  try {
-    const text = await obj.text();
-    const parsed = JSON.parse(text);
-    if (!parsed || !Array.isArray(parsed.history)) {
-      return { history: [], found: false };
-    }
-    return { history: parsed.history, found: true };
-  } catch (err) {
-    console.error("Failed to parse precomputed history for", itemId, err);
-    return { history: [], found: false };
-  }
 }
 
 async function handlePriceSeries(env, itemId) {
@@ -1314,10 +1208,7 @@ async function handlePriceSeries(env, itemId) {
     });
   }
 
-  // Try to load precomputed history for this item.
   const { history, found } = await loadPrecomputedHistory(env, itemId);
-
-  // Build forecast from signals, anchored to the last history point (or mid_now if no history).
   const forecast = await buildForecast(env, itemId, history);
 
   const truncated = !found;
@@ -1355,12 +1246,12 @@ export default {
     }
     if (url.pathname === "/price-series") {
       const idParam = url.searchParams.get("item_id");
-      const itemId = parseInt(idParam, 10);
-      if (!idParam || !Number.isFinite(itemId)) {
-        return new Response(
-          JSON.stringify({ error: "item_id query param required" }),
-          { status: 400, headers: { "Content-Type": "application/json" } }
-        );
+      const itemId = idParam ? Number(idParam) : NaN;
+      if (!Number.isFinite(itemId) || itemId <= 0) {
+        return new Response(JSON.stringify({ error: "Invalid item_id" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
       }
       return handlePriceSeries(env, itemId);
     }
