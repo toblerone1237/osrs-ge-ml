@@ -11,7 +11,7 @@ from features import (
     get_r2_client,
     list_keys_with_prefix,
     flatten_5m_snapshots,
-    add_basic_features,
+    add_model_features,
     add_multi_horizon_returns,
     HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
@@ -26,7 +26,23 @@ DECAY_DAYS = 14           # recency weighting half-life (days)
 TAX_RATE = 0.02
 MARGIN = 0.002            # extra 0.2% above tax for "profitable"
 
-FEATURE_COLS = ["mid_price", "spread_pct", "log_volume_5m"]
+# Features used by both regressors and probability-of-profit
+FEATURE_COLS = [
+    "mid_price",
+    "spread_pct",
+    "log_volume_5m",
+    "total_volume_5m",
+    "ret_5m_past",
+    "ret_15m_past",
+    "ret_60m_past",
+    "volatility_60m",
+    "log_rolling_volume_60m",
+    "volume_ratio_5m_to_60m",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+]
 
 # how many samples we require to train a regressor for a given horizon
 MIN_SAMPLES_PER_HORIZON = 50
@@ -70,17 +86,14 @@ def build_training_dataframe(s3, bucket):
 def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Add:
-      - basic per-snapshot features
+      - model features
       - multi-horizon return columns: ret_5m, ret_10m, ..., ret_120m
       - 60m "profit_ok" label
       - recency-based sample_weight
     """
-    df = add_basic_features(df_raw)
-    df = df.dropna(subset=["mid_price"])
-    df = df[df["mid_price"] > 0].copy()
-    df.sort_values(["item_id", "timestamp"], inplace=True)
+    df = add_model_features(df_raw)
 
-    # Add multi-horizon returns
+    # Add multi-horizon returns (targets)
     df = add_multi_horizon_returns(df, horizons_minutes=HORIZONS_MINUTES)
 
     # Check we have the main horizon
@@ -96,7 +109,7 @@ def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
     # Define main 60m future return
     df["future_return"] = df[col_60]
 
-    # "Profitable" label: net return after tax + margin > 0
+    # "Profitable" event: net return after tax + margin > 0
     # net_return = (1 + future_return) * (1 - TAX_RATE) - 1
     df["net_return"] = (1.0 + df["future_return"]) * (1.0 - TAX_RATE) - 1.0
     df["profit_ok"] = (df["net_return"] > MARGIN).astype(int)
@@ -118,15 +131,14 @@ def train_models(df: pd.DataFrame):
     Train:
       - A dict of XGBRegressors, one per horizon in HORIZONS_MINUTES
         reg_models[h].predict(X) ~= ret_{h}m
-      - A 60m classifier for profit_ok
+      - Estimate residual std for the main horizon (for probability-of-profit)
     """
     X_all = df[FEATURE_COLS].values
     w = df["sample_weight"].values
 
-    # ---------------------------
-    # Regressors per horizon
-    # ---------------------------
     reg_models = {}
+    sigma_main = None
+
     for H in HORIZONS_MINUTES:
         col = f"ret_{H}m"
         if col not in df.columns:
@@ -154,67 +166,53 @@ def train_models(df: pd.DataFrame):
         reg.fit(X_all[mask], y_h[mask], sample_weight=w[mask])
         reg_models[H] = reg
 
+        # After fitting the main horizon model, compute residual std
+        if H == HORIZON_MINUTES:
+            y_true = y_h[mask]
+            y_pred = reg.predict(X_all[mask])
+            w_h = w[mask]
+            # Normalise weights to avoid numerical issues
+            w_h = w_h / np.mean(w_h)
+            mse = np.average((y_true - y_pred) ** 2, weights=w_h)
+            sigma = float(np.sqrt(mse))
+            sigma_main = max(sigma, 1e-8)  # avoid degenerate zero
+
     if not reg_models:
         raise RuntimeError("No regression models were trained (not enough data for any horizon).")
 
-    # ---------------------------
-    # 60m classifier
-    # ---------------------------
-    y_cls = df["profit_ok"].values.astype(int)
-    print(f"[train] Training classifier on {len(y_cls)} samples.")
-    cls = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        objective="binary:logistic",
-        n_jobs=4,
-        tree_method="hist",
-    )
-    cls.fit(X_all, y_cls, sample_weight=w)
+    if sigma_main is None:
+        raise RuntimeError(f"No residual std computed for main horizon {HORIZON_MINUTES}m.")
 
-    return reg_models, cls, FEATURE_COLS
+    return reg_models, sigma_main, FEATURE_COLS
 
 
 # ---------------------------------------------------------------------------
 # Saving
 # ---------------------------------------------------------------------------
 
-def save_models(s3, bucket, reg_models, cls, feature_cols):
+def save_models(s3, bucket, reg_models, sigma_main, feature_cols):
     """
     Save:
       - reg_models (dict: horizon -> regressor) as latest_reg.pkl
-      - cls as latest_cls.pkl
-      - meta.json with both main and path horizon info
+      - meta.json with horizon, feature, and distribution info
     """
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
 
-    # Serialize models into memory buffers
+    # Serialize models into memory buffer
     buf_reg = io.BytesIO()
-    buf_cls = io.BytesIO()
     joblib.dump(reg_models, buf_reg)
-    joblib.dump(cls, buf_cls)
     buf_reg.seek(0)
-    buf_cls.seek(0)
 
-    # Date-stamped keys
+    # Date-stamped key
     key_reg = f"models/xgb/{date_part}/reg_multi.pkl"
-    key_cls = f"models/xgb/{date_part}/cls_60m.pkl"
     s3.put_object(Bucket=bucket, Key=key_reg, Body=buf_reg.getvalue())
-    s3.put_object(Bucket=bucket, Key=key_cls, Body=buf_cls.getvalue())
 
-    # "Latest" pointers (these are what score_latest.py will load)
+    # "Latest" pointer (what score_latest.py will load)
     s3.put_object(
         Bucket=bucket,
         Key="models/xgb/latest_reg.pkl",
         Body=buf_reg.getvalue(),
-    )
-    s3.put_object(
-        Bucket=bucket,
-        Key="models/xgb/latest_cls.pkl",
-        Body=buf_cls.getvalue(),
     )
 
     # Metadata
@@ -223,9 +221,10 @@ def save_models(s3, bucket, reg_models, cls, feature_cols):
         "path_horizons_minutes": HORIZONS_MINUTES,   # [5,10,...,120]
         "window_days": WINDOW_DAYS,
         "decay_days": DECAY_DAYS,
-        "feature_cols": feature_cols,                # used for both reg + cls
+        "feature_cols": feature_cols,                # used for regressors
         "tax_rate": TAX_RATE,
         "margin": MARGIN,
+        "sigma_main": float(sigma_main),
         "generated_at_iso": now.isoformat(),
     }
 
@@ -262,9 +261,10 @@ def main():
         print("No rows after labels/weights.")
         return
 
-    reg_models, cls, feature_cols = train_models(df)
-    save_models(s3, bucket, reg_models, cls, feature_cols)
+    reg_models, sigma_main, feature_cols = train_models(df)
+    save_models(s3, bucket, reg_models, sigma_main, feature_cols)
     print("Training complete.")
+    print(f"Main-horizon residual sigma: {sigma_main:.6f}")
 
 
 if __name__ == "__main__":
