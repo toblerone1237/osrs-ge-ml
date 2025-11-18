@@ -1,7 +1,7 @@
 import os
-import json
 import io
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from math import erf, sqrt
 
 import numpy as np
 import pandas as pd
@@ -11,405 +11,363 @@ from features import (
     get_r2_client,
     list_keys_with_prefix,
     flatten_5m_snapshots,
-    add_basic_features,
+    add_model_features,
+    HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
 
-# --------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Paths / config
+# ---------------------------------------------------------------------------
 
-# How far back we are willing to look for a "latest" snapshot per item
-# when generating signals. Any item that traded at least once in the last
-# SCORING_LOOKBACK_MINUTES minutes can get a signal, even if it did not
-# appear in the very last 5m bucket.
-SCORING_LOOKBACK_MINUTES = 60
+HORIZON_MINUTES = 60  # main decision horizon (must be in HORIZONS_MINUTES)
+WINDOW_MINUTES = 60   # how far back to pull snapshots for scoring
+TAX_RATE = 0.02       # same as in training
+MARGIN = 0.002        # same as in training
+
+# Minimum volume over the scoring window for an item to be considered "active"
+MIN_VOLUME_WINDOW = 1
+
+# Minimum mid price to consider (exclude literal junk)
+MIN_MID_PRICE = 100
 
 
-# --------------------------------------------------------------------
-# Helpers to find recent 5m snapshots and to load models + item map
-# --------------------------------------------------------------------
-
-
-def get_latest_5m_key(s3, bucket: str) -> str | None:
+def get_latest_5m_key(s3, bucket):
     """
-    Find the latest 5m snapshot key by checking today, then yesterday.
-    """
-    now = datetime.now(timezone.utc)
-    for delta in (0, 1):
-        d = (now - timedelta(days=delta)).date()
-        prefix = f"5m/{d.year}/{d.month:02d}/{d.day:02d}/"
-        keys = list_keys_with_prefix(s3, bucket, prefix)
-        if keys:
-            keys.sort()
-            return keys[-1]
-    return None
-
-
-def get_recent_5m_keys(s3, bucket: str, minutes: int) -> list[str]:
-    """
-    Return all 5m snapshot keys whose timestamp falls within the last
-    `minutes` minutes. We only need to look at today + yesterday because
-    minutes is assumed < 24h.
+    Return the key of the most recent 5m snapshot in the bucket, or None.
     """
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=minutes)
-    keys_with_ts: list[tuple[datetime, str]] = []
+    # For scoring we only care about "today" – the most recent snapshot
+    prefix = f"5m/{now.year}/{now.month:02d}/{now.day:02d}/"
+    keys = list_keys_with_prefix(s3, bucket, prefix)
+    if not keys:
+        return None
 
-    for delta in (0, 1):  # today and yesterday
-        day = (now - timedelta(days=delta)).date()
-        prefix = f"5m/{day.year}/{day.month:02d}/{day.day:02d}/"
-        day_keys = list_keys_with_prefix(s3, bucket, prefix)
-        for key in day_keys:
-            # Keys look like: 5m/YYYY/MM/DD/HH-MM.json
-            try:
-                filename = key.split("/")[-1]
-                hhmm = filename.split(".")[0]
-                hh_str, mm_str = hhmm.split("-")
-                hh = int(hh_str)
-                mm = int(mm_str)
-                ts = datetime(
-                    day.year, day.month, day.day, hh, mm, tzinfo=timezone.utc
-                )
-            except Exception:
-                continue
-            if ts >= cutoff:
-                keys_with_ts.append((ts, key))
-
-    keys_with_ts.sort(key=lambda x: x[0])
-    return [k for _, k in keys_with_ts]
+    # keys are already dated and will sort lexicographically by time
+    keys.sort()
+    return keys[-1]
 
 
-def load_models_and_meta(s3, bucket: str):
+def load_latest_models(s3, bucket):
     """
-    Load multi-horizon regressors + classifier + meta from R2.
-
-    Expected layout (from updated train_model.py):
-      - models/xgb/latest_reg.pkl     => either:
-            * dict[horizon_minutes] -> XGBRegressor
-            * or dict with key "regs" containing that mapping
-      - models/xgb/latest_cls.pkl     => XGBClassifier
-      - models/xgb/latest_meta.json   => metadata dict
+    Load the latest regressors and metadata from R2.
     """
-    reg_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_reg.pkl")
-    cls_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_cls.pkl")
-    meta_obj = s3.get_object(Bucket=bucket, Key="models/xgb/latest_meta.json")
+    key_reg = "models/xgb/latest_reg.pkl"
+    key_meta = "models/xgb/latest_meta.json"
 
-    reg_bytes = reg_obj["Body"].read()
-    cls_bytes = cls_obj["Body"].read()
+    obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
+    obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
 
-    reg_bundle = joblib.load(io.BytesIO(reg_bytes))
-    cls = joblib.load(io.BytesIO(cls_bytes))
-    meta = json.loads(meta_obj["Body"].read())
+    reg_models = joblib.load(io.BytesIO(obj_reg["Body"].read()))
+    meta = pd.read_json(io.BytesIO(obj_meta["Body"].read()), typ="series").to_dict()
 
-    # Normalise to a dict[horizon] -> regressor
-    if hasattr(reg_bundle, "predict"):
-        # Single model only – treat as dict with one horizon (main horizon).
-        main_h = int(meta.get("horizon_minutes", 60))
-        reg_by_horizon = {main_h: reg_bundle}
-    elif isinstance(reg_bundle, dict):
-        # Could be {h: reg} or {"regs": {h: reg}, ...}
-        if "regs" in reg_bundle and isinstance(reg_bundle["regs"], dict):
-            reg_by_horizon = reg_bundle["regs"]
-        else:
-            reg_by_horizon = reg_bundle
-    else:
-        raise TypeError("Unsupported reg_bundle type: %r" % type(reg_bundle))
-
-    return reg_by_horizon, cls, meta
+    return reg_models, meta
 
 
-def _find_mapping_list(obj):
+def build_scoring_dataframe(s3, bucket):
     """
-    Recursively search a nested JSON object for a list of dicts that look
-    like OSRS wiki 'mapping' entries (must have 'id' and 'name').
+    Load recent 5m snapshots into a DataFrame, restricted to WINDOW_MINUTES.
     """
-    if isinstance(obj, list):
-        if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
-            return obj
-        for el in obj:
-            res = _find_mapping_list(el)
-            if res is not None:
-                return res
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            res = _find_mapping_list(v)
-            if res is not None:
-                return res
-    return None
+    latest_key = get_latest_5m_key(s3, bucket)
+    if not latest_key:
+        raise RuntimeError("No latest 5m snapshot found in bucket.")
 
+    # All snapshots for that day
+    day_prefix = latest_key.rsplit("/", 1)[0] + "/"
+    all_keys = list_keys_with_prefix(s3, bucket, day_prefix)
+    all_keys.sort()
 
-def load_item_name_map(s3, bucket: str) -> dict[int, str]:
-    """
-    Load the latest daily snapshot and build {item_id: name} from the wiki
-    mapping it contains.
-    """
-    now = datetime.now(timezone.utc)
-    daily_key = None
+    # Keep only those within WINDOW_MINUTES of the latest snapshot
+    obj_latest = s3.get_object(Bucket=bucket, Key=latest_key)
+    import json as _json
+    snap_latest = _json.loads(obj_latest["Body"].read())
+    latest_ts = snap_latest["five_minute"]["timestamp"]
 
-    # Try today and up to 6 days back
-    for delta in range(0, 7):
-        d = (now - timedelta(days=delta)).date()
-        prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-        contents = resp.get("Contents")
-        if contents:
-            contents.sort(key=lambda x: x["Key"])
-            daily_key = contents[-1]["Key"]
-            break
+    window_start_ts = latest_ts - WINDOW_MINUTES * 60
 
-    if not daily_key:
-        print("No daily snapshot found for mapping.")
-        return {}
+    recent_keys = []
+    for key in all_keys:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        snap = _json.loads(obj["Body"].read())
+        ts = snap["five_minute"]["timestamp"]
+        if ts >= window_start_ts:
+            recent_keys.append(key)
 
-    print("Using daily snapshot for mapping:", daily_key)
-    obj = s3.get_object(Bucket=bucket, Key=daily_key)
-    daily = json.loads(obj["Body"].read())
+    print(
+        f"Using {len(recent_keys)} snapshots from the last {WINDOW_MINUTES} minutes."
+    )
 
-    mapping_list = _find_mapping_list(daily)
-    if mapping_list is None:
-        print("No mapping list with id+name found inside daily snapshot.")
-        return {}
-
-    id_to_name: dict[int, str] = {}
-    for entry in mapping_list:
-        try:
-            item_id = int(entry.get("id"))
-        except (TypeError, ValueError):
-            continue
-        name = entry.get("name")
-        if name:
-            id_to_name[item_id] = name
-
-    print(f"Loaded {len(id_to_name)} item names from mapping.")
-    return id_to_name
-
-
-def build_scoring_dataframe(s3, bucket: str, lookback_minutes: int) -> pd.DataFrame:
-    """
-    Build a DataFrame of the most recent snapshot per item within the last
-    `lookback_minutes` minutes.
-
-    If there are no recent keys, we fall back to the single latest 5m snapshot
-    (old behaviour).
-    """
-    recent_keys = get_recent_5m_keys(s3, bucket, lookback_minutes)
-    if not recent_keys:
-        print(
-            f"No 5m snapshots found in the last {lookback_minutes} minutes; "
-            "falling back to latest single snapshot."
-        )
-        latest_key = get_latest_5m_key(s3, bucket)
-        if not latest_key:
-            return pd.DataFrame()
-        print("Using fallback snapshot:", latest_key)
-        df = flatten_5m_snapshots(s3, bucket, [latest_key])
-    else:
-        print(
-            f"Using {len(recent_keys)} snapshots from the last "
-            f"{lookback_minutes} minutes."
-        )
-        df = flatten_5m_snapshots(s3, bucket, recent_keys)
-
+    df = flatten_5m_snapshots(s3, bucket, recent_keys)
     if df.empty:
-        return df
+        raise RuntimeError("No rows in scoring DataFrame after flatten.")
 
-    # Basic features
-    df = add_basic_features(df)
-    df = df.dropna(subset=["mid_price"])
-    df = df[df["mid_price"] > 0].copy()
+    df = add_model_features(df)
+    df = df[df["mid_price"] >= MIN_MID_PRICE].copy()
+    return df, latest_ts
 
-    # For scoring, we want exactly one "current" row per item: the most recent
-    # snapshot in the lookback window. We rely on the timestamp column exposed
-    # by flatten_5m_snapshots.
-    df.sort_values(["item_id", "timestamp"], inplace=True)
-    idx = df.groupby("item_id")["timestamp"].idxmax()
-    df = df.loc[idx].copy()
 
-    # Very important: make index 0..N-1 so prediction arrays align with row positions
-    df.reset_index(drop=True, inplace=True)
+def compute_window_aggregates(df, window_start_ts):
+    """
+    Compute aggregated statistics over the scoring window per item.
+    """
+    df = df.copy()
+
+    # Only keep rows inside the window
+    df = df[df["timestamp_unix"] >= window_start_ts]
+
+    # Aggregate volume and price changes
+    grouped = df.groupby("item_id").agg(
+        {
+            "total_volume_5m": "sum",
+            "mid_price": ["first", "last"],
+        }
+    )
+    grouped.columns = ["volume_window", "price_start", "price_end"]
+    grouped.reset_index(inplace=True)
+
+    # Price change over the window
+    grouped["window_return"] = grouped["price_end"] / grouped["price_start"] - 1.0
+    return grouped
+
+
+def filter_active_items(df_agg):
+    """
+    Filter items that meet minimum volume / price criteria.
+    """
+    df = df_agg.copy()
+    df = df[df["volume_window"] >= MIN_VOLUME_WINDOW].copy()
+    df = df[df["price_start"] >= MIN_MID_PRICE].copy()
     return df
 
 
-# --------------------------------------------------------------------
-# Main scoring
-# --------------------------------------------------------------------
+def normal_cdf_array(z: np.ndarray) -> np.ndarray:
+    """
+    Vectorised Normal(0,1) CDF using math.erf for small arrays.
+    """
+    def _cdf_scalar(x):
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+    vec = np.vectorize(_cdf_scalar, otypes=[float])
+    return vec(z)
 
 
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
-    # 1) Build scoring dataframe for the last SCORING_LOOKBACK_MINUTES minutes
-    df = build_scoring_dataframe(s3, bucket, SCORING_LOOKBACK_MINUTES)
-    if df.empty:
-        print("No data to score (no recent snapshots).")
-        return
+    reg_models, meta = load_latest_models(s3, bucket)
 
-    print(f"Scoring {len(df)} items with recent activity.")
+    horizon_minutes = int(meta.get("horizon_minutes", HORIZON_MINUTES))
+    path_horizons = meta.get("path_horizons_minutes", HORIZONS_MINUTES)
+    feature_cols = meta.get("feature_cols", ["mid_price", "spread_pct", "log_volume_5m"])
+    tax_rate = float(meta.get("tax_rate", TAX_RATE))
+    margin = float(meta.get("margin", MARGIN))
+    sigma_main = float(meta.get("sigma_main", 0.02))
 
-    # 2) Load models + meta
-    reg_by_horizon, cls, meta = load_models_and_meta(s3, bucket)
+    df_raw, latest_ts = build_scoring_dataframe(s3, bucket)
+    window_start_ts = latest_ts - WINDOW_MINUTES * 60
 
-    feature_cols = meta["feature_cols"]
-    tax = float(meta.get("tax_rate", 0.02))
-    main_horizon = int(meta.get("horizon_minutes", 60))
+    df_agg = compute_window_aggregates(df_raw, window_start_ts)
+    df_active = filter_active_items(df_agg)
 
-    # Horizons for the path (e.g. [5,10,...,120])
-    path_horizons = meta.get("path_horizons_minutes")
-    if not path_horizons:
-        # Fall back to any keys we can parse as ints
-        keys = []
-        for k in reg_by_horizon.keys():
-            try:
-                keys.append(int(k))
-            except Exception:
-                continue
-        path_horizons = sorted(set(keys))
+    # Merge aggregated stats back into the per-snapshot data
+    df = df_raw.merge(df_active[["item_id"]], on="item_id", how="inner")
 
-    print("Main horizon:", main_horizon, "minutes.")
-    print("Path horizons:", path_horizons)
+    print(
+        f"Scoring {df['item_id'].nunique()} items with recent activity."
+    )
 
-    # 3) Build feature matrix
-    X = df[feature_cols].values
+    # Feature matrix
+    X_all = df[feature_cols].values
 
-    # 4) Predict returns for each horizon
-    def _get_reg(h):
-        if h in reg_by_horizon:
-            return reg_by_horizon[h]
-        if str(h) in reg_by_horizon:
-            return reg_by_horizon[str(h)]
-        return None
-
-    path_preds: dict[int, np.ndarray] = {}
-    for h in path_horizons:
-        reg_h = _get_reg(h)
-        if reg_h is None:
-            print(f"[warn] No regressor for horizon {h}m in model dict.")
+    # For each path horizon, compute predictions
+    path_results = {}
+    for H in path_horizons:
+        reg = reg_models.get(H)
+        if reg is None:
             continue
-        print(f"[score] Predicting horizon {h}m for {len(df)} rows.")
-        path_preds[h] = reg_h.predict(X)
+        print(f"[score] Predicting horizon {H}m for {len(df)} rows.")
+        preds = reg.predict(X_all)
+        path_results[H] = preds
 
-    # Main horizon: use its predictions if present, otherwise first available
-    main_ret = path_preds.get(main_horizon)
-    if main_ret is None:
-        print(
-            f"[warn] main_horizon {main_horizon}m not found in path_preds; "
-            f"using first available reg instead."
-        )
-        if path_preds:
-            some_h = next(iter(path_preds.keys()))
-            main_ret = path_preds[some_h]
-        else:
-            # Extreme fallback: pick some regressor and ignore horizon mismatch
-            some_reg = next(iter(reg_by_horizon.values()))
-            main_ret = some_reg.predict(X)
-
-    # 5) Probability of profit from classifier (main horizon)
-    try:
-        prob_profit = cls.predict_proba(X)[:, 1]
-    except Exception as e:
-        print("[warn] classifier predict_proba failed:", e)
-        prob_profit = np.full(len(df), 0.5, dtype=float)
+    # For the main horizon, compute expected return and profit
+    if horizon_minutes not in reg_models:
+        raise RuntimeError(f"Missing regressor for main horizon {horizon_minutes}m.")
+    reg_main = reg_models[horizon_minutes]
+    main_ret = reg_main.predict(X_all)
 
     df["future_return_hat"] = main_ret
-    df["prob_profit"] = prob_profit
+    df["net_return_hat"] = (1.0 + df["future_return_hat"]) * (1.0 - tax_rate) - 1.0
 
-    mid = df["mid_price"].values.astype(float)
-    buy_price = mid
-    mid_future = buy_price * (1.0 + main_ret)
-    net_sell = mid_future * (1.0 - tax)
-    profit = net_sell - buy_price
-    hold_seconds = main_horizon * 60.0
-    profit_per_sec = profit / hold_seconds
+    # "Buy" at current mid, "sell" at predicted net price after tax
+    df["buy_price"] = df["mid_price"]
+    df["sell_price_hat"] = df["buy_price"] * (1.0 + df["net_return_hat"])
+    df["expected_profit"] = df["sell_price_hat"] - df["buy_price"]
 
-    df["expected_profit"] = profit
-    df["expected_profit_per_second"] = profit_per_sec
+    # Profit per second
+    hold_seconds = horizon_minutes * 60.0
+    df["expected_profit_per_second"] = df["expected_profit"] / hold_seconds
 
-    # 6) Load item -> name map
-    id_to_name = load_item_name_map(s3, bucket)
+    # Probability of profit using regression-based Normal approximation
+    # Profit_ok is defined on net return > margin; translate that to gross return
+    gross_threshold = (1.0 + margin) / (1.0 - tax_rate) - 1.0
+    z = (df["future_return_hat"].values - gross_threshold) / max(sigma_main, 1e-8)
+    prob_profit = normal_cdf_array(z)
+    df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
-    # 7) Build multi-horizon path predictions per row (ALL items)
-    signals = []
-    N = len(df)
-    path_horizons_sorted = sorted(path_horizons)
+    # Summarize per item: last snapshot as of latest_ts
+    df.sort_values(["item_id", "timestamp"], inplace=True)
+    last_per_item = df.groupby("item_id").tail(1).copy()
 
-    for i in range(N):
-        row = df.iloc[i]
-        item_id = int(row["item_id"])
-        name = id_to_name.get(item_id)
+    # Attach aggregated window volume and window_return
+    last_per_item = last_per_item.merge(df_agg, on="item_id", how="left")
 
-        # For each horizon we stored predictions for,
-        # grab the i-th prediction from path_preds[h].
+    # Build path predictions for the last snapshot of each item
+    path_rows = []
+    for item_id, row in last_per_item.iterrows():
+        idx = row.name
         path = []
-        for h in path_horizons_sorted:
-            preds_h = path_preds.get(h)
+        for h in sorted(path_horizons):
+            preds_h = path_results.get(h)
             if preds_h is None:
                 continue
-            # preds_h is length N, indexed 0..N-1
-            r = float(preds_h[i])
-            path.append(
-                {
-                    "minutes": int(h),
-                    "future_return_hat": r,
-                }
-            )
+            ret_hat = preds_h[idx]
+            path.append({"minutes": int(h), "future_return_hat": float(ret_hat)})
+        path_rows.append(path)
 
+    last_per_item["path"] = path_rows
+
+    # Load item mapping from daily snapshots
+    mapping = load_latest_item_mapping(s3, bucket)
+
+    # Join mapping onto last_per_item
+    last_per_item["item_id_str"] = last_per_item["item_id"].astype(str)
+    mapping["id_str"] = mapping["id"].astype(str)
+    last_per_item = last_per_item.merge(
+        mapping[["id_str", "name"]], left_on="item_id_str", right_on="id_str", how="left"
+    )
+    last_per_item.drop(columns=["item_id_str", "id_str"], inplace=True)
+
+    # Sort by a composite score that emphasises higher Win %
+    liq = np.log1p(last_per_item["volume_window"]).clip(lower=1e-3)
+    prob = last_per_item["prob_profit"].clip(0.0, 1.0)
+    prof = last_per_item["expected_profit"].clip(lower=0.0)
+
+    last_per_item["score"] = (prob ** 2) * prof * liq
+
+    last_per_item.sort_values("score", ascending=False, inplace=True)
+
+    # Persist signals to R2
+    now = datetime.now(timezone.utc)
+    date_part = now.strftime("%Y/%m/%d")
+
+    signals = []
+    for _, r in last_per_item.iterrows():
         signals.append(
             {
-                "item_id": item_id,
-                "name": name,  # may be None if mapping doesn't have it
-                "mid_now": float(row["mid_price"]),
-                "future_return_hat": float(row["future_return_hat"]),
-                "prob_profit": float(row["prob_profit"]),
-                "expected_profit": float(row["expected_profit"]),
-                "expected_profit_per_second": float(
-                    row["expected_profit_per_second"]
-                ),
-                "hold_minutes": int(main_horizon),
-                "path": path,
+                "item_id": int(r["item_id"]),
+                "name": r.get("name") or f"Item {int(r['item_id'])}",
+                "mid_now": float(r["mid_price"]),
+                "future_return_hat": float(r["future_return_hat"]),
+                "net_return_hat": float(r["net_return_hat"]),
+                "expected_profit": float(r["expected_profit"]),
+                "expected_profit_per_second": float(r["expected_profit_per_second"]),
+                "prob_profit": float(r["prob_profit"]),
+                "volume_window": int(r.get("volume_window") or 0),
+                "window_return": float(r.get("window_return") or 0.0),
+                "hold_minutes": int(horizon_minutes),
+                "path": r["path"],
             }
         )
 
-    # 8) Sort signals by expected_profit_per_second (UI still picks top 10)
-    signals.sort(
-        key=lambda s: s.get("expected_profit_per_second", 0.0),
-        reverse=True,
-    )
-
-    # 9) Write signals/latest.json + dated copy
-    now = datetime.now(timezone.utc)
-    date_part = now.strftime("%Y/%m/%d")
-    time_part = now.strftime("%H-%M")
-
     out = {
         "generated_at_iso": now.isoformat(),
-        "horizon_minutes": int(main_horizon),
-        "tax_rate": float(tax),
-        "path_horizons_minutes": [int(h) for h in path_horizons_sorted],
+        "horizon_minutes": int(horizon_minutes),
+        "path_horizons_minutes": list(path_horizons),
+        "tax_rate": float(tax_rate),
+        "margin": float(margin),
+        "sigma_main": float(sigma_main),
         "signals": signals,
     }
-    body = json.dumps(out).encode("utf-8")
 
-    latest_key = "signals/latest.json"
-    dated_key = f"signals/{date_part}/{time_part}.json"
+    import json
 
-    s3.put_object(
-        Bucket=bucket,
-        Key=latest_key,
-        Body=body,
-        ContentType="application/json",
-    )
-    s3.put_object(
-        Bucket=bucket,
-        Key=dated_key,
-        Body=body,
-        ContentType="application/json",
-    )
+    buf = json.dumps(out).encode("utf-8")
 
-    print(
-        f"Wrote {len(signals)} signals "
-        f"(items with snapshots in the last {SCORING_LOOKBACK_MINUTES} minutes)."
-    )
+    # Write date-stamped + "latest" keys
+    key_signals = f"signals/{date_part}.json"
+    key_latest = "signals/latest.json"
+    s3.put_object(Bucket=bucket, Key=key_signals, Body=buf)
+    s3.put_object(Bucket=bucket, Key=key_latest, Body=buf)
+
+    print(f"Using daily snapshot for mapping: {mapping.attrs.get('source_key', 'unknown')}")
+    print(f"Loaded {len(mapping)} item names from mapping.")
+    print(f"Wrote {len(signals)} signals (items with snapshots in the last {WINDOW_MINUTES} minutes).")
+
+
+def load_latest_item_mapping(s3, bucket):
+    """
+    Load the latest item mapping from daily snapshots.
+    """
+    # For now we'll just look back 7 days and take the latest mapping we find.
+    now = datetime.now(timezone.utc)
+    for delta in range(7):
+        d = (now - timedelta(days=delta)).date()
+        prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
+        keys = list_keys_with_prefix(s3, bucket, prefix)
+        if not keys:
+            continue
+
+        keys.sort()
+        latest_key = keys[-1]
+        obj = s3.get_object(Bucket=bucket, Key=latest_key)
+        import json
+
+        snap = json.loads(obj["Body"].read())
+        # Expect something like snap["items"] = [{id, name, ...}, ...]
+        # We'll be flexible in case you structured it differently.
+        mapping = extract_item_mapping_from_daily(snap)
+        mapping.attrs["source_key"] = latest_key
+        return mapping
+
+    # Fallback: empty mapping
+    return pd.DataFrame(columns=["id", "name"])
+
+
+def extract_item_mapping_from_daily(snap: dict) -> pd.DataFrame:
+    """
+    Extract an item mapping from a daily snapshot JSON.
+    We try a few reasonable schema variants.
+    """
+    import pandas as pd
+
+    # 1) If there's a top-level "items" list
+    items = snap.get("items")
+    if isinstance(items, list) and items:
+        df = pd.DataFrame(items)
+        if "id" in df.columns and "name" in df.columns:
+            return df[["id", "name"]]
+
+    # 2) Otherwise, try to find any nested list of dicts with id+name
+    def dfs(obj):
+        if isinstance(obj, list):
+            if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
+                return pd.DataFrame(obj)
+            for el in obj:
+                res = dfs(el)
+                if res is not None:
+                    return res
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                res = dfs(v)
+                if res is not None:
+                    return res
+        return None
+
+    res = dfs(snap)
+    if res is not None and "id" in res.columns and "name" in res.columns:
+        return res[["id", "name"]]
+
+    return pd.DataFrame(columns=["id", "name"])
 
 
 if __name__ == "__main__":
