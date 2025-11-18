@@ -149,6 +149,16 @@ const HTML = `<!DOCTYPE html>
     canvas {
       max-width: 100%;
     }
+    .chart-wrapper {
+      position: relative;
+      height: 260px;
+      max-width: 100%;
+    }
+    .chart-wrapper canvas {
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+    }
     @media (max-width: 750px) {
       table { font-size: 0.78rem; }
       header h1 { font-size: 1.2rem; }
@@ -205,7 +215,9 @@ const HTML = `<!DOCTYPE html>
           <li><strong>Yellow dashed</strong>: forecast that was in effect when you starred the item (if pinned).</li>
         </ul>
       </div>
-      <canvas id="priceChart" height="180"></canvas>
+      <div class="chart-wrapper">
+        <canvas id="priceChart"></canvas>
+      </div>
       <div id="priceStatus" class="small" style="margin-top:0.4rem;"></div>
     </div>
   </main>
@@ -231,7 +243,7 @@ const HTML = `<!DOCTYPE html>
 
     let overviewSignals = [];
     let dailySnapshot = null;
-    let mappingList = []; // { id, name }
+    let mappingList = [];
     let MODEL_HORIZON = 60;
     let MODEL_TAX = 0.02;
     let priceChart = null;
@@ -262,11 +274,33 @@ const HTML = `<!DOCTYPE html>
       return new Set(Object.keys(state));
     }
 
-    function buildMappingFromDaily(dailyJson) {
-      if (!dailyJson) return;
-      const mapping = dailyJson.mapping;
-      if (!Array.isArray(mapping)) return;
-      mappingList = mapping
+    function buildMappingFromDaily() {
+      if (!dailySnapshot) return;
+
+      function dfs(obj) {
+        if (Array.isArray(obj)) {
+          if (obj.length && typeof obj[0] === "object" && obj[0] && "id" in obj[0] && "name" in obj[0]) {
+            return obj;
+          }
+          for (const el of obj) {
+            const r = dfs(el);
+            if (r) return r;
+          }
+        } else if (obj && typeof obj === "object") {
+          for (const v of Object.values(obj)) {
+            const r = dfs(v);
+            if (r) return r;
+          }
+        }
+        return null;
+      }
+
+      const found = dfs(dailySnapshot);
+      if (!found) {
+        mappingList = [];
+        return;
+      }
+      mappingList = found
         .filter((m) => m && typeof m.id === "number" && m.name)
         .map((m) => ({ id: m.id, name: m.name }));
       mappingList.sort((a, b) => a.name.localeCompare(b.name));
@@ -1008,7 +1042,7 @@ const HTML = `<!DOCTYPE html>
           (MODEL_TAX * 100).toFixed(1) +
           "%.";
 
-        buildMappingFromDaily(dailySnapshot);
+        buildMappingFromDaily();
         renderTopTable();
         renderPinnedList();
       } catch (err) {
@@ -1023,16 +1057,12 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-//
-// Backend (Cloudflare Worker) – R2-backed endpoints
-//
+// --- Backend (Cloudflare Worker) ---
 
-// Signals cache
 const SIGNALS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 let LAST_SIGNALS_JSON = null;
 let LAST_SIGNALS_FETCHED_AT = 0;
 
-// Simple per-item /price-series response cache
 const PRICE_CACHE = new Map();
 const PRICE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const PRICE_CACHE_MAX_ITEMS = 64;
@@ -1052,7 +1082,7 @@ async function bucketGetWithRetry(env, key, { attempts = 3, baseDelayMs = 200 } 
       const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
       console.warn(
         `Attempt ${i + 1} to fetch ${key} failed: ${err.message}${
-          isLast ? "" : `; retrying in ${delay}ms`
+          isLast ? "" : \`; retrying in \${delay}ms\`
         }`
       );
       if (!isLast) {
@@ -1060,7 +1090,33 @@ async function bucketGetWithRetry(env, key, { attempts = 3, baseDelayMs = 200 } 
       }
     }
   }
-  console.error(`Failed to fetch ${key} after ${attempts} attempts`, lastError);
+  console.error(\`Failed to fetch \${key} after \${attempts} attempts\`, lastError);
+  return null;
+}
+
+async function bucketListWithRetry(env, options, { attempts = 3, baseDelayMs = 200 } = {}) {
+  let lastError = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await env.OSRS_BUCKET.list(options);
+    } catch (err) {
+      lastError = err;
+      const isLast = i === attempts - 1;
+      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
+      console.warn(
+        \`Attempt \${i + 1} to list \${options?.prefix || ""} failed: \${err.message}\${
+          isLast ? "" : \`; retrying in \${delay}ms\`
+        }\`
+      );
+      if (!isLast) {
+        await sleep(delay);
+      }
+    }
+  }
+  console.error(
+    \`Failed to list with options \${JSON.stringify(options)} after \${attempts} attempts\`,
+    lastError
+  );
   return null;
 }
 
@@ -1102,7 +1158,9 @@ function setCachedPriceSeries(cacheKey, payload) {
   PRICE_CACHE.set(cacheKey, { cachedAt: Date.now(), payload });
   if (PRICE_CACHE.size > PRICE_CACHE_MAX_ITEMS) {
     const oldestKey = PRICE_CACHE.keys().next().value;
-    PRICE_CACHE.delete(oldestKey);
+    if (oldestKey !== undefined) {
+      PRICE_CACHE.delete(oldestKey);
+    }
   }
 }
 
@@ -1122,23 +1180,46 @@ async function handleSignals(env) {
 }
 
 async function handleDaily(env) {
-  const obj = await bucketGetWithRetry(env, "daily/latest.json");
-  if (!obj) {
-    return new Response(JSON.stringify({ error: "No daily snapshot found" }), {
-      status: 404,
+  // Prefer daily/latest.json if present
+  let obj = await bucketGetWithRetry(env, "daily/latest.json");
+  if (obj) {
+    const text = await obj.text();
+    return new Response(text, {
+      status: 200,
       headers: { "Content-Type": "application/json" }
     });
   }
-  const text = await obj.text();
-  return new Response(text, {
-    status: 200,
+
+  // Fallback: scan the last few days for a daily snapshot
+  const now = new Date();
+  for (let delta = 0; delta < 7; delta++) {
+    const d = new Date(now.getTime() - delta * 86400000);
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    const prefix = \`daily/\${year}/\${month}/\${day}\`;
+    const listing = await bucketListWithRetry(env, { prefix, limit: 1000 });
+    if (!listing || !listing.objects || !listing.objects.length) continue;
+    const objs = listing.objects.slice().sort((a, b) => (a.key < b.key ? -1 : 1));
+    const latest = objs[objs.length - 1];
+    obj = await bucketGetWithRetry(env, latest.key);
+    if (!obj) continue;
+    const text = await obj.text();
+    return new Response(text, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  return new Response(JSON.stringify({ error: "No daily snapshot found" }), {
+    status: 404,
     headers: { "Content-Type": "application/json" }
   });
 }
 
 // Load precomputed per-item history from R2: history/{itemId}.json
 async function loadPrecomputedHistory(env, itemId) {
-  const key = `history/${itemId}.json`;
+  const key = \`history/\${itemId}.json\`;
   const obj = await bucketGetWithRetry(env, key, { attempts: 2, baseDelayMs: 150 });
   if (!obj) {
     return { history: [], found: false };
@@ -1170,12 +1251,15 @@ async function buildForecast(env, itemId, history) {
   }
 
   const anchorMid = history.length ? history[history.length - 1].price : s.mid_now;
-  const baseTimeMs = history.length
-    ? Date.parse(history[history.length - 1].timestamp_iso || history[history.length - 1].timestamp)
-    : Date.now();
 
-  if (!Number.isFinite(baseTimeMs)) {
-    return forecast;
+  let baseTimeMs;
+  if (history.length) {
+    const last = history[history.length - 1];
+    const iso = last.timestamp_iso || last.timestamp;
+    const parsed = iso ? Date.parse(iso) : NaN;
+    baseTimeMs = Number.isFinite(parsed) ? parsed : Date.now();
+  } else {
+    baseTimeMs = Date.now();
   }
 
   forecast.push({
@@ -1238,12 +1322,21 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/") {
+      return new Response(HTML, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+
     if (url.pathname === "/signals") {
       return handleSignals(env);
     }
+
     if (url.pathname === "/daily") {
       return handleDaily(env);
     }
+
     if (url.pathname === "/price-series") {
       const idParam = url.searchParams.get("item_id");
       const itemId = idParam ? Number(idParam) : NaN;
@@ -1256,10 +1349,6 @@ export default {
       return handlePriceSeries(env, itemId);
     }
 
-    // default: serve UI
-    return new Response(HTML, {
-      status: 200,
-      headers: { "Content-Type": "text/html; charset=utf-8" }
-    });
+    return new Response("Not found", { status: 404 });
   }
 };
