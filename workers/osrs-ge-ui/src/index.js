@@ -186,7 +186,8 @@ const HTML = `<!DOCTYPE html>
     <div class="card">
       <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
-        Click a row to see up to the last 14 days (or as far back as available) of 5-minute mid prices and a 5–120 minute forecast.<br/>
+        Click a row to see up to the last 14 days (or as far back as available) of mid prices:
+        5-minute buckets for the last 24 hours, then 30-minute buckets further back, plus a 5–120 minute forecast.<br/>
         Click the ★ column to pin an item. Pins persist across refreshes.
       </div>
       <div id="tableContainer">Waiting for data...</div>
@@ -199,10 +200,10 @@ const HTML = `<!DOCTYPE html>
         <button id="searchButton" type="button">Search</button>
       </div>
       <div id="searchStatus" class="small"></div>
-      <div id="searchResults" style="margin-top:0.4rem;"></div>
+      <div id="searchResults"></div>
       <div class="pinned-list">
-        <div class="small" style="margin-bottom:0.25rem;">Pinned items (watchlist)</div>
-        <div id="pinnedList" class="small">Loading...</div>
+        <h3 class="small">Pinned items</h3>
+        <div id="pinnedList">No pins yet.</div>
       </div>
     </div>
 
@@ -211,7 +212,7 @@ const HTML = `<!DOCTYPE html>
       <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
       <div class="small" style="margin-bottom:0.4rem;">
         <ul style="margin:0; padding-left:1.2rem;">
-          <li><strong>Blue</strong>: actual mid price history (up to ~14 days, 5-minute buckets, limited by data availability).</li>
+          <li><strong>Blue</strong>: actual mid price history (5-minute buckets for the last 24 hours, then 30-minute buckets further back, up to ~14 days, limited by data availability).</li>
           <li><strong>Green</strong>: current forecast from the latest model, from now into the next 120 minutes.</li>
         </ul>
       </div>
@@ -252,229 +253,128 @@ const HTML = `<!DOCTYPE html>
         if (!raw) return {};
         const obj = JSON.parse(raw);
         if (obj && typeof obj === "object") return obj;
-        return {};
-      } catch (e) {
-        console.error("Error reading pinned state:", e);
-        return {};
+      } catch (err) {
+        console.warn("Failed to parse pin state:", err);
       }
+      return {};
     }
 
     function savePinnedState(state) {
       try {
         window.localStorage.setItem(PIN_KEY, JSON.stringify(state));
-      } catch (e) {
-        console.error("Error saving pinned state:", e);
+      } catch (err) {
+        console.warn("Failed to save pin state:", err);
       }
-    }
-
-    function formatGp(x) {
-      if (x === null || x === undefined || !isFinite(x)) return "-";
-      const v = Math.round(x);
-      return v.toLocaleString("en-US");
-    }
-
-    function formatPct(x) {
-      if (x === null || x === undefined || !isFinite(x)) return "-";
-      return x.toFixed(2) + "%";
-    }
-
-    function formatProb(p) {
-      if (p === null || p === undefined || !isFinite(p)) return "-";
-      return (p * 100).toFixed(1) + "%";
-    }
-
-    function probPill(p) {
-      if (p === null || p === undefined || !isFinite(p)) {
-        return '<span class="pill">n/a</span>';
-      }
-      let cls = "";
-      let label = "";
-      if (p >= 0.65) {
-        cls = "good";
-        label = "favourable";
-      } else if (p < 0.5) {
-        cls = "bad";
-        label = "unfavourable";
-      } else {
-        label = "uncertain";
-      }
-      return '<span class="pill ' + cls + '">' +
-        label + " (" + formatProb(p) + ")" + "</span>";
-    }
-
-    function findMappingList(obj) {
-      if (!obj) return null;
-      if (Array.isArray(obj)) {
-        if (
-          obj.length > 0 &&
-          typeof obj[0] === "object" &&
-          obj[0] !== null &&
-          "id" in obj[0] &&
-          "name" in obj[0]
-        ) {
-          return obj;
-        }
-        for (let i = 0; i < obj.length; i++) {
-          const res = findMappingList(obj[i]);
-          if (res) return res;
-        }
-        return null;
-      }
-      if (typeof obj === "object") {
-        for (const k in obj) {
-          if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-          const res = findMappingList(obj[k]);
-          if (res) return res;
-        }
-      }
-      return null;
     }
 
     function buildMappingFromDaily() {
       mappingList = [];
-      if (!dailySnapshot) return;
-      const list = findMappingList(dailySnapshot);
-      if (!list) return;
-      const out = [];
-      for (let i = 0; i < list.length; i++) {
-        const entry = list[i];
-        if (!entry) continue;
-        const idVal = Number(entry.id);
-        const nameVal = entry.name != null ? String(entry.name) : "";
-        if (!isNaN(idVal) && nameVal) {
-          out.push({ id: idVal, name: nameVal });
-        }
-      }
-      mappingList = out;
+      if (!dailySnapshot || !Array.isArray(dailySnapshot.mapping)) return;
+
+      dailySnapshot.mapping.forEach(function (m) {
+        if (!m || typeof m.id !== "number" || !m.name) return;
+        mappingList.push({ id: m.id, name: m.name });
+      });
+
+      mappingList.sort(function (a, b) {
+        return a.name.localeCompare(b.name);
+      });
     }
 
-    async function snapshotForecastAtStar(itemId) {
-      try {
-        const res = await fetch(
-          "/price-series?item_id=" + encodeURIComponent(itemId)
-        );
-        if (!res.ok) return null;
-        const data = await res.json();
-        const history = Array.isArray(data.history) ? data.history : [];
-        const forecast = Array.isArray(data.forecast) ? data.forecast : [];
-
-        const starTimeIso = history.length
-          ? history[history.length - 1].timestamp_iso
-          : new Date().toISOString();
-
-        return {
-          starredAtIso: starTimeIso,
-          forecastAtStar: forecast
-        };
-      } catch (err) {
-        console.error("Failed to snapshot forecast on pin:", err);
-        return null;
-      }
+    function formatProfitGp(p) {
+      if (!Number.isFinite(p)) return "-";
+      const v = Math.round(p);
+      return v.toLocaleString("en-US");
     }
 
-    async function togglePin(itemId, name, buttonEl) {
+    function formatPercent(p) {
+      if (!Number.isFinite(p)) return "-";
+      return (p * 100).toFixed(1) + "%";
+    }
+
+    function formatGpPerHour(v) {
+      if (!Number.isFinite(v)) return "-";
+      const abs = Math.abs(v);
+      if (abs >= 1_000_000_000) {
+        return (v / 1_000_000_000).toFixed(1) + "b";
+      }
+      if (abs >= 1_000_000) {
+        return (v / 1_000_000).toFixed(1) + "m";
+      }
+      if (abs >= 1_000) {
+        return (v / 1_000).toFixed(1) + "k";
+      }
+      return v.toFixed(0);
+    }
+
+    function getPinnedSet() {
+      const state = loadPinnedState();
+      return new Set(Object.keys(state));
+    }
+
+    function togglePin(itemId, name, latestForecast) {
       const state = loadPinnedState();
       const key = String(itemId);
-      let entry = state[key];
-      const wasPinned = !!(entry && entry.pinned);
-
-      if (!entry) {
-        entry = {
-          name: name,
-          pinned: true,
-          pinnedAtIso: new Date().toISOString(),
-          starredAtIso: null,
-          forecastAtStar: []
-        };
+      if (state[key] && state[key].pinned) {
+        delete state[key];
       } else {
-        entry.pinned = !entry.pinned;
-        entry.name = name || entry.name;
-        if (entry.pinned && !entry.pinnedAtIso) {
-          entry.pinnedAtIso = new Date().toISOString();
-        }
+        const nowIso = new Date().toISOString();
+        state[key] = {
+          pinned: true,
+          pinnedAtIso: nowIso,
+          starredAtIso: nowIso,
+          name: name,
+          forecastAtStar: latestForecast || []
+        };
       }
-
-      if (!wasPinned && entry.pinned) {
-        const snap = await snapshotForecastAtStar(itemId);
-        if (snap) {
-          entry.starredAtIso = snap.starredAtIso;
-          entry.forecastAtStar = snap.forecastAtStar;
-        } else if (!entry.starredAtIso) {
-          entry.starredAtIso = entry.pinnedAtIso;
-        }
-      }
-
-      state[key] = entry;
       savePinnedState(state);
-
-      if (buttonEl) {
-        buttonEl.textContent = entry.pinned ? "★" : "☆";
-        buttonEl.classList.toggle("pinned", entry.pinned);
-        buttonEl.classList.toggle("unpinned", !entry.pinned);
-      }
-
       renderPinnedList();
     }
 
     function renderPinnedList() {
       const state = loadPinnedState();
-      const items = [];
-      for (const key in state) {
-        if (!Object.prototype.hasOwnProperty.call(state, key)) continue;
-        const entry = state[key];
-        if (entry && entry.pinned) {
-          items.push({
-            item_id: Number(key),
-            name: entry.name || ("Item " + key),
-            pinnedAtIso: entry.pinnedAtIso || ""
-          });
-        }
-      }
+      const entries = Object.keys(state).map(function (k) {
+        const v = state[k];
+        return {
+          item_id: Number(k),
+          name: v.name || ("Item " + k),
+          pinnedAtIso: v.pinnedAtIso || v.starredAtIso || null
+        };
+      });
 
-      if (!items.length) {
-        pinnedListEl.textContent =
-          "No pinned items yet. Click ★ in the table or search results to pin.";
+      if (!entries.length) {
+        pinnedListEl.textContent = "No pins yet.";
         return;
       }
 
-      items.sort(function (a, b) {
-        return a.name.localeCompare(b.name);
+      entries.sort(function (a, b) {
+        const ta = a.pinnedAtIso ? new Date(a.pinnedAtIso).getTime() : 0;
+        const tb = b.pinnedAtIso ? new Date(b.pinnedAtIso).getTime() : 0;
+        return tb - ta;
       });
 
       const table = document.createElement("table");
       const thead = document.createElement("thead");
-      const tbody = document.createElement("tbody");
-
-      const headerRow = document.createElement("tr");
-      ["★", "Item", "Pinned at"].forEach(function (txt) {
+      const trHead = document.createElement("tr");
+      ["★", "Item", "Pinned at"].forEach(function (h) {
         const th = document.createElement("th");
-        th.textContent = txt;
-        headerRow.appendChild(th);
+        th.textContent = h;
+        trHead.appendChild(th);
       });
-      thead.appendChild(headerRow);
+      thead.appendChild(trHead);
+      table.appendChild(thead);
 
-      items.forEach(function (row) {
+      const tbody = document.createElement("tbody");
+      entries.forEach(function (row) {
         const tr = document.createElement("tr");
         tr.className = "clickable";
 
-        const tdPin = document.createElement("td");
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "pin-btn pinned";
-        btn.textContent = "★";
-        btn.addEventListener("click", async function (ev) {
-          ev.stopPropagation();
-          await togglePin(row.item_id, row.name, btn);
-        });
-        tdPin.appendChild(btn);
-        tr.appendChild(tdPin);
+        const tdStar = document.createElement("td");
+        tdStar.textContent = "★";
+        tr.appendChild(tdStar);
 
         const tdName = document.createElement("td");
-        tdName.textContent = row.name + " ";
-        const spanId = document.createElement("span");
-        spanId.className = "small mono";
-        spanId.textContent = "(id " + row.item_id + ")";
-        tdName.appendChild(spanId);
+        tdName.textContent = row.name;
         tr.appendChild(tdName);
 
         const tdTime = document.createElement("td");
@@ -489,7 +389,6 @@ const HTML = `<!DOCTYPE html>
         tbody.appendChild(tr);
       });
 
-      table.appendChild(thead);
       table.appendChild(tbody);
       pinnedListEl.innerHTML = "";
       pinnedListEl.appendChild(table);
@@ -506,186 +405,104 @@ const HTML = `<!DOCTYPE html>
         dailySnapshot.volumes_24h &&
         dailySnapshot.volumes_24h.data
           ? dailySnapshot.volumes_24h.data
-          : {};
+          : null;
 
-      const pinnedState = loadPinnedState();
+      const pins = getPinnedSet();
 
-      const enriched = overviewSignals
-        .filter(function (s) {
-          return s.mid_now && s.mid_now > 0;
-        })
+      const scored = overviewSignals
         .map(function (s) {
-          const mid = s.mid_now;
-          const grossRet =
-            typeof s.future_return_hat === "number" ? s.future_return_hat : 0;
-
-          let netProfit =
-            typeof s.expected_profit === "number"
-              ? s.expected_profit
-              : mid * (1 + grossRet) * (1 - MODEL_TAX) - mid;
-
-          let gpPerSec =
-            typeof s.expected_profit_per_second === "number"
-              ? s.expected_profit_per_second
-              : netProfit / (MODEL_HORIZON * 60);
-
-          const netPct = mid > 0 ? (netProfit / mid) * 100 : 0;
-          const grossPct = grossRet * 100;
-
-          const keyStr = String(s.item_id);
-          const vol24 =
-            vols[keyStr] != null
-              ? vols[keyStr]
-              : vols[s.item_id] != null
-              ? vols[s.item_id]
+          const id = s.item_id;
+          const name = s.name || ("Item " + id);
+          const winProb = typeof s.win_prob === "number" ? s.win_prob : 0;
+          const pnl = typeof s.expected_profit_gp === "number" ? s.expected_profit_gp : 0;
+          const vol =
+            vols && Object.prototype.hasOwnProperty.call(vols, id)
+              ? vols[id]
               : null;
-
-          const probProfit =
-            typeof s.prob_profit === "number" ? s.prob_profit : 0;
-
-          // Give liquid items a modest boost while still letting low-volume picks compete.
-          const volumeWeight = vol24 && vol24 > 0
-            ? Math.max(0.25, Math.log10(vol24 + 10) / 4)
-            : 0.25;
-          const probAdjustedProfit =
-            Math.max(0, probProfit) * Math.max(0, netProfit);
-          // Keep a floor on probability to avoid a zeroed score for very small but non-zero odds.
-          const score =
-            probAdjustedProfit * Math.max(0.05, probProfit) * volumeWeight;
-
-          const entry = pinnedState[keyStr];
-          const isPinned = !!(entry && entry.pinned);
-
+          const liqScore = vol != null ? Math.log10(1 + vol) : 0;
+          const score = winProb * pnl * liqScore;
           return {
-            item_id: s.item_id,
-            name: s.name || "Item " + s.item_id,
-            buy_price: mid,
-            target_sell_price: mid * (1 + grossRet),
-            mid_now: mid,
-            prob_profit: probProfit,
-            netProfit: netProfit,
-            netPct: netPct,
-            grossPct: grossPct,
-            vol24: vol24,
-            hold_minutes: s.hold_minutes || MODEL_HORIZON,
-            pinned: isPinned,
-            gpPerSec: gpPerSec,
-            score: score
+            ...s,
+            id: id,
+            name: name,
+            winProb: winProb,
+            pnl: pnl,
+            vol: vol,
+            liqScore: liqScore,
+            combinedScore: score,
+            pinned: pins.has(String(id))
           };
+        })
+        .filter(function (row) {
+          return Number.isFinite(row.combinedScore);
         });
 
-      // Thresholds for "good" trades
-      const MIN_PROB = 0.55;   // at least ~55% win chance
-      const MIN_NET_PCT = 2.0; // at least 2% net return per item
-
-      function compareRows(a, b) {
-        if (b.score !== a.score) return b.score - a.score;
-        if (b.prob_profit !== a.prob_profit) return b.prob_profit - a.prob_profit;
-        if (b.netPct !== a.netPct) return b.netPct - a.netPct;
-        return (b.vol24 || 0) - (a.vol24 || 0);
-      }
-
-      const good = enriched.filter(function (row) {
-        return row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT;
+      scored.sort(function (a, b) {
+        return b.combinedScore - a.combinedScore;
       });
 
-      const rest = enriched.filter(function (row) {
-        return !(row.prob_profit >= MIN_PROB && row.netPct >= MIN_NET_PCT);
-      });
-
-      good.sort(compareRows);
-      rest.sort(compareRows);
-
-      const ranked = good.concat(rest);
-      const top10 = ranked.slice(0, 10);
+      const top10 = scored.slice(0, 10);
 
       const table = document.createElement("table");
       const thead = document.createElement("thead");
-      const tbody = document.createElement("tbody");
-
-      const headerRow = document.createElement("tr");
-      const headers = [
+      const trHead = document.createElement("tr");
+      [
         "★",
         "Item",
-        "Buy @",
-        "Sell @ (60m)",
-        "Profit / item",
-        "Net %",
-        "GP / sec",
-        "Prob.",
-        "24h vol",
-        "Horizon"
-      ];
-      headers.forEach(function (text) {
+        "Win %",
+        "Exp. profit (gp)",
+        "GP/hr @limit",
+        "24h volume",
+        "Hold (m)"
+      ].forEach(function (h) {
         const th = document.createElement("th");
-        th.textContent = text;
-        headerRow.appendChild(th);
+        th.textContent = h;
+        trHead.appendChild(th);
       });
-      thead.appendChild(headerRow);
+      thead.appendChild(trHead);
+      table.appendChild(thead);
 
+      const tbody = document.createElement("tbody");
       top10.forEach(function (row) {
         const tr = document.createElement("tr");
         tr.className = "clickable";
-        tr.dataset.itemId = String(row.item_id);
-        tr.dataset.name = row.name;
 
-        const tdPin = document.createElement("td");
+        const tdStar = document.createElement("td");
         const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "pin-btn " + (row.pinned ? "pinned" : "unpinned");
+        btn.className = "pin-btn " + (row.pinned ? "pinned" : "unPinned");
         btn.textContent = row.pinned ? "★" : "☆";
-        btn.addEventListener("click", async function (ev) {
+        btn.type = "button";
+        btn.addEventListener("click", function (ev) {
           ev.stopPropagation();
-          await togglePin(row.item_id, row.name, btn);
+          togglePin(row.id, row.name, row.path || []);
         });
-        tdPin.appendChild(btn);
-        tr.appendChild(tdPin);
+        tdStar.appendChild(btn);
+        tr.appendChild(tdStar);
 
         const tdName = document.createElement("td");
-        tdName.textContent = row.name + " ";
-        const spanId = document.createElement("span");
-        spanId.className = "small mono";
-        spanId.textContent = "(id " + row.item_id + ")";
-        tdName.appendChild(spanId);
+        tdName.textContent = row.name;
         tr.appendChild(tdName);
 
-        const tdBuy = document.createElement("td");
-        tdBuy.className = "mono";
-        tdBuy.textContent = formatGp(row.buy_price);
-        tr.appendChild(tdBuy);
-
-        const tdSell = document.createElement("td");
-        tdSell.className = "mono";
-        tdSell.textContent = formatGp(row.target_sell_price);
-        tr.appendChild(tdSell);
+        const tdWin = document.createElement("td");
+        tdWin.textContent = formatPercent(row.winProb);
+        tr.appendChild(tdWin);
 
         const tdProfit = document.createElement("td");
-        tdProfit.className = "mono";
-        tdProfit.textContent = formatGp(row.netProfit);
+        tdProfit.textContent = formatProfitGp(row.pnl);
         tr.appendChild(tdProfit);
 
-        const tdNetPct = document.createElement("td");
-        tdNetPct.textContent = formatPct(row.netPct);
-        tr.appendChild(tdNetPct);
-
-        const tdGps = document.createElement("td");
-        if (row.gpPerSec != null && isFinite(row.gpPerSec)) {
-          tdGps.textContent = row.gpPerSec.toFixed(4);
-        } else {
-          tdGps.textContent = "-";
-        }
-        tr.appendChild(tdGps);
-
-        const tdProb = document.createElement("td");
-        tdProb.innerHTML = probPill(row.prob_profit);
-        tr.appendChild(tdProb);
+        const tdHr = document.createElement("td");
+        const hr = typeof row.gp_per_hour === "number" ? row.gp_per_hour : null;
+        tdHr.textContent = hr != null ? formatGpPerHour(hr) : "-";
+        tr.appendChild(tdHr);
 
         const tdVol = document.createElement("td");
-        if (row.vol24 != null) {
-          tdVol.textContent = row.vol24.toLocaleString("en-US");
-        } else {
-          tdVol.textContent = "-";
-        }
+        const id = row.id;
+        const v =
+          vols && Object.prototype.hasOwnProperty.call(vols, id)
+            ? vols[id]
+            : null;
+        tdVol.textContent = v != null ? v.toLocaleString("en-US") : "-";
         tr.appendChild(tdVol);
 
         const tdH = document.createElement("td");
@@ -693,126 +510,88 @@ const HTML = `<!DOCTYPE html>
         tr.appendChild(tdH);
 
         tr.addEventListener("click", function () {
-          loadPriceSeries(row.item_id, row.name);
+          loadPriceSeries(row.id, row.name);
         });
 
         tbody.appendChild(tr);
       });
 
-      table.appendChild(thead);
       table.appendChild(tbody);
       tableContainer.innerHTML = "";
       tableContainer.appendChild(table);
 
       if (top10.length > 0) {
-        loadPriceSeries(top10[0].item_id, top10[0].name);
+        loadPriceSeries(top10[0].id, top10[0].name);
       }
     }
 
     function runSearch() {
       if (!mappingList.length) {
         searchStatusEl.textContent =
-          "No item mapping available yet (daily snapshot is missing mapping list).";
+          "No item mapping available yet (daily snapshots not loaded).";
+        return;
+      }
+
+      const q = searchInput.value.trim().toLowerCase();
+      if (!q) {
+        searchStatusEl.textContent = "Enter a name to search.";
+        return;
+      }
+
+      const matches = mappingList.filter(function (m) {
+        return m.name.toLowerCase().includes(q);
+      });
+
+      if (!matches.length) {
+        searchStatusEl.textContent = "No items found for that query.";
         searchResultsEl.innerHTML = "";
         return;
       }
 
-      const qRaw = searchInput.value.trim();
-      if (!qRaw) {
-        searchStatusEl.textContent = "Type an item name to search.";
-        searchResultsEl.innerHTML = "";
-        return;
-      }
-      const q = qRaw.toLowerCase();
-
-      const results = mappingList
-        .filter(function (entry) {
-          return entry.name.toLowerCase().indexOf(q) !== -1;
-        })
-        .slice(0, 25);
-
-      if (!results.length) {
-        searchStatusEl.textContent =
-          'No items found for "' + qRaw + '".';
-        searchResultsEl.innerHTML = "";
-        return;
-      }
-
-      searchStatusEl.textContent =
-        "Found " + results.length + " item(s). Showing up to 25.";
-
-      const state = loadPinnedState();
-      const vols =
-        dailySnapshot &&
-        dailySnapshot.volumes_24h &&
-        dailySnapshot.volumes_24h.data
-          ? dailySnapshot.volumes_24h.data
-          : {};
+      searchStatusEl.textContent = "Found " + matches.length + " matching items.";
 
       const table = document.createElement("table");
       const thead = document.createElement("thead");
-      const tbody = document.createElement("tbody");
-
-      const headerRow = document.createElement("tr");
-      ["★", "Item", "24h vol"].forEach(function (txt) {
+      const trHead = document.createElement("tr");
+      ["Item", "ID"].forEach(function (h) {
         const th = document.createElement("th");
-        th.textContent = txt;
-        headerRow.appendChild(th);
+        th.textContent = h;
+        trHead.appendChild(th);
       });
-      thead.appendChild(headerRow);
+      thead.appendChild(trHead);
+      table.appendChild(thead);
 
-      results.forEach(function (res) {
-        const id = res.id;
-        const name = res.name;
-        const keyStr = String(id);
-        const entry = state[keyStr];
-        const isPinned = entry && entry.pinned;
-
+      const tbody = document.createElement("tbody");
+      matches.slice(0, 50).forEach(function (m) {
         const tr = document.createElement("tr");
         tr.className = "clickable";
 
-        const tdPin = document.createElement("td");
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "pin-btn " + (isPinned ? "pinned" : "unpinned");
-        btn.textContent = isPinned ? "★" : "☆";
-        btn.addEventListener("click", async function (ev) {
-          ev.stopPropagation();
-          await togglePin(id, name, btn);
-        });
-        tdPin.appendChild(btn);
-        tr.appendChild(tdPin);
-
         const tdName = document.createElement("td");
-        tdName.textContent = name + " ";
-        const spanId = document.createElement("span");
-        spanId.className = "small mono";
-        spanId.textContent = "(id " + id + ")";
-        tdName.appendChild(spanId);
+        tdName.textContent = m.name;
         tr.appendChild(tdName);
 
-        const tdVol = document.createElement("td");
-        const v =
-          vols[keyStr] != null
-            ? vols[keyStr]
-            : vols[id] != null
-            ? vols[id]
-            : null;
-        tdVol.textContent = v != null ? v.toLocaleString("en-US") : "-";
-        tr.appendChild(tdVol);
+        const tdId = document.createElement("td");
+        tdId.textContent = m.id;
+        tr.appendChild(tdId);
 
         tr.addEventListener("click", function () {
-          loadPriceSeries(id, name);
+          loadPriceSeries(m.id, m.name);
         });
 
         tbody.appendChild(tr);
       });
 
-      table.appendChild(thead);
       table.appendChild(tbody);
       searchResultsEl.innerHTML = "";
       searchResultsEl.appendChild(table);
     }
+
+    searchButton.addEventListener("click", runSearch);
+    searchInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        runSearch();
+      }
+    });
 
     function buildTimeline(history, forecast, starInfo) {
       const tsSet = new Set();
@@ -848,12 +627,12 @@ const HTML = `<!DOCTYPE html>
         ? new Date(forecast[0].timestamp_iso).getTime()
         : null;
 
-      const rawStarTs = starInfo && starInfo.starredAtIso
-        ? new Date(starInfo.starredAtIso).getTime()
-        : null;
+      const rawStarTs =
+        starInfo && starInfo.starredAtIso
+          ? new Date(starInfo.starredAtIso).getTime()
+          : null;
       const starTsCandidate = rawStarTs;
       let starTs = starTsCandidate;
-      // Snap the star timestamp to the nearest history bucket so the overlay connects cleanly.
       if (starTsCandidate != null && histMap.size && !histMap.has(starTsCandidate)) {
         const lastHistTs = new Date(
           history[history.length - 1].timestamp_iso
@@ -910,9 +689,7 @@ const HTML = `<!DOCTYPE html>
             ? histMap.get(ts) || oldFcMap.get(ts) || null
             : null
         );
-        nowMarkerData.push(
-          nowTs != null && ts === nowTs ? histMap.get(ts) || null : null
-        );
+        nowMarkerData.push(nowTs != null && ts === nowTs ? histMap.get(ts) || null : null);
       });
 
       return {
@@ -934,7 +711,10 @@ const HTML = `<!DOCTYPE html>
         if (!res.ok) {
           priceStatusEl.textContent =
             "No price data available (HTTP " + res.status + ").";
-          if (priceChart) { priceChart.destroy(); priceChart = null; }
+          if (priceChart) {
+            priceChart.destroy();
+            priceChart = null;
+          }
           return;
         }
 
@@ -944,18 +724,22 @@ const HTML = `<!DOCTYPE html>
 
         if (!history.length && !forecast.length) {
           priceStatusEl.textContent = "No price data yet for this item.";
-          if (priceChart) { priceChart.destroy(); priceChart = null; }
+          if (priceChart) {
+            priceChart.destroy();
+            priceChart = null;
+          }
           return;
         }
 
         const pinnedState = loadPinnedState();
         const pinEntry = pinnedState[String(itemId)];
-        const starInfo = pinEntry && pinEntry.pinned
-          ? {
-              starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
-              forecastAtStar: pinEntry.forecastAtStar || []
-            }
-          : null;
+        const starInfo =
+          pinEntry && pinEntry.pinned
+            ? {
+                starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
+                forecastAtStar: pinEntry.forecastAtStar || []
+              }
+            : null;
 
         const tl = buildTimeline(history, forecast, starInfo);
         const labels = tl.labels;
@@ -967,7 +751,9 @@ const HTML = `<!DOCTYPE html>
 
         const allPrices = []
           .concat(histData, fcData)
-          .filter(function (v) { return v != null && isFinite(v); });
+          .filter(function (v) {
+            return v != null && isFinite(v);
+          });
         let yMin = 0;
         let yMax = 1;
         if (allPrices.length) {
@@ -985,7 +771,7 @@ const HTML = `<!DOCTYPE html>
 
         const datasets = [
           {
-            label: "Historical mid price (5m)",
+            label: "Historical mid price (5m last 24h, 30m older)",
             data: histData,
             borderColor: "rgba(59,130,246,1)",
             backgroundColor: "rgba(59,130,246,0.2)",
@@ -1076,12 +862,15 @@ const HTML = `<!DOCTYPE html>
         });
 
         priceStatusEl.textContent = starInfo
-          ? "Blue = actual prices; green = current forecast from the latest model (5–120 minute horizons); yellow dashed = forecast captured when you starred the item."
-          : "Blue = actual prices; green = current forecast from the latest model (5–120 minute horizons).";
+          ? "Blue = actual prices (5m for the last 24h, 30m older); green = current forecast from the latest model (5–120 minute horizons); yellow dashed = forecast captured when you starred the item."
+          : "Blue = actual prices (5m for the last 24h, 30m older); green = current forecast from the latest model (5–120 minute horizons).";
       } catch (err) {
         console.error(err);
         priceStatusEl.textContent = "Error loading price series: " + err.message;
-        if (priceChart) { priceChart.destroy(); priceChart = null; }
+        if (priceChart) {
+          priceChart.destroy();
+          priceChart = null;
+        }
       }
     }
 
@@ -1120,8 +909,11 @@ const HTML = `<!DOCTYPE html>
 
         statusEl.textContent = "Loaded " + overviewSignals.length + " signals.";
         metaEl.textContent =
-          "Main horizon: " + MODEL_HORIZON + " minutes, tax: " +
-          (MODEL_TAX * 100).toFixed(1) + "%.";
+          "Main horizon: " +
+          MODEL_HORIZON +
+          " minutes, tax: " +
+          (MODEL_TAX * 100).toFixed(1) +
+          "%.";
 
         buildMappingFromDaily();
         renderTopTable();
@@ -1129,52 +921,41 @@ const HTML = `<!DOCTYPE html>
       } catch (err) {
         console.error(err);
         statusEl.textContent = "Error loading overview: " + err.message;
-        tableContainer.textContent = "Failed to load.";
       }
     }
-
-    searchButton.addEventListener("click", runSearch);
-    searchInput.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter") {
-        runSearch();
-      }
-    });
 
     loadOverview();
   })();
   </script>
 </body>
-</html>`;
+</html>
+`;
 
-// ----------------- Backend helpers -----------------
-
-const PRICE_CACHE = new Map();
-const PRICE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const PRICE_CACHE_MAX_ITEMS = 50;
+const SIGNALS_CACHE_TTL_MS = 60_000;
 let LAST_SIGNALS_JSON = null;
 let LAST_SIGNALS_FETCHED_AT = 0;
-const SIGNALS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes of reuse on success
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const PRICE_CACHE = new Map();
+const PRICE_CACHE_TTL_MS = 60_000;
+const PRICE_CACHE_MAX_ITEMS = 64;
 
-async function bucketGetWithRetry(env, key, { attempts = 3, baseDelayMs = 200 } = {}) {
+async function bucketGetWithRetry(env, key, { attempts = 3, baseDelayMs = 250 } = {}) {
   let lastError = null;
 
   for (let i = 0; i < attempts; i++) {
     try {
-      const obj = await env.OSRS_BUCKET.get(key);
-      return obj;
+      return await env.OSRS_BUCKET.get(key);
     } catch (err) {
       lastError = err;
       const isLast = i === attempts - 1;
-      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
+      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 200;
       console.warn(
-        `Attempt ${i + 1} to fetch ${key} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
+        `Attempt ${i + 1} for bucket.get(${key}) failed: ${err.message}${
+          isLast ? "" : `; retrying in ${delay}ms`
+        }`
       );
       if (!isLast) {
-        await sleep(delay);
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
@@ -1192,17 +973,19 @@ async function bucketListWithRetry(env, options, { attempts = 3, baseDelayMs = 2
     } catch (err) {
       lastError = err;
       const isLast = i === attempts - 1;
-      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 100;
+      const delay = baseDelayMs * Math.pow(2, i) + Math.random() * 200;
       console.warn(
-        `Attempt ${i + 1} to list ${options?.prefix || ""} failed: ${err.message}${isLast ? "" : `; retrying in ${delay}ms`}`,
+        `Attempt ${i + 1} for bucket.list(${JSON.stringify(options)}) failed: ${
+          err.message
+        }${isLast ? "" : `; retrying in ${delay}ms`}`
       );
       if (!isLast) {
-        await sleep(delay);
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
 
-  console.error(`Failed to list with options ${JSON.stringify(options)} after ${attempts} attempts`, lastError);
+  console.error(`Failed to list with options ${JSON.stringify(options)}`, lastError);
   return null;
 }
 
@@ -1234,11 +1017,10 @@ function getCachedPriceSeries(cacheKey, { allowStale = false } = {}) {
   if (!entry) return null;
 
   const age = Date.now() - entry.cachedAt;
-  if (age > PRICE_CACHE_TTL_MS && !allowStale) {
+  if (!allowStale && age > PRICE_CACHE_TTL_MS) {
     PRICE_CACHE.delete(cacheKey);
     return null;
   }
-
   return entry.payload;
 }
 
@@ -1281,7 +1063,7 @@ async function handleDaily(env) {
   });
 }
 
-// Build price history (~14d of 5m mid prices) + forecast from signals.path,
+// Build price history (~14d of 5m mid prices, sampled as 5m last 24h + 30m older) + forecast from signals.path,
 // anchoring the forecast to the last history mid price.
 async function buildSnapshotKeys(env, startedAt, budgetMs) {
   const MAX_DAYS = 14;
@@ -1327,33 +1109,91 @@ async function buildSnapshotKeys(env, startedAt, budgetMs) {
   return { selectedKeys: keys.slice(-MAX_SNAPSHOTS), truncated };
 }
 
+// Keys look like "5m/YYYY/MM/DD/HH-MM.json".
+// This returns the UTC timestamp in milliseconds, or null if parsing fails.
+function parseSnapshotKeyToTimestampMs(key) {
+  try {
+    const parts = key.split("/");
+    if (parts.length < 5) return null;
+
+    const year = Number(parts[1]);
+    const month = Number(parts[2]); // 1-based
+    const day = Number(parts[3]);
+
+    const timePart = parts[4].split(".")[0]; // strip ".json"
+    const [hourStr, minuteStr] = timePart.split("-");
+    const hour = Number(hourStr);
+    const minute = Number(minuteStr);
+
+    if (
+      !Number.isFinite(year) ||
+      !Number.isFinite(month) ||
+      !Number.isFinite(day) ||
+      !Number.isFinite(hour) ||
+      !Number.isFinite(minute)
+    ) {
+      return null;
+    }
+
+    return Date.UTC(year, month - 1, day, hour, minute);
+  } catch (_err) {
+    return null;
+  }
+}
+
+// Sample snapshot keys so that:
+//  - the last 24h are kept at full 5-minute resolution
+//  - older history is downsampled to ~30-minute spacing
 function sampleSnapshotKeys(selectedKeys) {
-  // Downsample snapshot fetches to avoid timeouts while still covering the full window.
-  // Keep the most recent 3h at full (5m) resolution and aggressively sample the older
-  // portion to stay within a tighter fetch budget. The lower cap keeps the worker comfortably
-  // within observed timeout thresholds and reduces cascading failures when a single item is heavy
-  // to load.
-  const MAX_FETCH_KEYS = 90; // tighter hard cap on snapshot fetches per request
-  const RECENT_FULL_WINDOW = 3 * 12; // last 3h of 5m snapshots
+  if (!selectedKeys || !selectedKeys.length) return [];
 
-  const recentKeys = selectedKeys.slice(-RECENT_FULL_WINDOW);
-  const olderKeys = selectedKeys.slice(0, Math.max(0, selectedKeys.length - RECENT_FULL_WINDOW));
+  const nowMs = Date.now();
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const THIRTY_MIN_MS = 30 * 60 * 1000;
+  const cutoffRecentMs = nowMs - ONE_DAY_MS;
 
-  const remainingBudget = Math.max(0, MAX_FETCH_KEYS - recentKeys.length);
-  const sampledOlder = [];
-  if (olderKeys.length && remainingBudget > 0) {
-    const olderStride = Math.max(1, Math.ceil(olderKeys.length / remainingBudget));
-    for (let i = 0; i < olderKeys.length; i += olderStride) {
-      sampledOlder.push(olderKeys[i]);
+  const keyed = [];
+  for (const key of selectedKeys) {
+    const tsMs = parseSnapshotKeyToTimestampMs(key);
+    if (tsMs == null) continue;
+    keyed.push({ key, tsMs });
+  }
+
+  keyed.sort((a, b) => a.tsMs - b.tsMs);
+
+  const recent = [];
+  const older = [];
+  for (const item of keyed) {
+    if (item.tsMs >= cutoffRecentMs) {
+      recent.push(item); // keep every 5m bucket in the last 24h
+    } else {
+      older.push(item);
     }
   }
 
-  const sampledKeys = sampledOlder.concat(recentKeys);
-  if (sampledKeys.length && sampledKeys[sampledKeys.length - 1] !== selectedKeys[selectedKeys.length - 1]) {
-    sampledKeys.push(selectedKeys[selectedKeys.length - 1]);
+  const sampledOlder = [];
+  let lastKeptTs = null;
+  for (const item of older) {
+    if (lastKeptTs == null || item.tsMs - lastKeptTs >= THIRTY_MIN_MS) {
+      sampledOlder.push(item);
+      lastKeptTs = item.tsMs;
+    }
   }
 
-  return sampledKeys;
+  const merged = sampledOlder.concat(recent);
+
+  // Safety cap: if something goes wild, fall back to uniform sampling
+  const MAX_FETCH_KEYS = 1000; // tune if needed
+  if (merged.length > MAX_FETCH_KEYS) {
+    const stride = Math.ceil(merged.length / MAX_FETCH_KEYS);
+    const down = [];
+    for (let i = 0; i < merged.length; i += stride) {
+      down.push(merged[i]);
+    }
+    return down.map((x) => x.key);
+  }
+
+  return merged.map((x) => x.key);
 }
 
 async function readSnapshotJson(env, key) {
@@ -1393,7 +1233,8 @@ async function loadHistoryFromSnapshots(env, itemId, sampledKeys, startedAt, bud
 
         const ah = rec.avgHighPrice;
         const al = rec.avgLowPrice;
-        if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0) return null;
+        if (typeof ah !== "number" || typeof al !== "number" || ah <= 0 || al <= 0)
+          return null;
 
         const mid = (ah + al) / 2;
         const tsSec = typeof fm.timestamp === "number" ? fm.timestamp : null;
@@ -1443,7 +1284,6 @@ async function buildForecast(env, itemId, history) {
     const minutes = p.minutes;
     const ret = p.future_return_hat;
 
-    // Optional mild clamp to avoid absurd spikes
     const clampedRet = Math.max(-0.8, Math.min(3.0, ret));
 
     const price = anchorMid * (1 + clampedRet);
@@ -1499,7 +1339,7 @@ async function handlePriceSeries(env, itemId) {
     });
   }
   const startedAt = Date.now();
-  const BUILD_BUDGET_MS = 12_000; // soft budget to bail out before hard worker timeout
+  const BUILD_BUDGET_MS = 12_000;
 
   const built = await buildPriceSeriesPayload(env, itemId, startedAt, BUILD_BUDGET_MS).then(
     (payload) => payload,
@@ -1530,6 +1370,12 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/") {
+      return new Response(HTML, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=UTF-8" }
+      });
+    }
     if (url.pathname === "/signals") {
       return handleSignals(env);
     }
@@ -1538,20 +1384,16 @@ export default {
     }
     if (url.pathname === "/price-series") {
       const idParam = url.searchParams.get("item_id");
-      const itemId = parseInt(idParam, 10);
-      if (!idParam || !Number.isFinite(itemId)) {
-        return new Response(
-          JSON.stringify({ error: "item_id query param required" }),
-          { status: 400, headers: { "Content-Type": "application/json" } }
-        );
+      const itemId = idParam ? Number(idParam) : NaN;
+      if (!Number.isFinite(itemId) || itemId <= 0) {
+        return new Response(JSON.stringify({ error: "Invalid item_id" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
       }
       return handlePriceSeries(env, itemId);
     }
 
-    // default: serve UI
-    return new Response(HTML, {
-      status: 200,
-      headers: { "Content-Type": "text/html; charset=utf-8" }
-    });
+    return new Response("Not found", { status: 404 });
   }
 };
