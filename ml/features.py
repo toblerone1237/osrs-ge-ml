@@ -7,7 +7,7 @@ from botocore.config import Config
 import pandas as pd
 import numpy as np
 
-# --- Multi‑horizon configuration -------------------------------------------
+# --- Multi-horizon configuration -------------------------------------------
 
 # Horizons in minutes for which we will train path models
 # e.g. 5, 10, ..., 120 minutes
@@ -52,7 +52,7 @@ def list_keys_with_prefix(s3, bucket, prefix):
 
 def load_5m_snapshot(s3, bucket, key):
     """
-    Load a single 5‑minute snapshot JSON from R2.
+    Load a single 5-minute snapshot JSON from R2.
     """
     obj = s3.get_object(Bucket=bucket, Key=key)
     snap = json.loads(obj["Body"].read())
@@ -61,10 +61,10 @@ def load_5m_snapshot(s3, bucket, key):
 
 def flatten_5m_snapshots(s3, bucket, keys):
     """
-    Flatten a list of OSRS 5‑minute snapshot objects into a tabular DataFrame.
+    Flatten a list of OSRS 5-minute snapshot objects into a tabular DataFrame.
 
     Columns:
-      - timestamp: timezone‑aware datetime (UTC) of the 5m bucket
+      - timestamp: timezone-aware datetime (UTC) of the 5m bucket
       - timestamp_unix: integer seconds since epoch (UTC)
       - item_id
       - avg_high_price, avg_low_price
@@ -74,7 +74,7 @@ def flatten_5m_snapshots(s3, bucket, keys):
     for key in keys:
         snap = load_5m_snapshot(s3, bucket, key)
         five = snap["five_minute"]
-        ts_unix = five["timestamp"]            # seconds since epoch (int)
+        ts_unix = five["timestamp"]  # seconds since epoch (int)
         ts_dt = datetime.fromtimestamp(ts_unix, tz=timezone.utc)
         data = five["data"]
 
@@ -104,9 +104,9 @@ def flatten_5m_snapshots(s3, bucket, keys):
     return df
 
 
-def add_basic_features(df):
+def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add basic per‑snapshot features used by both training and scoring.
+    Add basic per-snapshot features used by other helpers.
 
     Adds:
       - mid_price
@@ -115,7 +115,7 @@ def add_basic_features(df):
       - log_volume_5m
     """
     df = df.copy()
-    df["mid_price"] = (df["avg_high_price"] + df["avg_low_price"]) / 2
+    df["mid_price"] = (df["avg_high_price"] + df["avg_low_price"]) / 2.0
 
     df["spread"] = df["avg_high_price"] - df["avg_low_price"]
     # avoid division by zero
@@ -127,13 +127,97 @@ def add_basic_features(df):
     return df
 
 
+def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add all features used by the ML models (training & scoring).
+
+    This builds on add_basic_features and then adds:
+      - Lagged returns: ret_5m_past, ret_15m_past, ret_60m_past
+      - Volatility over last 60m: volatility_60m (std of 5m returns)
+      - Rolling 60m volume and relative volume:
+            rolling_volume_60m, log_rolling_volume_60m,
+            volume_ratio_5m_to_60m
+      - Time-of-day and day-of-week encodings:
+            hour_sin, hour_cos, dow_sin, dow_cos
+    """
+    df = add_basic_features(df)
+    df = df.dropna(subset=["mid_price"]).copy()
+    df = df[df["mid_price"] > 0].copy()
+    df.sort_values(["item_id", "timestamp"], inplace=True)
+
+    # Group by item for lag/rolling features
+    grp_mid = df.groupby("item_id", sort=False)["mid_price"]
+    grp_vol = df.groupby("item_id", sort=False)["total_volume_5m"]
+
+    # Past returns (assuming 5m spacing between rows within an item series)
+    df["ret_5m_past"] = grp_mid.pct_change(periods=1)
+    df["ret_15m_past"] = grp_mid.pct_change(periods=3)
+    df["ret_60m_past"] = grp_mid.pct_change(periods=12)
+
+    # 60m volatility of 5m returns
+    grp_ret5 = df.groupby("item_id", sort=False)["ret_5m_past"]
+    df["volatility_60m"] = (
+        grp_ret5.rolling(window=12, min_periods=2)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+
+    # Rolling 60m volume (sum of 12 buckets)
+    rolling_vol_60m = (
+        grp_vol.rolling(window=12, min_periods=1)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
+    df["rolling_volume_60m"] = rolling_vol_60m
+    df["log_rolling_volume_60m"] = np.log1p(rolling_vol_60m)
+
+    # Relative volume: current 5m vs average over last 60m
+    avg_vol_60m = rolling_vol_60m / 12.0
+    df["volume_ratio_5m_to_60m"] = df["total_volume_5m"] / (1.0 + avg_vol_60m)
+
+    # Time-of-day / day-of-week encodings
+    ts = df["timestamp"]
+    # ts should already be tz-aware UTC, but be safe:
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize(timezone.utc)
+    else:
+        ts = ts.dt.tz_convert(timezone.utc)
+
+    hour_float = ts.dt.hour + ts.dt.minute / 60.0
+    dow = ts.dt.dayofweek  # 0=Monday
+
+    df["hour_sin"] = np.sin(2.0 * np.pi * hour_float / 24.0)
+    df["hour_cos"] = np.cos(2.0 * np.pi * hour_float / 24.0)
+    df["dow_sin"] = np.sin(2.0 * np.pi * dow / 7.0)
+    df["dow_cos"] = np.cos(2.0 * np.pi * dow / 7.0)
+
+    # Clean up NaNs / infs in derived features (leave mid_price, etc. as-is)
+    derived_cols = [
+        "ret_5m_past",
+        "ret_15m_past",
+        "ret_60m_past",
+        "volatility_60m",
+        "rolling_volume_60m",
+        "log_rolling_volume_60m",
+        "volume_ratio_5m_to_60m",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
+    ]
+    df[derived_cols] = df[derived_cols].replace([np.inf, -np.inf], np.nan)
+    df[derived_cols] = df[derived_cols].fillna(0.0)
+
+    return df
+
+
 def add_multi_horizon_returns(
-    df,
+    df: pd.DataFrame,
     horizons_minutes=None,
-    item_col="item_id",
-    time_col="timestamp_unix",
-    mid_col="mid_price",
-):
+    item_col: str = "item_id",
+    time_col: str = "timestamp_unix",
+    mid_col: str = "mid_price",
+) -> pd.DataFrame:
     """
     For each row (item_id, timestamp), compute future returns at multiple horizons.
 
@@ -147,7 +231,7 @@ def add_multi_horizon_returns(
     This function assumes:
       - df[time_col] is integer seconds since epoch (e.g. timestamp_unix)
       - df[mid_col] holds the mid price at that time
-      - df is already at 5‑minute resolution per item_id (your 5m snapshots)
+      - df is already at 5-minute resolution per item_id (your 5m snapshots)
 
     It returns a *copy* of df with new columns:
 
@@ -159,44 +243,46 @@ def add_multi_horizon_returns(
         horizons_minutes = HORIZONS_MINUTES
 
     df = df.copy()
-
-    # ensure sorted by item + time
     df.sort_values([item_col, time_col], inplace=True)
 
-    # prepare empty columns
+    # Prepare result columns
     for h in horizons_minutes:
         df[f"ret_{h}m"] = np.nan
 
-    # group per item to keep lookup local
-    for item_id, g in df.groupby(item_col):
+    # Group per item to keep lookup local
+    for _, g in df.groupby(item_col, sort=False):
         idx = g.index.to_numpy()
-        ts = g[time_col].to_numpy(dtype="int64")   # seconds
+        ts = g[time_col].to_numpy(dtype="int64")  # seconds
         mid = g[mid_col].to_numpy(dtype="float64")
 
         n = len(ts)
         if n == 0:
             continue
 
-        for i in range(n):
-            mid_now = mid[i]
-            if not np.isfinite(mid_now) or mid_now <= 0:
+        valid_mid = np.isfinite(mid) & (mid > 0)
+        if not valid_mid.any():
+            continue
+
+        for h in horizons_minutes:
+            horizon_sec = int(h) * 60
+            targets = ts + horizon_sec
+            # For each current timestamp, find index of first ts[j] >= target
+            j = np.searchsorted(ts, targets, side="left")
+
+            mask = (j < n) & valid_mid
+            if not np.any(mask):
                 continue
 
-            t0 = ts[i]
+            future_mid = np.full_like(mid, np.nan, dtype="float64")
+            future_mid[mask] = mid[j[mask]]
+            mask &= np.isfinite(future_mid) & (future_mid > 0)
 
-            for h in horizons_minutes:
-                target = t0 + h * 60  # seconds
+            if not np.any(mask):
+                continue
 
-                # find first index j with ts[j] >= target
-                j = np.searchsorted(ts, target)
-                if j >= n:
-                    continue  # no future snapshot available at this horizon
+            ret = np.full_like(mid, np.nan, dtype="float64")
+            ret[mask] = (future_mid[mask] / mid[mask]) - 1.0
 
-                mid_future = mid[j]
-                if not np.isfinite(mid_future) or mid_future <= 0:
-                    continue
-
-                ret = (mid_future / mid_now) - 1.0
-                df.loc[idx[i], f"ret_{h}m"] = ret
+            df.loc[idx, f"ret_{h}m"] = ret
 
     return df
