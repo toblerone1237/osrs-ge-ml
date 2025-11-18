@@ -413,23 +413,56 @@ const HTML = `<!DOCTYPE html>
         .map(function (s) {
           const id = s.item_id;
           const name = s.name || ("Item " + id);
-          const winProb = typeof s.win_prob === "number" ? s.win_prob : 0;
-          const pnl = typeof s.expected_profit_gp === "number" ? s.expected_profit_gp : 0;
-          const vol =
-            vols && Object.prototype.hasOwnProperty.call(vols, id)
-              ? vols[id]
+
+          // ✅ Correct field names from signals/latest.json
+          const winProb =
+            typeof s.prob_profit === "number" ? s.prob_profit : 0;
+
+          const pnl =
+            typeof s.expected_profit === "number" ? s.expected_profit : 0;
+
+          const gpPerSec =
+            typeof s.expected_profit_per_second === "number"
+              ? s.expected_profit_per_second
               : null;
-          const liqScore = vol != null ? Math.log10(1 + vol) : 0;
-          const score = winProb * pnl * liqScore;
+
+          const gpPerHour =
+            gpPerSec != null && Number.isFinite(gpPerSec)
+              ? gpPerSec * 3600
+              : null;
+
+          // 24h volume lookup (works if keys are strings or numbers)
+          let vol = null;
+          if (vols) {
+            if (Object.prototype.hasOwnProperty.call(vols, id)) {
+              vol = vols[id];
+            } else if (
+              Object.prototype.hasOwnProperty.call(vols, String(id))
+            ) {
+              vol = vols[String(id)];
+            }
+          }
+
+          const liqScore =
+            vol != null && vol > 0 ? Math.log10(1 + vol) : 0;
+
+          // Ranking score: winProb × profit × liquidity
+          const score =
+            Math.max(0, winProb) *
+            Math.max(0, pnl) *
+            Math.max(1e-3, liqScore || 1);
+
           return {
-            ...s,
+            raw: s,
             id: id,
             name: name,
             winProb: winProb,
             pnl: pnl,
+            gpPerHour: gpPerHour,
             vol: vol,
-            liqScore: liqScore,
-            combinedScore: score,
+            holdMinutes:
+              typeof s.hold_minutes === "number" ? s.hold_minutes : null,
+            combinedScore: Number.isFinite(score) ? score : 0,
             pinned: pins.has(String(id))
           };
         })
@@ -437,6 +470,7 @@ const HTML = `<!DOCTYPE html>
           return Number.isFinite(row.combinedScore);
         });
 
+      // Highest combined score first
       scored.sort(function (a, b) {
         return b.combinedScore - a.combinedScore;
       });
@@ -467,46 +501,53 @@ const HTML = `<!DOCTYPE html>
         const tr = document.createElement("tr");
         tr.className = "clickable";
 
+        // ★ pin
         const tdStar = document.createElement("td");
         const btn = document.createElement("button");
-        btn.className = "pin-btn " + (row.pinned ? "pinned" : "unPinned");
+        btn.className = "pin-btn " + (row.pinned ? "pinned" : "unpinned");
         btn.textContent = row.pinned ? "★" : "☆";
         btn.type = "button";
         btn.addEventListener("click", function (ev) {
           ev.stopPropagation();
-          togglePin(row.id, row.name, row.path || []);
+          // store current path when pinning, if available
+          togglePin(row.id, row.name, row.raw.path || []);
         });
         tdStar.appendChild(btn);
         tr.appendChild(tdStar);
 
+        // Item name
         const tdName = document.createElement("td");
         tdName.textContent = row.name;
         tr.appendChild(tdName);
 
+        // Win %
         const tdWin = document.createElement("td");
         tdWin.textContent = formatPercent(row.winProb);
         tr.appendChild(tdWin);
 
+        // Exp. profit (gp) per item
         const tdProfit = document.createElement("td");
         tdProfit.textContent = formatProfitGp(row.pnl);
         tr.appendChild(tdProfit);
 
+        // GP/hr @limit
         const tdHr = document.createElement("td");
-        const hr = typeof row.gp_per_hour === "number" ? row.gp_per_hour : null;
-        tdHr.textContent = hr != null ? formatGpPerHour(hr) : "-";
+        tdHr.textContent =
+          row.gpPerHour != null && Number.isFinite(row.gpPerHour)
+            ? formatGpPerHour(row.gpPerHour)
+            : "-";
         tr.appendChild(tdHr);
 
+        // 24h volume
         const tdVol = document.createElement("td");
-        const id = row.id;
-        const v =
-          vols && Object.prototype.hasOwnProperty.call(vols, id)
-            ? vols[id]
-            : null;
-        tdVol.textContent = v != null ? v.toLocaleString("en-US") : "-";
+        tdVol.textContent =
+          row.vol != null ? row.vol.toLocaleString("en-US") : "-";
         tr.appendChild(tdVol);
 
+        // Hold (m)
         const tdH = document.createElement("td");
-        tdH.textContent = row.hold_minutes + "m";
+        tdH.textContent =
+          row.holdMinutes != null ? row.holdMinutes + "m" : "-";
         tr.appendChild(tdH);
 
         tr.addEventListener("click", function () {
@@ -524,6 +565,7 @@ const HTML = `<!DOCTYPE html>
         loadPriceSeries(top10[0].id, top10[0].name);
       }
     }
+
 
     function runSearch() {
       if (!mappingList.length) {
