@@ -15,7 +15,18 @@ from features import (
 )
 
 # --------------------------------------------------------------------
-# Helpers to find the latest 5m snapshot and to load models + item map
+# Config
+# --------------------------------------------------------------------
+
+# How far back we are willing to look for a "latest" snapshot per item
+# when generating signals. Any item that traded at least once in the last
+# SCORING_LOOKBACK_MINUTES minutes can get a signal, even if it did not
+# appear in the very last 5m bucket.
+SCORING_LOOKBACK_MINUTES = 60
+
+
+# --------------------------------------------------------------------
+# Helpers to find recent 5m snapshots and to load models + item map
 # --------------------------------------------------------------------
 
 
@@ -32,6 +43,40 @@ def get_latest_5m_key(s3, bucket: str) -> str | None:
             keys.sort()
             return keys[-1]
     return None
+
+
+def get_recent_5m_keys(s3, bucket: str, minutes: int) -> list[str]:
+    """
+    Return all 5m snapshot keys whose timestamp falls within the last
+    `minutes` minutes. We only need to look at today + yesterday because
+    minutes is assumed < 24h.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=minutes)
+    keys_with_ts: list[tuple[datetime, str]] = []
+
+    for delta in (0, 1):  # today and yesterday
+        day = (now - timedelta(days=delta)).date()
+        prefix = f"5m/{day.year}/{day.month:02d}/{day.day:02d}/"
+        day_keys = list_keys_with_prefix(s3, bucket, prefix)
+        for key in day_keys:
+            # Keys look like: 5m/YYYY/MM/DD/HH-MM.json
+            try:
+                filename = key.split("/")[-1]
+                hhmm = filename.split(".")[0]
+                hh_str, mm_str = hhmm.split("-")
+                hh = int(hh_str)
+                mm = int(mm_str)
+                ts = datetime(
+                    day.year, day.month, day.day, hh, mm, tzinfo=timezone.utc
+                )
+            except Exception:
+                continue
+            if ts >= cutoff:
+                keys_with_ts.append((ts, key))
+
+    keys_with_ts.sort(key=lambda x: x[0])
+    return [k for _, k in keys_with_ts]
 
 
 def load_models_and_meta(s3, bucket: str):
@@ -139,6 +184,52 @@ def load_item_name_map(s3, bucket: str) -> dict[int, str]:
     return id_to_name
 
 
+def build_scoring_dataframe(s3, bucket: str, lookback_minutes: int) -> pd.DataFrame:
+    """
+    Build a DataFrame of the most recent snapshot per item within the last
+    `lookback_minutes` minutes.
+
+    If there are no recent keys, we fall back to the single latest 5m snapshot
+    (old behaviour).
+    """
+    recent_keys = get_recent_5m_keys(s3, bucket, lookback_minutes)
+    if not recent_keys:
+        print(
+            f"No 5m snapshots found in the last {lookback_minutes} minutes; "
+            "falling back to latest single snapshot."
+        )
+        latest_key = get_latest_5m_key(s3, bucket)
+        if not latest_key:
+            return pd.DataFrame()
+        print("Using fallback snapshot:", latest_key)
+        df = flatten_5m_snapshots(s3, bucket, [latest_key])
+    else:
+        print(
+            f"Using {len(recent_keys)} snapshots from the last "
+            f"{lookback_minutes} minutes."
+        )
+        df = flatten_5m_snapshots(s3, bucket, recent_keys)
+
+    if df.empty:
+        return df
+
+    # Basic features
+    df = add_basic_features(df)
+    df = df.dropna(subset=["mid_price"])
+    df = df[df["mid_price"] > 0].copy()
+
+    # For scoring, we want exactly one "current" row per item: the most recent
+    # snapshot in the lookback window. We rely on the timestamp column exposed
+    # by flatten_5m_snapshots.
+    df.sort_values(["item_id", "timestamp"], inplace=True)
+    idx = df.groupby("item_id")["timestamp"].idxmax()
+    df = df.loc[idx].copy()
+
+    # Very important: make index 0..N-1 so prediction arrays align with row positions
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
 # --------------------------------------------------------------------
 # Main scoring
 # --------------------------------------------------------------------
@@ -148,26 +239,15 @@ def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
-    # 1) Get the latest 5m snapshot and flatten it
-    latest_key = get_latest_5m_key(s3, bucket)
-    if not latest_key:
-        print("No 5m snapshot found.")
-        return
-
-    print("Using snapshot:", latest_key)
-    df = flatten_5m_snapshots(s3, bucket, [latest_key])
+    # 1) Build scoring dataframe for the last SCORING_LOOKBACK_MINUTES minutes
+    df = build_scoring_dataframe(s3, bucket, SCORING_LOOKBACK_MINUTES)
     if df.empty:
-        print("Snapshot empty.")
+        print("No data to score (no recent snapshots).")
         return
 
-    # 2) Basic features + clean
-    df = add_basic_features(df)
-    df = df.dropna(subset=["mid_price"])
-    df = df[df["mid_price"] > 0].copy()
-    # Very important: make index 0..N-1 so prediction arrays align with row positions
-    df.reset_index(drop=True, inplace=True)
+    print(f"Scoring {len(df)} items with recent activity.")
 
-    # 3) Load models + meta
+    # 2) Load models + meta
     reg_by_horizon, cls, meta = load_models_and_meta(s3, bucket)
 
     feature_cols = meta["feature_cols"]
@@ -189,10 +269,10 @@ def main():
     print("Main horizon:", main_horizon, "minutes.")
     print("Path horizons:", path_horizons)
 
-    # 4) Build feature matrix
+    # 3) Build feature matrix
     X = df[feature_cols].values
 
-    # 5) Predict returns for each horizon
+    # 4) Predict returns for each horizon
     def _get_reg(h):
         if h in reg_by_horizon:
             return reg_by_horizon[h]
@@ -220,10 +300,11 @@ def main():
             some_h = next(iter(path_preds.keys()))
             main_ret = path_preds[some_h]
         else:
+            # Extreme fallback: pick some regressor and ignore horizon mismatch
             some_reg = next(iter(reg_by_horizon.values()))
             main_ret = some_reg.predict(X)
 
-    # 6) Probability of profit from classifier (main horizon)
+    # 5) Probability of profit from classifier (main horizon)
     try:
         prob_profit = cls.predict_proba(X)[:, 1]
     except Exception as e:
@@ -244,10 +325,10 @@ def main():
     df["expected_profit"] = profit
     df["expected_profit_per_second"] = profit_per_sec
 
-    # 7) Load item -> name map
+    # 6) Load item -> name map
     id_to_name = load_item_name_map(s3, bucket)
 
-    # 8) Build multi-horizon path predictions per row (ALL items)
+    # 7) Build multi-horizon path predictions per row (ALL items)
     signals = []
     N = len(df)
     path_horizons_sorted = sorted(path_horizons)
@@ -289,13 +370,13 @@ def main():
             }
         )
 
-    # 9) Sort signals by expected_profit_per_second (UI still picks top 10)
+    # 8) Sort signals by expected_profit_per_second (UI still picks top 10)
     signals.sort(
         key=lambda s: s.get("expected_profit_per_second", 0.0),
         reverse=True,
     )
 
-    # 10) Write signals/latest.json + dated copy
+    # 9) Write signals/latest.json + dated copy
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
     time_part = now.strftime("%H-%M")
@@ -325,7 +406,10 @@ def main():
         ContentType="application/json",
     )
 
-    print(f"Wrote {len(signals)} signals (all items in latest snapshot).")
+    print(
+        f"Wrote {len(signals)} signals "
+        f"(items with snapshots in the last {SCORING_LOOKBACK_MINUTES} minutes)."
+    )
 
 
 if __name__ == "__main__":
