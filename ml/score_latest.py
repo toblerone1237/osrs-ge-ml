@@ -313,8 +313,8 @@ def main():
     import json
     buf = json.dumps(out).encode("utf-8")
 
-    key_signals = f"signals/{date_part}.json"
-    key_latest = "signals/latest.json"
+    key_signals = f"signals/remove-noisy-sections/{date_part}.json"
+    key_latest = "signals/remove-noisy-sections/latest.json"
     s3.put_object(Bucket=bucket, Key=key_signals, Body=buf)
     s3.put_object(Bucket=bucket, Key=key_latest, Body=buf)
 
