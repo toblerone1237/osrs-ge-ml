@@ -88,8 +88,8 @@ def load_latest_models(s3, bucket):
     """
     Load the latest regressors and metadata from R2.
     """
-    key_reg = "models/{EXPERIMENT}/latest_reg.pkl"
-    key_meta = "models/{EXPERIMENT}/latest_meta.json"
+    key_reg = "models/quantile/latest_reg.pkl"
+    key_meta = "models/quantile/latest_meta.json"
 
     obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
     obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
@@ -472,8 +472,8 @@ def main():
     buf = json.dumps(out).encode("utf-8")
     
     SIGNALS_NAMESPACE = EXPERIMENT
-    key_signals = f"signals/{SIGNALS_NAMESPACE}/{date_part}.json"
-    key_latest = "signals/{SIGNALS_NAMESPACE}/latest.json"
+    key_signals = f"signals/quantile/{date_part}.json"
+    key_latest = "signals/quantile/latest.json"
     s3.put_object(Bucket=bucket, Key=key_signals, Body=buf)
     s3.put_object(Bucket=bucket, Key=key_latest, Body=buf)
 
