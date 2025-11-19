@@ -1155,7 +1155,7 @@ async function loadSignalsWithCache(env) {
     return { json: LAST_SIGNALS_JSON, source: "cache" };
   }
 
-  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/quantile/latest.json");
   if (obj) {
     try {
       const text = await obj.text();
@@ -1166,7 +1166,7 @@ async function loadSignalsWithCache(env) {
         return { json: parsed, source: "fresh" };
       }
     } catch (err) {
-      console.error("Error parsing signals/latest.json:", err);
+      console.error("Error parsing signals/quantile/latest.json:", err);
     }
   }
 
@@ -1195,7 +1195,7 @@ function setCachedPriceSeries(cacheKey, payload) {
 }
 
 async function handleSignals(env) {
-  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/quantile/latest.json");
   if (!obj) {
     return new Response(JSON.stringify({ error: "No signals found" }), {
       status: 404,
