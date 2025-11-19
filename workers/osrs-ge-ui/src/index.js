@@ -156,12 +156,12 @@ const HTML = `<!DOCTYPE html>
       table { font-size: 0.78rem; }
       header h1 { font-size: 1.2rem; }
       .card { padding: 0.85rem 0.9rem; }
-      .chart-wrapper {
-        height: 220px;
-      }
+      .chart-wrapper { height: 220px; }
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2"></script>
 </head>
 <body>
   <header>
@@ -215,6 +215,7 @@ const HTML = `<!DOCTYPE html>
         <canvas id="priceChart"></canvas>
       </div>
       <div id="priceStatus" class="small" style="margin-top:0.4rem;"></div>
+      <div class="small" style="margin-top:0.25rem;">Scroll to zoom, Shift+drag to pan, double‑click to reset.</div>
     </div>
   </main>
 
@@ -423,13 +424,6 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
-      const vols =
-        dailySnapshot &&
-        dailySnapshot.volumes_24h &&
-        dailySnapshot.volumes_24h.data
-          ? dailySnapshot.volumes_24h.data
-          : {};
-
       const pins = getPinnedSet();
 
       const rows = overviewSignals
@@ -451,19 +445,11 @@ const HTML = `<!DOCTYPE html>
               ? gpPerSec * 3600
               : null;
 
-          let vol = null;
-          if (vols) {
-            if (Object.prototype.hasOwnProperty.call(vols, id)) {
-              vol = vols[id];
-            } else if (
-              Object.prototype.hasOwnProperty.call(vols, String(id))
-            ) {
-              vol = vols[String(id)];
-            }
-          }
+          const volWindow =
+            typeof s.volume_window === "number" ? s.volume_window : 0;
 
           const liqScore =
-            vol != null && vol > 0 ? Math.log10(1 + vol) : 0;
+            volWindow > 0 ? Math.log10(1 + volWindow) : 0;
 
           const score =
             Math.max(0, winProb) *
@@ -477,7 +463,7 @@ const HTML = `<!DOCTYPE html>
             winProb,
             profit,
             gpPerHour,
-            vol,
+            volWindow,
             holdMinutes:
               typeof s.hold_minutes === "number" ? s.hold_minutes : null,
             combinedScore: Number.isFinite(score) ? score : 0,
@@ -501,7 +487,7 @@ const HTML = `<!DOCTYPE html>
         "Win %",
         "Exp. profit (gp)",
         "GP/hr @limit",
-        "24h volume",
+        "Window volume",
         "Hold (m)"
       ].forEach((h) => {
         const th = document.createElement("th");
@@ -547,7 +533,9 @@ const HTML = `<!DOCTYPE html>
 
         const tdVol = document.createElement("td");
         tdVol.textContent =
-          row.vol != null ? row.vol.toLocaleString("en-US") : "-";
+          row.volWindow != null
+            ? row.volWindow.toLocaleString("en-US")
+            : "-";
         tr.appendChild(tdVol);
 
         const tdHold = document.createElement("td");
@@ -704,22 +692,25 @@ const HTML = `<!DOCTYPE html>
         tsSet.add(nowTs);
       }
 
-      const tsList = Array.from(tsSet).filter((ts) => Number.isFinite(ts));
-      tsList.sort((a, b) => a - b);
+      const tsList = Array.from(tsSet).filter(function (ts) {
+        return ts != null && Number.isFinite(ts);
+      });
+      tsList.sort(function (a, b) {
+        return a - b;
+      });
 
-      const labels = [];
+      // Use Date objects for a real time axis
+      const labels = tsList.map(function (ts) {
+        return new Date(ts);
+      });
+
       const histData = [];
       const fcData = [];
       const oldFcData = [];
       const starMarkerData = [];
       const nowMarkerData = [];
 
-      tsList.forEach((ts) => {
-        const d = new Date(ts);
-        const iso = isNaN(d.getTime()) ? null : d.toISOString();
-        const label = iso ? iso.slice(5, 10) + " " + iso.slice(11, 16) : String(ts);
-        labels.push(label);
-
+      tsList.forEach(function (ts) {
         histData.push(histMap.has(ts) ? histMap.get(ts) : null);
 
         const isFutureOrNow = nowTs == null || ts >= nowTs;
@@ -898,10 +889,17 @@ const HTML = `<!DOCTYPE html>
             animation: false,
             scales: {
               x: {
+                type: "time",
+                time: {
+                  unit: "hour",
+                  stepSize: 1,
+                  displayFormats: {
+                    hour: "MM-dd HH:mm"
+                  }
+                },
                 ticks: {
-                  maxRotation: 45,
-                  minRotation: 45,
-                  maxTicksLimit: 16
+                  maxRotation: 0,
+                  autoSkip: true
                 }
               },
               y: {
@@ -922,8 +920,33 @@ const HTML = `<!DOCTYPE html>
             plugins: {
               legend: {
                 position: "bottom"
+              },
+              zoom: {
+                zoom: {
+                  wheel: {
+                    enabled: true
+                  },
+                  pinch: {
+                    enabled: true
+                  },
+                  mode: "x"
+                },
+                pan: {
+                  enabled: true,
+                  mode: "x",
+                  modifierKey: "shift"
+                },
+                limits: {
+                  x: { min: "original", max: "original" }
+                }
               }
             }
+          }
+        });
+
+        chartCanvas.addEventListener("dblclick", function () {
+          if (priceChart && typeof priceChart.resetZoom === "function") {
+            priceChart.resetZoom();
           }
         });
 
@@ -1153,7 +1176,6 @@ async function handleSignals(env) {
 }
 
 async function handleDaily(env) {
-  // Try today and up to 6 days back
   const now = new Date();
   for (let delta = 0; delta < 7; delta++) {
     const d = new Date(now.getTime() - delta * 86400000);
