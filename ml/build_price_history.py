@@ -1,16 +1,10 @@
 import os
 import json
+import math
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
-import numpy as np
-import pandas as pd
-
-from features import (
-    get_r2_client,
-    list_keys_with_prefix,
-    flatten_5m_snapshots,
-    add_basic_features,
-)
+from features import get_r2_client, list_keys_with_prefix
 
 # How far back to build history (in days)
 MAX_HISTORY_DAYS = 14
@@ -22,13 +16,12 @@ RECENT_WINDOW_HOURS = 24
 OLDER_INTERVAL_MIN = 30
 
 
-def find_recent_5m_keys(s3, bucket: str) -> list[str]:
+def list_recent_5m_keys(s3, bucket: str):
     """
     Collect all 5m snapshot keys for the last MAX_HISTORY_DAYS days.
     """
     now = datetime.now(timezone.utc)
-    keys: list[str] = []
-
+    keys = []
     for delta in range(MAX_HISTORY_DAYS):
         d = (now - timedelta(days=delta)).date()
         prefix = f"5m/{d.year}/{d.month:02d}/{d.day:02d}/"
@@ -40,77 +33,137 @@ def find_recent_5m_keys(s3, bucket: str) -> list[str]:
     return keys
 
 
-def build_histories(df: pd.DataFrame, bucket: str, s3) -> None:
+def build_streaming_histories(s3, bucket: str):
     """
-    Given a DataFrame of 5m snapshots with mid_price, build per-item histories and
-    write them to R2 as history/{item_id}.json.
+    Stream over 5m snapshots and build per-item histories in memory:
 
-    - Last RECENT_WINDOW_HOURS hours stay at 5m resolution
-    - Older data is resampled to OLDER_INTERVAL_MIN-minute buckets (last price)
+      - last RECENT_WINDOW_HOURS hours: keep every 5m mid price
+      - older data up to MAX_HISTORY_DAYS: keep last price in each
+        OLDER_INTERVAL_MIN-minute bucket
     """
-    if df.empty:
-        print("No rows to build histories from.")
-        return
+    now = datetime.now(timezone.utc)
+    cutoff_oldest = now - timedelta(days=MAX_HISTORY_DAYS)
+    cutoff_recent = now - timedelta(hours=RECENT_WINDOW_HOURS)
+    cutoff_oldest_unix = int(cutoff_oldest.timestamp())
+    cutoff_recent_unix = int(cutoff_recent.timestamp())
 
-    # Ensure timestamp is a timezone-aware index
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df.set_index("timestamp", inplace=True)
-    df.sort_index(inplace=True)
+    print("Building histories up to", MAX_HISTORY_DAYS, "days back.")
+    print("Recent window cutoff:", cutoff_recent.isoformat())
 
-    cutoff_recent = datetime.now(timezone.utc) - timedelta(hours=RECENT_WINDOW_HOURS)
-    print("Recent/older split cutoff:", cutoff_recent.isoformat())
+    # item_id -> list[(ts_unix, mid_price)] for the recent (5m) region
+    recent_points = defaultdict(list)
 
-    n_items = df["item_id"].nunique()
-    print(f"Building histories for {n_items} items.")
+    # item_id -> {bucket_start_ts_unix: mid_price} for the older (30m) region
+    older_buckets = defaultdict(dict)
+
+    keys = list_recent_5m_keys(s3, bucket)
+    print("Using", len(keys), "5m snapshots in total.")
+
+    for i, key in enumerate(keys, start=1):
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        snap = json.loads(obj["Body"].read())
+        five = snap.get("five_minute") or {}
+
+        ts_unix = int(five.get("timestamp") or 0)
+        if ts_unix <= 0:
+            continue
+        if ts_unix < cutoff_oldest_unix:
+            continue
+
+        data = five.get("data") or {}
+
+        if ts_unix >= cutoff_recent_unix:
+            # Recent window: keep every 5m value
+            for item_id_str, st in data.items():
+                ah = st.get("avgHighPrice")
+                al = st.get("avgLowPrice")
+                if ah is None or al is None:
+                    continue
+                mid = (ah + al) / 2.0
+                if mid is None or mid <= 0 or not math.isfinite(mid):
+                    continue
+                try:
+                    item_id = int(item_id_str)
+                except ValueError:
+                    continue
+                recent_points[item_id].append((ts_unix, float(mid)))
+        else:
+            # Older region: downsample into OLDER_INTERVAL_MIN-minute buckets
+            bucket_sec = (
+                ts_unix // (OLDER_INTERVAL_MIN * 60)
+            ) * (OLDER_INTERVAL_MIN * 60)
+            for item_id_str, st in data.items():
+                ah = st.get("avgHighPrice")
+                al = st.get("avgLowPrice")
+                if ah is None or al is None:
+                    continue
+                mid = (ah + al) / 2.0
+                if mid is None or mid <= 0 or not math.isfinite(mid):
+                    continue
+                try:
+                    item_id = int(item_id_str)
+                except ValueError:
+                    continue
+                # Overwrite within the same bucket: we keep the last 5m price
+                older_buckets[item_id][bucket_sec] = float(mid)
+
+        if i % 200 == 0:
+            print(f"... processed {i} snapshots")
+
+    return older_buckets, recent_points
+
+
+def write_histories(s3, bucket: str, older_buckets, recent_points):
+    """
+    Combine older_buckets & recent_points into full histories
+    and write history/{item_id}.json objects to R2.
+    """
+    now_unix = int(datetime.now(timezone.utc).timestamp())
+    min_allowed_unix = now_unix - MAX_HISTORY_DAYS * 24 * 3600
+
+    all_item_ids = set(older_buckets.keys()) | set(recent_points.keys())
+    print("Building histories for", len(all_item_ids), "items.")
 
     written = 0
 
-    for item_id, g in df.groupby("item_id"):
-        # g already indexed by timestamp thanks to set_index above
-        g = g.sort_index()
+    for item_id in sorted(all_item_ids):
+        pts = []
 
-        older = g[g.index < cutoff_recent]
-        recent = g[g.index >= cutoff_recent]
+        # Older (30m) buckets
+        older = older_buckets.get(item_id)
+        if older:
+            for ts, price in older.items():
+                if ts >= min_allowed_unix:
+                    pts.append((ts, price))
 
-        pieces = []
+        # Recent 5m points
+        recent = recent_points.get(item_id)
+        if recent:
+            for ts, price in recent:
+                if ts >= min_allowed_unix:
+                    pts.append((ts, price))
 
-        if not older.empty:
-            # Downsample older region to 30m buckets (last mid_price in each bucket)
-            series = older["mid_price"]
-            older_30m = (
-                series.resample(f"{OLDER_INTERVAL_MIN}min")  # <-- 'min', not 'T'
-                .last()
-                .dropna()
-            )
-            if not older_30m.empty:
-                older_df = older_30m.reset_index()
-                older_df.rename(columns={"mid_price": "price"}, inplace=True)
-                pieces.append(older_df)
-
-        if not recent.empty:
-            # Keep 5m resolution in recent region
-            recent_df = recent.reset_index()[["timestamp", "mid_price"]]
-            recent_df.rename(columns={"mid_price": "price"}, inplace=True)
-            pieces.append(recent_df)
-
-        # Avoid concatenating empties → removes the FutureWarning
-        if not pieces:
+        if not pts:
             continue
 
-        combined = pd.concat(pieces, ignore_index=True)
-        combined.sort_values("timestamp", inplace=True)
-        combined.drop_duplicates(subset="timestamp", keep="last", inplace=True)
+        # Sort and de-duplicate by timestamp (keep the last price per ts)
+        pts.sort(key=lambda t: t[0])
+        dedup = []
+        last_ts = None
+        for ts, price in pts:
+            if last_ts is not None and ts == last_ts:
+                dedup[-1] = (ts, price)
+            else:
+                dedup.append((ts, price))
+                last_ts = ts
 
-        # Convert to JSON-serialisable list
         history_entries = []
-        for ts, price in zip(combined["timestamp"], combined["price"]):
-            if pd.isna(price) or not np.isfinite(price):
-                continue
-            ts_iso = ts.isoformat().replace("+00:00", "Z")
+        for ts, price in dedup:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            iso = dt.isoformat().replace("+00:00", "Z")
             history_entries.append(
                 {
-                    "timestamp_iso": ts_iso,
+                    "timestamp_iso": iso,
                     "price": float(price),
                 }
             )
@@ -122,8 +175,8 @@ def build_histories(df: pd.DataFrame, bucket: str, s3) -> None:
             "item_id": int(item_id),
             "history": history_entries,
         }
-        key = f"history/{int(item_id)}.json"
         body = json.dumps(out).encode("utf-8")
+        key = f"history/{int(item_id)}.json"
 
         s3.put_object(
             Bucket=bucket,
@@ -131,7 +184,6 @@ def build_histories(df: pd.DataFrame, bucket: str, s3) -> None:
             Body=body,
             ContentType="application/json",
         )
-
         written += 1
         if written % 200 == 0:
             print(f"... wrote history for {written} items so far")
@@ -143,26 +195,8 @@ def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
-    # 1) Collect relevant 5m snapshot keys
-    keys = find_recent_5m_keys(s3, bucket)
-    if not keys:
-        print(f"No 5m snapshots found in last {MAX_HISTORY_DAYS} days.")
-        return
-
-    print(f"Using {len(keys)} 5m snapshots over last {MAX_HISTORY_DAYS} days.")
-
-    # 2) Flatten into a DataFrame and compute mid_price
-    df = flatten_5m_snapshots(s3, bucket, keys)
-    if df.empty:
-        print("Flattened DataFrame is empty.")
-        return
-
-    df = add_basic_features(df)
-    df = df.dropna(subset=["mid_price"])
-    df = df[df["mid_price"] > 0].copy()
-
-    # 3) Build and upload per-item histories
-    build_histories(df, bucket, s3)
+    older_buckets, recent_points = build_streaming_histories(s3, bucket)
+    write_histories(s3, bucket, older_buckets, recent_points)
 
 
 if __name__ == "__main__":
