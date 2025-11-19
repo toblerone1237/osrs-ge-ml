@@ -5,8 +5,8 @@ on:
   workflow_dispatch:
 
   # Optional: run automatically once per day at 03:00 UTC
-  schedule:
-    - cron: "0 3 * * *"
+  #schedule:
+    #- cron: "0 3 * * *"
 
 jobs:
   analyse-sigma:
