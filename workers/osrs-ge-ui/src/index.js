@@ -481,7 +481,7 @@ async function loadSignalsWithCache(env) {
   if (LAST_SIGNALS_JSON && now - LAST_SIGNALS_FETCHED_AT < SIGNALS_CACHE_TTL_MS) {
     return { json: LAST_SIGNALS_JSON, source: "cache" };
   }
-  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/remove-noisy-sections/latest.json");
   if (obj) {
     try {
       const text = await obj.text();
@@ -491,7 +491,7 @@ async function loadSignalsWithCache(env) {
         LAST_SIGNALS_FETCHED_AT = Date.now();
         return { json: parsed, source: "fresh" };
       }
-    } catch (err) { console.error("Error parsing signals/latest.json:", err); }
+    } catch (err) { console.error("Error parsing signals/remove-noisy-sections/latest.json:", err); }
   }
   return { json: LAST_SIGNALS_JSON, source: LAST_SIGNALS_JSON ? "stale" : "missing" };
 }
