@@ -1,4 +1,4 @@
-name = "osrs-ge-5m"
+name = "osrs-ge-5m-remove-noisy-sections"
 main = "src/index.js"
 account_id = "8ae63fcb1e098108b894021e5f72aea8"
 compatibility_date = "2025-01-01"
