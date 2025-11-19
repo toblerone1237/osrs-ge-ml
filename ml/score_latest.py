@@ -19,16 +19,22 @@ from features import (
 # Paths / config
 # ---------------------------------------------------------------------------
 
-HORIZON_MINUTES = 60  # main decision horizon (must be in HORIZONS_MINUTES)
-WINDOW_MINUTES = 60   # how far back to pull snapshots for scoring
-TAX_RATE = 0.02       # same as in training
-MARGIN = 0.002        # same as in training
+HORIZON_MINUTES = 60   # main decision horizon (must be in HORIZONS_MINUTES)
+WINDOW_MINUTES = 60    # how far back to pull snapshots for scoring
+TAX_RATE = 0.02        # same as in training
+MARGIN = 0.002         # same as in training
 
 # Minimum volume over the scoring window for an item to be considered "active"
 MIN_VOLUME_WINDOW = 1
 
-# sanity only now; we don't use this as a cutoff in the main pipeline anymore
-MIN_MID_PRICE = 0
+# Clamp predictions before converting to EV/Win%
+FUTURE_RETURN_HAT_CLIP_LOWER = -0.5   # -50%
+FUTURE_RETURN_HAT_CLIP_UPPER = +0.5   # +50%
+
+# Heuristic "noisy regime" flags
+NOISY_PRICE_MAX_GP = 10_000           # cheap items tend to be regime-shifted
+NOISY_NET_RETURN_MIN = 0.20           # 20% predicted net return is suspicious here
+NOISY_PROB_MIN = 0.80                 # 80%+ Win% on cheap items often unreliable
 
 
 def get_latest_5m_key(s3, bucket):
@@ -40,7 +46,6 @@ def get_latest_5m_key(s3, bucket):
     keys = list_keys_with_prefix(s3, bucket, prefix)
     if not keys:
         return None
-
     keys.sort()
     return keys[-1]
 
@@ -90,16 +95,14 @@ def build_scoring_dataframe(s3, bucket):
         if ts >= window_start_ts:
             recent_keys.append(key)
 
-    print(
-        f"Using {len(recent_keys)} snapshots from the last {WINDOW_MINUTES} minutes."
-    )
+    print(f"Using {len(recent_keys)} snapshots from the last {WINDOW_MINUTES} minutes.")
 
     df = flatten_5m_snapshots(s3, bucket, recent_keys)
     if df.empty:
         raise RuntimeError("No rows in scoring DataFrame after flatten.")
 
     df = add_model_features(df)
-    df = df[df["mid_price"] > 0].copy()  # only sanity, no hard cutoff
+    df = df[df["mid_price"] > 0].copy()  # sanity only
     return df, latest_ts
 
 
@@ -129,7 +132,6 @@ def filter_active_items(df_agg):
     """
     df = df_agg.copy()
     df = df[df["volume_window"] >= MIN_VOLUME_WINDOW].copy()
-    # no mid-price cutoff anymore
     return df
 
 
@@ -139,7 +141,6 @@ def normal_cdf_array(z: np.ndarray) -> np.ndarray:
     """
     def _cdf_scalar(x):
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
-
     vec = np.vectorize(_cdf_scalar, otypes=[float])
     return vec(z)
 
@@ -165,10 +166,7 @@ def main():
 
     # Merge aggregated stats back into the per-snapshot data
     df = df_raw.merge(df_active[["item_id"]], on="item_id", how="inner")
-
-    print(
-        f"Scoring {df['item_id'].nunique()} items with recent activity."
-    )
+    print(f"Scoring {df['item_id'].nunique()} items with recent activity.")
 
     X_all = df[feature_cols].values
 
@@ -186,19 +184,23 @@ def main():
     if horizon_minutes not in reg_models:
         raise RuntimeError(f"Missing regressor for main horizon {horizon_minutes}m.")
     reg_main = reg_models[horizon_minutes]
-    main_ret = reg_main.predict(X_all)
+    main_ret_raw = reg_main.predict(X_all)
 
-    df["future_return_hat"] = main_ret
+    # Clamp before converting to anything downstream
+    df["future_return_hat_raw"] = main_ret_raw
+    df["future_return_hat"] = np.clip(
+        main_ret_raw, FUTURE_RETURN_HAT_CLIP_LOWER, FUTURE_RETURN_HAT_CLIP_UPPER
+    )
+
+    # Profit/EV
     df["net_return_hat"] = (1.0 + df["future_return_hat"]) * (1.0 - tax_rate) - 1.0
-
     df["buy_price"] = df["mid_price"]
     df["sell_price_hat"] = df["buy_price"] * (1.0 + df["net_return_hat"])
     df["expected_profit"] = df["sell_price_hat"] - df["buy_price"]
-
     hold_seconds = horizon_minutes * 60.0
     df["expected_profit_per_second"] = df["expected_profit"] / hold_seconds
 
-    # Probability-of-profit from Normal approximation
+    # Win % via Normal CDF against gross threshold
     gross_threshold = (1.0 + margin) / (1.0 - tax_rate) - 1.0
     z = (df["future_return_hat"].values - gross_threshold) / max(sigma_main, 1e-8)
     prob_profit = normal_cdf_array(z)
@@ -209,29 +211,46 @@ def main():
     last_per_item = df.groupby("item_id").tail(1).copy()
     last_per_item = last_per_item.merge(df_agg, on="item_id", how="left")
 
-    # Build path predictions for each item
+    # Mark "noisy regimes" so downstream (UI, etc.) can exclude or flag them
+    reasons = []
+    is_cheap = (last_per_item["mid_price"] <= NOISY_PRICE_MAX_GP)
+    big_net = (last_per_item["net_return_hat"].abs() >= NOISY_NET_RETURN_MIN)
+    high_prob = (last_per_item["prob_profit"] >= NOISY_PROB_MIN)
+    noisy_mask = is_cheap & (big_net | high_prob)
+    last_per_item["noisy"] = noisy_mask
+
+    reason_text = []
+    for _, r in last_per_item.iterrows():
+        r_reasons = []
+        if r["mid_price"] <= NOISY_PRICE_MAX_GP:
+            r_reasons.append(f"mid_price <= {NOISY_PRICE_MAX_GP:,} gp")
+        if abs(r["net_return_hat"]) >= NOISY_NET_RETURN_MIN:
+            r_reasons.append(f"large predicted net return ({r['net_return_hat']:.0%})")
+        if r["prob_profit"] >= NOISY_PROB_MIN:
+            r_reasons.append(f"very high Win% estimate ({r['prob_profit']:.0%})")
+        reason_text.append("; ".join(r_reasons) if r_reasons else "")
+    last_per_item["noise_reason"] = reason_text
+
+    # Build path predictions for each item (at the last snapshot index)
     path_rows = []
-    for idx, r in last_per_item.iterrows():
+    for _, r in last_per_item.iterrows():
         item_id = r["item_id"]
-        row_path = []
-        # Find the index of this row in original df for path lookups
-        # (we know it's the last row for this item)
-        # Use boolean mask once for simplicity:
         mask = (df["item_id"] == item_id)
         row_idx = df.index[mask][-1]
+        row_path = []
         for h in sorted(path_horizons):
             preds_h = path_results.get(h)
             if preds_h is None:
                 continue
             ret_hat = preds_h[row_idx]
-            row_path.append({"minutes": int(h), "future_return_hat": float(ret_hat)})
+            # Clamp for path as well, to be consistent
+            ret_hat = float(np.clip(ret_hat, FUTURE_RETURN_HAT_CLIP_LOWER, FUTURE_RETURN_HAT_CLIP_UPPER))
+            row_path.append({"minutes": int(h), "future_return_hat": ret_hat})
         path_rows.append(row_path)
-
     last_per_item["path"] = path_rows
 
-    # Load mapping from daily snapshots
+    # Load mapping from daily snapshots for item names
     mapping = load_latest_item_mapping(s3, bucket)
-
     last_per_item["item_id_str"] = last_per_item["item_id"].astype(str)
     mapping["id_str"] = mapping["id"].astype(str)
     last_per_item = last_per_item.merge(
@@ -242,13 +261,16 @@ def main():
     )
     last_per_item.drop(columns=["item_id_str", "id_str"], inplace=True)
 
-    # Composite score: emphasise higher Win % but still care about EV and liquidity
+    # Composite score: EV × liquidity × mild prob shaping
     liq = np.log1p(last_per_item["volume_window"].fillna(0)).clip(lower=1e-3)
     prob = last_per_item["prob_profit"].clip(0.0, 1.0)
     prof = last_per_item["expected_profit"].clip(lower=0.0)
+    ev_profit = prob * prof
+    prob_boost = 0.5 + 0.5 * prob  # modestly rewards higher probabilities, saturates at 1.0
+    last_per_item["score"] = ev_profit * liq * prob_boost
 
-    last_per_item["score"] = (prob ** 2) * prof * liq
-    last_per_item.sort_values("score", ascending=False, inplace=True)
+    # Hard-penalise noisy
+    last_per_item.loc[last_per_item["noisy"], "score"] = 0.0
 
     # Persist signals to R2
     now = datetime.now(timezone.utc)
@@ -270,6 +292,9 @@ def main():
                 "window_return": float(r.get("window_return") or 0.0),
                 "hold_minutes": int(horizon_minutes),
                 "path": r["path"],
+                "score": float(r["score"]),
+                "noisy": bool(r["noisy"]),
+                "noise_reason": r["noise_reason"],
             }
         )
 
@@ -280,11 +305,12 @@ def main():
         "tax_rate": float(tax_rate),
         "margin": float(margin),
         "sigma_main": float(sigma_main),
+        # FYI for UI/debug
+        "future_return_hat_clip": [FUTURE_RETURN_HAT_CLIP_LOWER, FUTURE_RETURN_HAT_CLIP_UPPER],
         "signals": signals,
     }
 
     import json
-
     buf = json.dumps(out).encode("utf-8")
 
     key_signals = f"signals/{date_part}.json"
@@ -292,11 +318,6 @@ def main():
     s3.put_object(Bucket=bucket, Key=key_signals, Body=buf)
     s3.put_object(Bucket=bucket, Key=key_latest, Body=buf)
 
-    print(
-        "Using daily snapshot for mapping:",
-        mapping.attrs.get("source_key", "unknown"),
-    )
-    print(f"Loaded {len(mapping)} item names from mapping.")
     print(
         f"Wrote {len(signals)} signals (items with snapshots in the last {WINDOW_MINUTES} minutes)."
     )
@@ -342,12 +363,12 @@ def extract_item_mapping_from_daily(snap: dict) -> pd.DataFrame:
             if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
                 return pd.DataFrame(obj)
             for el in obj:
-                res = dfs(el)
+                res = dfs(el);  # noqa
                 if res is not None:
                     return res
         elif isinstance(obj, dict):
             for v in obj.values():
-                res = dfs(v)
+                res = dfs(v)  # noqa
                 if res is not None:
                     return res
         return None
@@ -355,7 +376,6 @@ def extract_item_mapping_from_daily(snap: dict) -> pd.DataFrame:
     res = dfs(snap)
     if res is not None and "id" in res.columns and "name" in res.columns:
         return res[["id", "name"]]
-
     return pd.DataFrame(columns=["id", "name"])
 
 
