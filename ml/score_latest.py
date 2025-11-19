@@ -27,8 +27,8 @@ MARGIN = 0.002        # same as in training
 # Minimum volume over the scoring window for an item to be considered "active"
 MIN_VOLUME_WINDOW = 1
 
-# Minimum mid price to consider (exclude literal junk)
-MIN_MID_PRICE = 100
+# sanity only now; we don't use this as a cutoff in the main pipeline anymore
+MIN_MID_PRICE = 0
 
 
 def get_latest_5m_key(s3, bucket):
@@ -36,13 +36,11 @@ def get_latest_5m_key(s3, bucket):
     Return the key of the most recent 5m snapshot in the bucket, or None.
     """
     now = datetime.now(timezone.utc)
-    # For scoring we only care about "today" – the most recent snapshot
     prefix = f"5m/{now.year}/{now.month:02d}/{now.day:02d}/"
     keys = list_keys_with_prefix(s3, bucket, prefix)
     if not keys:
         return None
 
-    # keys are already dated and will sort lexicographically by time
     keys.sort()
     return keys[-1]
 
@@ -76,7 +74,7 @@ def build_scoring_dataframe(s3, bucket):
     all_keys = list_keys_with_prefix(s3, bucket, day_prefix)
     all_keys.sort()
 
-    # Keep only those within WINDOW_MINUTES of the latest snapshot
+    # Determine the latest timestamp
     obj_latest = s3.get_object(Bucket=bucket, Key=latest_key)
     import json as _json
     snap_latest = _json.loads(obj_latest["Body"].read())
@@ -101,7 +99,7 @@ def build_scoring_dataframe(s3, bucket):
         raise RuntimeError("No rows in scoring DataFrame after flatten.")
 
     df = add_model_features(df)
-    df = df[df["mid_price"] >= MIN_MID_PRICE].copy()
+    df = df[df["mid_price"] > 0].copy()  # only sanity, no hard cutoff
     return df, latest_ts
 
 
@@ -110,11 +108,8 @@ def compute_window_aggregates(df, window_start_ts):
     Compute aggregated statistics over the scoring window per item.
     """
     df = df.copy()
-
-    # Only keep rows inside the window
     df = df[df["timestamp_unix"] >= window_start_ts]
 
-    # Aggregate volume and price changes
     grouped = df.groupby("item_id").agg(
         {
             "total_volume_5m": "sum",
@@ -124,24 +119,23 @@ def compute_window_aggregates(df, window_start_ts):
     grouped.columns = ["volume_window", "price_start", "price_end"]
     grouped.reset_index(inplace=True)
 
-    # Price change over the window
     grouped["window_return"] = grouped["price_end"] / grouped["price_start"] - 1.0
     return grouped
 
 
 def filter_active_items(df_agg):
     """
-    Filter items that meet minimum volume / price criteria.
+    Filter items that meet minimum volume criteria.
     """
     df = df_agg.copy()
     df = df[df["volume_window"] >= MIN_VOLUME_WINDOW].copy()
-    df = df[df["price_start"] >= MIN_MID_PRICE].copy()
+    # no mid-price cutoff anymore
     return df
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
     """
-    Vectorised Normal(0,1) CDF using math.erf for small arrays.
+    Vectorised Normal(0,1) CDF using math.erf.
     """
     def _cdf_scalar(x):
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
@@ -176,7 +170,6 @@ def main():
         f"Scoring {df['item_id'].nunique()} items with recent activity."
     )
 
-    # Feature matrix
     X_all = df[feature_cols].values
 
     # For each path horizon, compute predictions
@@ -189,7 +182,7 @@ def main():
         preds = reg.predict(X_all)
         path_results[H] = preds
 
-    # For the main horizon, compute expected return and profit
+    # Main horizon predictions
     if horizon_minutes not in reg_models:
         raise RuntimeError(f"Missing regressor for main horizon {horizon_minutes}m.")
     reg_main = reg_models[horizon_minutes]
@@ -198,62 +191,63 @@ def main():
     df["future_return_hat"] = main_ret
     df["net_return_hat"] = (1.0 + df["future_return_hat"]) * (1.0 - tax_rate) - 1.0
 
-    # "Buy" at current mid, "sell" at predicted net price after tax
     df["buy_price"] = df["mid_price"]
     df["sell_price_hat"] = df["buy_price"] * (1.0 + df["net_return_hat"])
     df["expected_profit"] = df["sell_price_hat"] - df["buy_price"]
 
-    # Profit per second
     hold_seconds = horizon_minutes * 60.0
     df["expected_profit_per_second"] = df["expected_profit"] / hold_seconds
 
-    # Probability of profit using regression-based Normal approximation
-    # Profit_ok is defined on net return > margin; translate that to gross return
+    # Probability-of-profit from Normal approximation
     gross_threshold = (1.0 + margin) / (1.0 - tax_rate) - 1.0
     z = (df["future_return_hat"].values - gross_threshold) / max(sigma_main, 1e-8)
     prob_profit = normal_cdf_array(z)
     df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
-    # Summarize per item: last snapshot as of latest_ts
+    # Summarise per item (last snapshot)
     df.sort_values(["item_id", "timestamp"], inplace=True)
     last_per_item = df.groupby("item_id").tail(1).copy()
-
-    # Attach aggregated window volume and window_return
     last_per_item = last_per_item.merge(df_agg, on="item_id", how="left")
 
-    # Build path predictions for the last snapshot of each item
+    # Build path predictions for each item
     path_rows = []
-    for item_id, row in last_per_item.iterrows():
-        idx = row.name
-        path = []
+    for idx, r in last_per_item.iterrows():
+        item_id = r["item_id"]
+        row_path = []
+        # Find the index of this row in original df for path lookups
+        # (we know it's the last row for this item)
+        # Use boolean mask once for simplicity:
+        mask = (df["item_id"] == item_id)
+        row_idx = df.index[mask][-1]
         for h in sorted(path_horizons):
             preds_h = path_results.get(h)
             if preds_h is None:
                 continue
-            ret_hat = preds_h[idx]
-            path.append({"minutes": int(h), "future_return_hat": float(ret_hat)})
-        path_rows.append(path)
+            ret_hat = preds_h[row_idx]
+            row_path.append({"minutes": int(h), "future_return_hat": float(ret_hat)})
+        path_rows.append(row_path)
 
     last_per_item["path"] = path_rows
 
-    # Load item mapping from daily snapshots
+    # Load mapping from daily snapshots
     mapping = load_latest_item_mapping(s3, bucket)
 
-    # Join mapping onto last_per_item
     last_per_item["item_id_str"] = last_per_item["item_id"].astype(str)
     mapping["id_str"] = mapping["id"].astype(str)
     last_per_item = last_per_item.merge(
-        mapping[["id_str", "name"]], left_on="item_id_str", right_on="id_str", how="left"
+        mapping[["id_str", "name"]],
+        left_on="item_id_str",
+        right_on="id_str",
+        how="left",
     )
     last_per_item.drop(columns=["item_id_str", "id_str"], inplace=True)
 
-    # Sort by a composite score that emphasises higher Win %
-    liq = np.log1p(last_per_item["volume_window"]).clip(lower=1e-3)
+    # Composite score: emphasise higher Win % but still care about EV and liquidity
+    liq = np.log1p(last_per_item["volume_window"].fillna(0)).clip(lower=1e-3)
     prob = last_per_item["prob_profit"].clip(0.0, 1.0)
     prof = last_per_item["expected_profit"].clip(lower=0.0)
 
     last_per_item["score"] = (prob ** 2) * prof * liq
-
     last_per_item.sort_values("score", ascending=False, inplace=True)
 
     # Persist signals to R2
@@ -293,23 +287,28 @@ def main():
 
     buf = json.dumps(out).encode("utf-8")
 
-    # Write date-stamped + "latest" keys
     key_signals = f"signals/{date_part}.json"
     key_latest = "signals/latest.json"
     s3.put_object(Bucket=bucket, Key=key_signals, Body=buf)
     s3.put_object(Bucket=bucket, Key=key_latest, Body=buf)
 
-    print(f"Using daily snapshot for mapping: {mapping.attrs.get('source_key', 'unknown')}")
+    print(
+        "Using daily snapshot for mapping:",
+        mapping.attrs.get("source_key", "unknown"),
+    )
     print(f"Loaded {len(mapping)} item names from mapping.")
-    print(f"Wrote {len(signals)} signals (items with snapshots in the last {WINDOW_MINUTES} minutes).")
+    print(
+        f"Wrote {len(signals)} signals (items with snapshots in the last {WINDOW_MINUTES} minutes)."
+    )
 
 
 def load_latest_item_mapping(s3, bucket):
     """
-    Load the latest item mapping from daily snapshots.
+    Load the latest item mapping from daily snapshots (look back up to 7 days).
     """
-    # For now we'll just look back 7 days and take the latest mapping we find.
     now = datetime.now(timezone.utc)
+    import json
+
     for delta in range(7):
         d = (now - timedelta(days=delta)).date()
         prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
@@ -320,34 +319,24 @@ def load_latest_item_mapping(s3, bucket):
         keys.sort()
         latest_key = keys[-1]
         obj = s3.get_object(Bucket=bucket, Key=latest_key)
-        import json
-
         snap = json.loads(obj["Body"].read())
-        # Expect something like snap["items"] = [{id, name, ...}, ...]
-        # We'll be flexible in case you structured it differently.
         mapping = extract_item_mapping_from_daily(snap)
         mapping.attrs["source_key"] = latest_key
         return mapping
 
-    # Fallback: empty mapping
     return pd.DataFrame(columns=["id", "name"])
 
 
 def extract_item_mapping_from_daily(snap: dict) -> pd.DataFrame:
     """
     Extract an item mapping from a daily snapshot JSON.
-    We try a few reasonable schema variants.
     """
-    import pandas as pd
-
-    # 1) If there's a top-level "items" list
     items = snap.get("items")
     if isinstance(items, list) and items:
         df = pd.DataFrame(items)
         if "id" in df.columns and "name" in df.columns:
             return df[["id", "name"]]
 
-    # 2) Otherwise, try to find any nested list of dicts with id+name
     def dfs(obj):
         if isinstance(obj, list):
             if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
