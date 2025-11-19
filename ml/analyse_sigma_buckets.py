@@ -16,12 +16,12 @@ from features import (
     HORIZONS_MINUTES,
 )
 
-# These constants should match your training config
-HORIZON_MINUTES = 60      # main horizon
+# Match training config
+HORIZON_MINUTES = 60
 TAX_RATE = 0.02
 MARGIN = 0.002
 
-# How many days of history to analyse (you can change this)
+# How many days of history to analyse
 EVAL_DAYS = 14
 
 # Recency decay for sample weights (same as training)
@@ -46,7 +46,7 @@ def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
       - item_id
       - mid_price
       - model features
-      - future_return (60m actual return)
+      - future_return (60m actual return, UNCLIPPED on purpose)
       - sample_weight (recency-based)
     """
     now = datetime.now(timezone.utc)
@@ -83,24 +83,21 @@ def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
         raise RuntimeError(f"Expected column {col_60} from add_multi_horizon_returns().")
 
     df = df.dropna(subset=[col_60]).copy()
-    df["future_return"] = df[col_60]
+    df["future_return"] = df[col_60]  # UNCLIPPED (so we see the true tails)
 
     # Recency-based sample weights (same as training)
     latest_ts = df["timestamp"].max()
     age_days = (latest_ts - df["timestamp"]).dt.total_seconds() / (3600 * 24)
     df["sample_weight"] = np.exp(-age_days / DECAY_DAYS)
 
-    # Keep only rows with reasonable mid_price
+    # Keep only rows with positive mid_price
     df = df[df["mid_price"] > 0].copy()
 
-    print(f"[load] Eval dataframe rows after cleaning: {len(df)}")
+    print(f"[load] Eval dataframe rows after basic cleaning: {len(df)}")
     return df
 
 
-def load_latest_regressor(s3, bucket: str):
-    """
-    Load latest regression models + meta from R2.
-    """
+def load_latest_regressor(s3, bucket):
     key_reg = "models/xgb/latest_reg.pkl"
     key_meta = "models/xgb/latest_meta.json"
 
@@ -110,41 +107,30 @@ def load_latest_regressor(s3, bucket: str):
     reg_models = joblib.load(io.BytesIO(obj_reg["Body"].read()))
     meta = pd.read_json(io.BytesIO(obj_meta["Body"].read()), typ="series").to_dict()
 
-    # Sanity check main horizon
-    if HORIZON_MINUTES not in reg_models:
-        raise RuntimeError(f"No regressor for main horizon {HORIZON_MINUTES}m in latest_reg.pkl")
-
+    horizon_minutes = int(meta.get("horizon_minutes", HORIZON_MINUTES))
     sigma_main = float(meta.get("sigma_main", 0.02))
-    feature_cols = meta.get(
-        "feature_cols",
-        ["mid_price", "spread_pct", "log_volume_5m"],
-    )
+    feature_cols = meta.get("feature_cols", ["mid_price", "spread_pct", "log_volume_5m"])
 
-    return reg_models[HORIZON_MINUTES], sigma_main, feature_cols
+    if horizon_minutes not in reg_models:
+        raise RuntimeError(f"No regressor for horizon {horizon_minutes}m.")
+
+    reg_main = reg_models[horizon_minutes]
+    return reg_main, sigma_main, feature_cols
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
-    """
-    Vectorised Normal(0,1) CDF using math.erf.
-    """
     def _cdf_scalar(x):
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+    return np.vectorize(_cdf_scalar, otypes=[float])(z)
 
-    vec = np.vectorize(_cdf_scalar, otypes=[float])
-    return vec(z)
-
-
-# ---------------------------------------------------------------------------
-# Bucketing and residual analysis
-# ---------------------------------------------------------------------------
 
 def add_predictions_and_residuals(df: pd.DataFrame, reg_main, sigma_main: float, feature_cols):
     """
-    Given a dataframe with features and future_return, add:
+    Given a dataframe with features and UNCLIPPED future_return, add:
 
-      - future_return_hat
+      - future_return_hat (from the trained model)
       - net_return_hat (after tax)
-      - prob_profit (Win%)
+      - prob_profit (Win%) via Normal CDF using sigma_main
       - resid = future_return - future_return_hat
     """
     df = df.copy()
@@ -162,7 +148,6 @@ def add_predictions_and_residuals(df: pd.DataFrame, reg_main, sigma_main: float,
     df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
     df["resid"] = df["future_return"] - df["future_return_hat"]
-
     return df
 
 
@@ -188,47 +173,22 @@ def add_bins(df: pd.DataFrame) -> pd.DataFrame:
 
     time_edges = [0, 4, 8, 12, 16, 20, 24]
     time_labels = ["00-04", "04-08", "08-12", "12-16", "16-20", "20-24"]
-    df["time_bin"] = pd.cut(
-        hour_float,
-        bins=time_edges,
-        labels=time_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["time_bin"] = pd.cut(hour_float, bins=time_edges, labels=time_labels, right=False, include_lowest=True)
 
     # Price bins (in gp)
     price_edges = [0, 1e3, 1e4, 1e5, 1e6, np.inf]
     price_labels = ["<=1k", "1k-10k", "10k-100k", "100k-1m", ">1m"]
-    df["price_bin"] = pd.cut(
-        df["mid_price"],
-        bins=price_edges,
-        labels=price_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["price_bin"] = pd.cut(df["mid_price"], bins=price_edges, labels=price_labels, right=False, include_lowest=True)
 
     # Win% bins
     win_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     win_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
-    df["win_bin"] = pd.cut(
-        df["prob_profit"],
-        bins=win_edges,
-        labels=win_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["win_bin"] = pd.cut(df["prob_profit"], bins=win_edges, labels=win_labels, right=False, include_lowest=True)
 
-    # Predicted net return bins (profit/loss%)
-    # net_return_hat is in decimal form (e.g. 0.05 = +5%)
+    # Predicted net return bins (decimal, e.g. 0.05=+5%)
     ret_edges = [-1.0, -0.05, 0.0, 0.05, 0.2, np.inf]
     ret_labels = ["<-5%", "-5-0%", "0-5%", "5-20%", ">20%"]
-    df["pred_ret_bin"] = pd.cut(
-        df["net_return_hat"],
-        bins=ret_edges,
-        labels=ret_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["pred_ret_bin"] = pd.cut(df["net_return_hat"], bins=ret_edges, labels=ret_labels, right=False, include_lowest=True)
 
     return df
 
@@ -237,8 +197,6 @@ def compute_bucket_sigmas(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute residual sigma (unweighted and weighted) for each combination of:
       (time_bin, price_bin, win_bin, pred_ret_bin)
-
-    Returns a DataFrame with one row per non-empty bucket combo.
     """
     group_cols = ["time_bin", "price_bin", "win_bin", "pred_ret_bin"]
 
@@ -251,12 +209,8 @@ def compute_bucket_sigmas(df: pd.DataFrame) -> pd.DataFrame:
         resid = sub["resid"].values
         w = sub["sample_weight"].values
 
-        # Unweighted sigma
         sigma_unw = float(np.std(resid, ddof=0))
-
-        # Weighted sigma (using same weights as training)
-        w_sum = w.sum()
-        if w_sum > 0:
+        if w.sum() > 0:
             sigma_w = float(np.sqrt(np.average(resid**2, weights=w)))
         else:
             sigma_w = float("nan")
@@ -281,19 +235,11 @@ def compute_bucket_sigmas(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df_buckets = pd.DataFrame(rows)
-    df_buckets.sort_values(
-        ["sigma_unweighted", "n_rows"],
-        ascending=[False, False],
-        inplace=True,
-    )
+    df_buckets.sort_values(["sigma_unweighted", "n_rows"], ascending=[False, False], inplace=True)
     return df_buckets
 
 
 def print_marginal_summaries(df_buckets: pd.DataFrame):
-    """
-    Print marginal sigma summaries by each bin dimension separately
-    (this is what you'll paste back into ChatGPT).
-    """
     def summarize(col):
         print("\n=== MARGINAL by", col, "===")
         grp = df_buckets.groupby(col).agg(
@@ -308,44 +254,45 @@ def print_marginal_summaries(df_buckets: pd.DataFrame):
         summarize(col)
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
-def main():
+def summarize():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
-    # 1) Load eval data
     df = build_eval_dataframe(s3, bucket)
     if df.empty:
-        print("[main] No eval data, exiting.")
+        print("No data to evaluate.")
         return
 
-    # 2) Load regressor and meta
     reg_main, sigma_main, feature_cols = load_latest_regressor(s3, bucket)
-    print(f"[main] Loaded regressor for {HORIZON_MINUTES}m; global sigma_main = {sigma_main:.6f}")
-    print(f"[main] Using {len(feature_cols)} features:", feature_cols)
+    print(f"[meta] Loaded main regressor; sigma_main={sigma_main:.6f}")
 
-    # 3) Add predictions, residuals, Win%
     df = add_predictions_and_residuals(df, reg_main, sigma_main, feature_cols)
-
-    # 4) Add bin columns
     df = add_bins(df)
-
-    # 5) Compute bucket sigmas
     df_buckets = compute_bucket_sigmas(df)
-    if df_buckets.empty:
-        print("[main] No buckets with at least", MIN_ROWS_PER_BUCKET, "rows.")
-        return
 
-    # 6) Save full bucket table to CSV
-    out_csv = "sigma_buckets_full.csv"
-    df_buckets.to_csv(out_csv, index=False)
-    print(f"[main] Wrote detailed bucket table to {out_csv} (rows: {len(df_buckets)})")
+    print("\n=== TOP NOISY BUCKETS (by unweighted sigma) ===")
+    print(df_buckets.head(20).to_string())
 
-    # 7) Print marginal summaries (small enough to paste into chat)
     print_marginal_summaries(df_buckets)
+
+    # Save a full CSV so we can paste summaries externally if needed
+    out_csv = df_buckets.copy()
+    out_csv["sigma_unweighted"] = out_csv["sigma_unweighted"].round(3)
+    out_csv["sigma_weighted"] = out_csv["sigma_weighted"].round(3)
+    out_csv["mean_future_return"] = out_csv["mean_future_return"].round(3)
+    out_csv["mean_pred_return"] = out_csv["mean_pred_return"].round(3)
+    out_csv["mean_prob_profit"] = out_csv["mean_prob_profit"].round(3)
+    out_csv["mean_pred_net_return"] = out_csv["mean_pred_net_return"].round(3)
+
+    now = datetime.now(timezone.utc)
+    key = f"analysis/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+    buf = io.BytesIO(out_csv.to_csv(index=False).encode("utf-8"))
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    print(f"[save] Wrote bucket CSV to r2://{bucket}/{key}")
+
+
+def main():
+    summarize()
 
 
 if __name__ == "__main__":
