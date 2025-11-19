@@ -16,6 +16,8 @@ from features import (
     HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
 
+EXPERIMENT = "quantile"
+
 # ---------------------------------------------------------------------------
 # Training config
 # ---------------------------------------------------------------------------
@@ -337,13 +339,13 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
     buf_reg.seek(0)
 
     # Date-stamped key
-    key_reg = f"models/xgb/{date_part}/reg_multi.pkl"
+    key_reg = f"models/{EXPERIMENT}/{date_part}/reg_multi.pkl"
     s3.put_object(Bucket=bucket, Key=key_reg, Body=buf_reg.getvalue())
 
     # "Latest" pointer (what score_latest.py will load)
     s3.put_object(
         Bucket=bucket,
-        Key="models/xgb/latest_reg.pkl",
+        Key="models/{EXPERIMENT}/latest_reg.pkl",
         Body=buf_reg.getvalue(),
     )
 
@@ -377,11 +379,11 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
     }
 
     meta_bytes = json_bytes(meta)
-    key_meta = f"models/xgb/{date_part}/meta.json"
+    key_meta = f"models/{EXPERIMENT}/{date_part}/meta.json"
     s3.put_object(Bucket=bucket, Key=key_meta, Body=meta_bytes)
     s3.put_object(
         Bucket=bucket,
-        Key="models/xgb/latest_meta.json",
+        Key="models/{EXPERIMENT}/latest_meta.json",
         Body=meta_bytes,
     )
 
