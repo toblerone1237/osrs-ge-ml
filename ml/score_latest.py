@@ -54,8 +54,8 @@ def load_latest_models(s3, bucket):
     """
     Load the latest regressors and metadata from R2.
     """
-    key_reg = "models/xgb/latest_reg.pkl"
-    key_meta = "models/xgb/latest_meta.json"
+    key_reg = "models/remove-noisy-sections/xgb/latest_reg.pkl"
+    key_meta = "models/remove-noisy-sections/xgb/latest_meta.json"
 
     obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
     obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
