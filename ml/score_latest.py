@@ -30,6 +30,43 @@ MIN_VOLUME_WINDOW = 1
 # sanity only now; we don't use this as a cutoff in the main pipeline anymore
 MIN_MID_PRICE = 0
 
+# Default regimes (used if meta doesn't define any)
+REGIME_DEFS_DEFAULT = {
+    "low":  {"mid_price_min": 0,       "mid_price_max": 10_000},
+    "mid":  {"mid_price_min": 10_000,  "mid_price_max": 100_000},
+    "high": {"mid_price_min": 100_000, "mid_price_max": None},
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def assign_regime_for_price(mid_price: float, regime_defs) -> str:
+    """
+    Assign a regime name given a mid_price and a regime_defs dict.
+    Falls back to 'mid' if mid_price is missing or doesn't match.
+    """
+    try:
+        p = float(mid_price)
+    except (TypeError, ValueError):
+        return "mid"
+
+    if not np.isfinite(p) or p <= 0:
+        return "mid"
+
+    for name, bounds in regime_defs.items():
+        lo = bounds.get("mid_price_min", 0.0)
+        hi = bounds.get("mid_price_max", None)
+        if hi is None:
+            if p >= lo:
+                return name
+        else:
+            if lo <= p < hi:
+                return name
+
+    return "mid"
+
 
 def get_latest_5m_key(s3, bucket):
     """
@@ -77,9 +114,10 @@ def build_scoring_dataframe(s3, bucket):
     # Determine the latest timestamp
     obj_latest = s3.get_object(Bucket=bucket, Key=latest_key)
     import json as _json
-    snap_latest = _json.loads(obj_latest["Body"].read())
-    latest_ts = snap_latest["five_minute"]["timestamp"]
+    latest_json = _json.loads(obj_latest["Body"].read())
+    latest_ts = latest_json["five_minute"]["timestamp"]
 
+    # Filter keys to within WINDOW_MINUTES of latest_ts
     window_start_ts = latest_ts - WINDOW_MINUTES * 60
 
     recent_keys = []
@@ -144,53 +182,166 @@ def normal_cdf_array(z: np.ndarray) -> np.ndarray:
     return vec(z)
 
 
+def load_latest_item_mapping(s3, bucket):
+    """
+    Load the latest daily snapshot and derive item id->name mapping.
+    Reuses the logic from osrs-ge-daily (extract_item_mapping_from_daily).
+    """
+    # We'll scan back up to 7 days for a daily snapshot
+    now = datetime.now(timezone.utc)
+    for delta in range(7):
+        d = now - timedelta(days=delta)
+        prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
+        keys = list_keys_with_prefix(s3, bucket, prefix)
+        if not keys:
+            continue
+        keys.sort()
+        latest_key = keys[-1]
+        obj = s3.get_object(Bucket=bucket, Key=latest_key)
+        buf = io.BytesIO(obj["Body"].read())
+        try:
+            df_daily = pd.read_parquet(buf)
+        except Exception:
+            # Fallback: maybe it's JSON
+            import json
+            df_daily = pd.json_normalize(json.loads(buf.getvalue()))
+        df_daily.attrs["source_key"] = latest_key
+        return extract_item_mapping_from_daily(df_daily)
+
+    # If nothing found, return empty mapping
+    return pd.DataFrame(columns=["id", "name"])
+
+
+def extract_item_mapping_from_daily(df_daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a daily snapshot dataframe, extract item id/name mapping.
+    We try a few common shapes.
+    """
+    # If the daily snapshot already has "id" and "name" columns, use them
+    if {"id", "name"}.issubset(df_daily.columns):
+        return df_daily[["id", "name"]].drop_duplicates().reset_index(drop=True)
+
+    # Otherwise, try to find nested mapping
+    # (this mirrors the logic in osrs-ge-daily worker)
+    mapping_rows = []
+
+    def dfs(obj):
+        if isinstance(obj, dict):
+            if "id" in obj and "name" in obj:
+                mapping_rows.append({"id": obj["id"], "name": obj["name"]})
+            for v in obj.values():
+                dfs(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                dfs(v)
+
+    for _, row in df_daily.iterrows():
+        dfs(row.to_dict())
+
+    if not mapping_rows:
+        return pd.DataFrame(columns=["id", "name"])
+
+    mapping = pd.DataFrame(mapping_rows).drop_duplicates()
+    return mapping.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Main scoring
+# ---------------------------------------------------------------------------
+
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
 
-    reg_models, meta = load_latest_models(s3, bucket)
+    reg_models_raw, meta = load_latest_models(s3, bucket)
 
+    # Meta / config
     horizon_minutes = int(meta.get("horizon_minutes", HORIZON_MINUTES))
     path_horizons = meta.get("path_horizons_minutes", HORIZONS_MINUTES)
     feature_cols = meta.get("feature_cols", ["mid_price", "spread_pct", "log_volume_5m"])
     tax_rate = float(meta.get("tax_rate", TAX_RATE))
     margin = float(meta.get("margin", MARGIN))
-    sigma_main = float(meta.get("sigma_main", 0.02))
+    sigma_main_global = float(meta.get("sigma_main", 0.02))
+
+    sigma_main_per_regime_meta = meta.get("sigma_main_per_regime")
+    regime_defs_meta = meta.get("regime_defs")
+
+    # Normalise model structure to: regime -> horizon -> regressor
+    if not reg_models_raw:
+        raise RuntimeError("reg_models is empty; nothing to score with.")
+
+    first_key = next(iter(reg_models_raw.keys()))
+    if isinstance(first_key, int):
+        # Old format: single global dict[horizon] -> regressor
+        reg_models = {"global": reg_models_raw}
+        regime_defs = regime_defs_meta or {"global": {"mid_price_min": 0, "mid_price_max": None}}
+        if isinstance(sigma_main_per_regime_meta, dict) and sigma_main_per_regime_meta:
+            sigma_main_per_regime = {k: float(v) for k, v in sigma_main_per_regime_meta.items()}
+        else:
+            sigma_main_per_regime = {"global": sigma_main_global}
+    else:
+        # New format: regime_name -> {horizon: regressor}
+        reg_models = reg_models_raw
+        regime_defs = regime_defs_meta or REGIME_DEFS_DEFAULT
+        if isinstance(sigma_main_per_regime_meta, dict) and sigma_main_per_regime_meta:
+            sigma_main_per_regime = {k: float(v) for k, v in sigma_main_per_regime_meta.items()}
+        else:
+            # Fallback: assign global sigma to each regime
+            sigma_main_per_regime = {
+                regime_name: sigma_main_global for regime_name in reg_models.keys()
+            }
 
     df_raw, latest_ts = build_scoring_dataframe(s3, bucket)
     window_start_ts = latest_ts - WINDOW_MINUTES * 60
 
+    # Aggregate activity over the scoring window
     df_agg = compute_window_aggregates(df_raw, window_start_ts)
     df_active = filter_active_items(df_agg)
+    if df_active.empty:
+        print("No active items found in scoring window.")
+        return
 
-    # Merge aggregated stats back into the per-snapshot data
     df = df_raw.merge(df_active[["item_id"]], on="item_id", how="inner")
 
-    print(
-        f"Scoring {df['item_id'].nunique()} items with recent activity."
+    # Assign regimes based on current mid_price
+    df["regime"] = df["mid_price"].apply(
+        lambda p: assign_regime_for_price(p, regime_defs)
     )
 
-    X_all = df[feature_cols].values
+    print(
+        f"Scoring {df['item_id'].nunique()} items with recent activity "
+        f"across regimes: {df['regime'].value_counts().to_dict()}"
+    )
 
-    # For each path horizon, compute predictions
+    # Ensure stable index for array-based operations
+    df = df.reset_index(drop=True)
+
+    X_all = df[feature_cols].values
+    n_rows = len(df)
+
+    # For each path horizon, compute predictions regime-wise
     path_results = {}
     for H in path_horizons:
-        reg = reg_models.get(H)
-        if reg is None:
-            continue
-        print(f"[score] Predicting horizon {H}m for {len(df)} rows.")
-        preds = reg.predict(X_all)
-        path_results[H] = preds
+        preds_all = np.full(n_rows, np.nan, dtype="float64")
+        for regime_name, models_for_regime in reg_models.items():
+            reg_h = models_for_regime.get(H)
+            if reg_h is None:
+                continue
+            mask = df["regime"] == regime_name
+            if not mask.any():
+                continue
+            X_reg = df.loc[mask, feature_cols].values
+            preds_all[mask.values] = reg_h.predict(X_reg)
+        path_results[H] = preds_all
+        print(f"[score] Predicting horizon {H}m for {n_rows} rows (all regimes).")
 
     # Main horizon predictions
-    if horizon_minutes not in reg_models:
+    if horizon_minutes not in path_results:
         raise RuntimeError(f"Missing regressor for main horizon {horizon_minutes}m.")
-    reg_main = reg_models[horizon_minutes]
-    main_ret = reg_main.predict(X_all)
+    df["future_return_hat"] = path_results[horizon_minutes]
 
-    df["future_return_hat"] = main_ret
+    # Net return and expected profit
     df["net_return_hat"] = (1.0 + df["future_return_hat"]) * (1.0 - tax_rate) - 1.0
-
     df["buy_price"] = df["mid_price"]
     df["sell_price_hat"] = df["buy_price"] * (1.0 + df["net_return_hat"])
     df["expected_profit"] = df["sell_price_hat"] - df["buy_price"]
@@ -198,9 +349,18 @@ def main():
     hold_seconds = horizon_minutes * 60.0
     df["expected_profit_per_second"] = df["expected_profit"] / hold_seconds
 
-    # Probability-of-profit from Normal approximation
+    # Probability-of-profit from regime-specific Normal approximation
     gross_threshold = (1.0 + margin) / (1.0 - tax_rate) - 1.0
-    z = (df["future_return_hat"].values - gross_threshold) / max(sigma_main, 1e-8)
+
+    df["regime_sigma"] = df["regime"].map(sigma_main_per_regime).astype(float)
+    sigma_vec = df["regime_sigma"].values
+    # Fallback to global sigma if missing or non-positive
+    sigma_vec = np.where(
+        (np.isfinite(sigma_vec)) & (sigma_vec > 0.0),
+        sigma_vec,
+        sigma_main_global,
+    )
+    z = (df["future_return_hat"].values - gross_threshold) / np.maximum(sigma_vec, 1e-8)
     prob_profit = normal_cdf_array(z)
     df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
@@ -211,12 +371,10 @@ def main():
 
     # Build path predictions for each item
     path_rows = []
-    for idx, r in last_per_item.iterrows():
+    for _, r in last_per_item.iterrows():
         item_id = r["item_id"]
         row_path = []
-        # Find the index of this row in original df for path lookups
-        # (we know it's the last row for this item)
-        # Use boolean mask once for simplicity:
+        # Find the last index for this item in df
         mask = (df["item_id"] == item_id)
         row_idx = df.index[mask][-1]
         for h in sorted(path_horizons):
@@ -228,6 +386,33 @@ def main():
         path_rows.append(row_path)
 
     last_per_item["path"] = path_rows
+
+    # Compute a regime penalty based on sigma_main_per_regime
+    sigma_vals = np.array(list(sigma_main_per_regime.values()), dtype="float64")
+    sigma_vals = sigma_vals[np.isfinite(sigma_vals) & (sigma_vals > 0)]
+    if sigma_vals.size > 0:
+        if "mid" in sigma_main_per_regime:
+            base_sigma = sigma_main_per_regime["mid"]
+        else:
+            base_sigma = float(np.median(sigma_vals))
+        regime_penalty_map = {}
+        for regime_name, s_val in sigma_main_per_regime.items():
+            s = float(s_val) if s_val is not None else base_sigma
+            raw = base_sigma / max(s, 1e-8)
+            # Clip to a sane range to avoid crazy weights
+            regime_penalty_map[regime_name] = float(np.clip(raw, 0.2, 5.0))
+    else:
+        regime_penalty_map = {name: 1.0 for name in sigma_main_per_regime.keys()}
+
+    last_per_item["regime_penalty"] = last_per_item["regime"].map(regime_penalty_map).fillna(1.0)
+
+    # Composite score: emphasise higher Win %, profit, liquidity, and regime quality
+    liq = np.log1p(last_per_item["volume_window"].fillna(0)).clip(lower=1e-3)
+    prob = last_per_item["prob_profit"].clip(0.0, 1.0)
+    prof = last_per_item["expected_profit"].clip(lower=0.0)
+
+    last_per_item["score"] = (prob ** 2) * prof * liq * last_per_item["regime_penalty"]
+    last_per_item.sort_values("score", ascending=False, inplace=True)
 
     # Load mapping from daily snapshots
     mapping = load_latest_item_mapping(s3, bucket)
@@ -241,14 +426,6 @@ def main():
         how="left",
     )
     last_per_item.drop(columns=["item_id_str", "id_str"], inplace=True)
-
-    # Composite score: emphasise higher Win % but still care about EV and liquidity
-    liq = np.log1p(last_per_item["volume_window"].fillna(0)).clip(lower=1e-3)
-    prob = last_per_item["prob_profit"].clip(0.0, 1.0)
-    prof = last_per_item["expected_profit"].clip(lower=0.0)
-
-    last_per_item["score"] = (prob ** 2) * prof * liq
-    last_per_item.sort_values("score", ascending=False, inplace=True)
 
     # Persist signals to R2
     now = datetime.now(timezone.utc)
@@ -269,6 +446,9 @@ def main():
                 "volume_window": int(r.get("volume_window") or 0),
                 "window_return": float(r.get("window_return") or 0.0),
                 "hold_minutes": int(horizon_minutes),
+                "regime": str(r.get("regime") or ""),
+                "regime_sigma": float(r.get("regime_sigma") or sigma_main_global),
+                "regime_penalty": float(r.get("regime_penalty") or 1.0),
                 "path": r["path"],
             }
         )
@@ -279,7 +459,9 @@ def main():
         "path_horizons_minutes": list(path_horizons),
         "tax_rate": float(tax_rate),
         "margin": float(margin),
-        "sigma_main": float(sigma_main),
+        "sigma_main": float(sigma_main_global),
+        "sigma_main_per_regime": sigma_main_per_regime,
+        "regime_defs": regime_defs,
         "signals": signals,
     }
 
@@ -300,63 +482,6 @@ def main():
     print(
         f"Wrote {len(signals)} signals (items with snapshots in the last {WINDOW_MINUTES} minutes)."
     )
-
-
-def load_latest_item_mapping(s3, bucket):
-    """
-    Load the latest item mapping from daily snapshots (look back up to 7 days).
-    """
-    now = datetime.now(timezone.utc)
-    import json
-
-    for delta in range(7):
-        d = (now - timedelta(days=delta)).date()
-        prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
-        keys = list_keys_with_prefix(s3, bucket, prefix)
-        if not keys:
-            continue
-
-        keys.sort()
-        latest_key = keys[-1]
-        obj = s3.get_object(Bucket=bucket, Key=latest_key)
-        snap = json.loads(obj["Body"].read())
-        mapping = extract_item_mapping_from_daily(snap)
-        mapping.attrs["source_key"] = latest_key
-        return mapping
-
-    return pd.DataFrame(columns=["id", "name"])
-
-
-def extract_item_mapping_from_daily(snap: dict) -> pd.DataFrame:
-    """
-    Extract an item mapping from a daily snapshot JSON.
-    """
-    items = snap.get("items")
-    if isinstance(items, list) and items:
-        df = pd.DataFrame(items)
-        if "id" in df.columns and "name" in df.columns:
-            return df[["id", "name"]]
-
-    def dfs(obj):
-        if isinstance(obj, list):
-            if obj and isinstance(obj[0], dict) and "id" in obj[0] and "name" in obj[0]:
-                return pd.DataFrame(obj)
-            for el in obj:
-                res = dfs(el)
-                if res is not None:
-                    return res
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                res = dfs(v)
-                if res is not None:
-                    return res
-        return None
-
-    res = dfs(snap)
-    if res is not None and "id" in res.columns and "name" in res.columns:
-        return res[["id", "name"]]
-
-    return pd.DataFrame(columns=["id", "name"])
 
 
 if __name__ == "__main__":
