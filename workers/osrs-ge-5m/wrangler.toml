@@ -7,5 +7,5 @@ compatibility_date = "2025-01-01"
 binding = "OSRS_BUCKET"
 bucket_name = "osrs-ge-raw"
 
-[triggers]
-crons = ["*/5 * * * *"]   # every 5 minutes
+#[triggers]
+#crons = ["*/5 * * * *"]   # every 5 minutes
