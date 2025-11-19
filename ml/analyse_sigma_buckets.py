@@ -16,12 +16,15 @@ from features import (
     HORIZONS_MINUTES,
 )
 
-# These constants should match your training config
-HORIZON_MINUTES = 60      # main horizon
+# ---------------------------------------------------------------------------
+# Config (constants should match your training config)
+# ---------------------------------------------------------------------------
+
+HORIZON_MINUTES = 60
 TAX_RATE = 0.02
 MARGIN = 0.002
 
-# How many days of history to analyse (you can change this)
+# How many days of 5m snapshots to use for evaluation
 EVAL_DAYS = 14
 
 # Recency decay for sample weights (same as training)
@@ -30,10 +33,43 @@ DECAY_DAYS = 14
 # Minimum rows for a bucket combination to be included in the detailed output
 MIN_ROWS_PER_BUCKET = 100
 
+# Default regime definitions (used if meta has none)
+REGIME_DEFS_DEFAULT = {
+    "low":  {"mid_price_min": 0,       "mid_price_max": 10_000},
+    "mid":  {"mid_price_min": 10_000,  "mid_price_max": 100_000},
+    "high": {"mid_price_min": 100_000, "mid_price_max": None},
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers to load data and models
 # ---------------------------------------------------------------------------
+
+def assign_regime_for_price(mid_price: float, regime_defs) -> str:
+    """
+    Assign a regime name given a mid_price and a regime_defs dict.
+    Falls back to 'mid' if mid_price is missing or doesn't match.
+    """
+    try:
+        p = float(mid_price)
+    except (TypeError, ValueError):
+        return "mid"
+
+    if not np.isfinite(p) or p <= 0:
+        return "mid"
+
+    for name, bounds in regime_defs.items():
+        lo = bounds.get("mid_price_min", 0.0)
+        hi = bounds.get("mid_price_max", None)
+        if hi is None:
+            if p >= lo:
+                return name
+        else:
+            if lo <= p < hi:
+                return name
+
+    return "mid"
+
 
 def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
     """
@@ -51,16 +87,14 @@ def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
     """
     now = datetime.now(timezone.utc)
     start_date = (now - timedelta(days=EVAL_DAYS - 1)).date()
-    end_date = now.date()
-
-    print(f"[load] Building eval dataframe from {start_date} to {end_date}")
+    end_date = now.date()  # include today
 
     chunks = []
     d = start_date
     while d <= end_date:
         prefix = f"5m/{d.year}/{d.month:02d}/{d.day:02d}/"
         keys = list_keys_with_prefix(s3, bucket, prefix)
-        print(f"[load] {d}: {len(keys)} snapshot keys")
+        print("[load]", d, "keys:", len(keys))
         if keys:
             df_day = flatten_5m_snapshots(s3, bucket, keys)
             if not df_day.empty:
@@ -100,6 +134,12 @@ def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
 def load_latest_regressor(s3, bucket: str):
     """
     Load latest regression models + meta from R2.
+
+    Returns:
+      - reg_main_map: dict[regime_name] -> main-horizon regressor
+      - sigma_main_per_regime: dict[regime_name] -> float
+      - feature_cols: list of feature columns
+      - regime_defs: dict used for regime assignment
     """
     key_reg = "models/xgb/latest_reg.pkl"
     key_meta = "models/xgb/latest_meta.json"
@@ -107,20 +147,52 @@ def load_latest_regressor(s3, bucket: str):
     obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
     obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
 
-    reg_models = joblib.load(io.BytesIO(obj_reg["Body"].read()))
+    reg_models_raw = joblib.load(io.BytesIO(obj_reg["Body"].read()))
     meta = pd.read_json(io.BytesIO(obj_meta["Body"].read()), typ="series").to_dict()
 
-    # Sanity check main horizon
-    if HORIZON_MINUTES not in reg_models:
-        raise RuntimeError(f"No regressor for main horizon {HORIZON_MINUTES}m in latest_reg.pkl")
-
-    sigma_main = float(meta.get("sigma_main", 0.02))
+    sigma_main_global = float(meta.get("sigma_main", 0.02))
+    sigma_main_per_regime_meta = meta.get("sigma_main_per_regime")
+    regime_defs_meta = meta.get("regime_defs")
     feature_cols = meta.get(
         "feature_cols",
         ["mid_price", "spread_pct", "log_volume_5m"],
     )
 
-    return reg_models[HORIZON_MINUTES], sigma_main, feature_cols
+    if not reg_models_raw:
+        raise RuntimeError("reg_models is empty in latest_reg.pkl")
+
+    first_key = next(iter(reg_models_raw.keys()))
+    if isinstance(first_key, int):
+        # Old format: single global dict[horizon] -> regressor
+        if HORIZON_MINUTES not in reg_models_raw:
+            raise RuntimeError(
+                f"No regressor for main horizon {HORIZON_MINUTES}m in latest_reg.pkl"
+            )
+        reg_main_map = {"global": reg_models_raw[HORIZON_MINUTES]}
+        regime_defs = regime_defs_meta or {"global": {"mid_price_min": 0, "mid_price_max": None}}
+        if isinstance(sigma_main_per_regime_meta, dict) and sigma_main_per_regime_meta:
+            sigma_main_per_regime = {k: float(v) for k, v in sigma_main_per_regime_meta.items()}
+        else:
+            sigma_main_per_regime = {"global": sigma_main_global}
+    else:
+        # New format: regime_name -> {horizon: regressor}
+        reg_main_map = {}
+        for regime_name, models_for_regime in reg_models_raw.items():
+            if HORIZON_MINUTES in models_for_regime:
+                reg_main_map[regime_name] = models_for_regime[HORIZON_MINUTES]
+        if not reg_main_map:
+            raise RuntimeError(
+                f"No regressor for main horizon {HORIZON_MINUTES}m in any regime."
+            )
+        regime_defs = regime_defs_meta or REGIME_DEFS_DEFAULT
+        if isinstance(sigma_main_per_regime_meta, dict) and sigma_main_per_regime_meta:
+            sigma_main_per_regime = {k: float(v) for k, v in sigma_main_per_regime_meta.items()}
+        else:
+            sigma_main_per_regime = {
+                regime_name: sigma_main_global for regime_name in reg_main_map.keys()
+            }
+
+    return reg_main_map, sigma_main_per_regime, feature_cols, regime_defs
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
@@ -134,14 +206,17 @@ def normal_cdf_array(z: np.ndarray) -> np.ndarray:
     return vec(z)
 
 
-# ---------------------------------------------------------------------------
-# Bucketing and residual analysis
-# ---------------------------------------------------------------------------
-
-def add_predictions_and_residuals(df: pd.DataFrame, reg_main, sigma_main: float, feature_cols):
+def add_predictions_and_residuals(
+    df: pd.DataFrame,
+    reg_main_map,
+    sigma_main_per_regime: dict,
+    feature_cols,
+    regime_defs,
+) -> pd.DataFrame:
     """
     Given a dataframe with features and future_return, add:
 
+      - regime (based on mid_price)
       - future_return_hat
       - net_return_hat (after tax)
       - prob_profit (Win%)
@@ -149,15 +224,51 @@ def add_predictions_and_residuals(df: pd.DataFrame, reg_main, sigma_main: float,
     """
     df = df.copy()
 
-    X = df[feature_cols].values
-    future_return_hat = reg_main.predict(X)
+    # Assign regimes
+    df["regime"] = df["mid_price"].apply(
+        lambda p: assign_regime_for_price(p, regime_defs)
+    )
+
+    n_rows = len(df)
+    X_all = df[feature_cols].values
+
+    future_return_hat = np.full(n_rows, np.nan, dtype="float64")
+    regime_sigma = np.full(n_rows, np.nan, dtype="float64")
+
+    # Predict per regime
+    for regime_name, reg in reg_main_map.items():
+        mask = df["regime"] == regime_name
+        if not mask.any():
+            continue
+        X_reg = X_all[mask.values]
+        y_hat = reg.predict(X_reg)
+        future_return_hat[mask.values] = y_hat
+
+        sigma = sigma_main_per_regime.get(regime_name)
+        if sigma is None:
+            # fallback to global median
+            sigma_vals = np.array(list(sigma_main_per_regime.values()), dtype="float64")
+            sigma_vals = sigma_vals[np.isfinite(sigma_vals) & (sigma_vals > 0)]
+            if sigma_vals.size > 0:
+                sigma = float(np.median(sigma_vals))
+            else:
+                sigma = 0.02
+        regime_sigma[mask.values] = float(sigma)
 
     df["future_return_hat"] = future_return_hat
+    df["regime_sigma"] = regime_sigma
     df["net_return_hat"] = (1.0 + df["future_return_hat"]) * (1.0 - TAX_RATE) - 1.0
 
     # Profit_ok is defined on net_return > MARGIN; translate to gross threshold
     gross_threshold = (1.0 + MARGIN) / (1.0 - TAX_RATE) - 1.0
-    z = (df["future_return_hat"].values - gross_threshold) / max(sigma_main, 1e-8)
+
+    sigma_vec = df["regime_sigma"].values
+    sigma_vec = np.where(
+        (np.isfinite(sigma_vec)) & (sigma_vec > 0.0),
+        sigma_vec,
+        0.02,
+    )
+    z = (df["future_return_hat"].values - gross_threshold) / np.maximum(sigma_vec, 1e-8)
     prob_profit = normal_cdf_array(z)
     df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
@@ -165,6 +276,10 @@ def add_predictions_and_residuals(df: pd.DataFrame, reg_main, sigma_main: float,
 
     return df
 
+
+# ---------------------------------------------------------------------------
+# Bucketing / sigma computation
+# ---------------------------------------------------------------------------
 
 def add_bins(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -183,21 +298,21 @@ def add_bins(df: pd.DataFrame) -> pd.DataFrame:
         ts = ts.dt.tz_convert(timezone.utc)
     else:
         ts = ts.dt.tz_localize(timezone.utc)
+    hours = ts.dt.hour + ts.dt.minute / 60.0
 
-    hour_float = ts.dt.hour + ts.dt.minute / 60.0
-
+    # 4-hour ranges: [0-4), [4-8), ..., [20-24)
     time_edges = [0, 4, 8, 12, 16, 20, 24]
     time_labels = ["00-04", "04-08", "08-12", "12-16", "16-20", "20-24"]
     df["time_bin"] = pd.cut(
-        hour_float,
+        hours,
         bins=time_edges,
         labels=time_labels,
         right=False,
         include_lowest=True,
     )
 
-    # Price bins (in gp)
-    price_edges = [0, 1e3, 1e4, 1e5, 1e6, np.inf]
+    # Price ranges (in gp), matching your previous analysis
+    price_edges = [-np.inf, 1_000, 10_000, 100_000, 1_000_000, np.inf]
     price_labels = ["<=1k", "1k-10k", "10k-100k", "100k-1m", ">1m"]
     df["price_bin"] = pd.cut(
         df["mid_price"],
@@ -207,8 +322,8 @@ def add_bins(df: pd.DataFrame) -> pd.DataFrame:
         include_lowest=True,
     )
 
-    # Win% bins
-    win_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    # Predicted Win% bins
+    win_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0000001]
     win_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
     df["win_bin"] = pd.cut(
         df["prob_profit"],
@@ -236,11 +351,11 @@ def add_bins(df: pd.DataFrame) -> pd.DataFrame:
 def compute_bucket_sigmas(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute residual sigma (unweighted and weighted) for each combination of:
-      (time_bin, price_bin, win_bin, pred_ret_bin)
+      (regime, time_bin, price_bin, win_bin, pred_ret_bin)
 
     Returns a DataFrame with one row per non-empty bucket combo.
     """
-    group_cols = ["time_bin", "price_bin", "win_bin", "pred_ret_bin"]
+    group_cols = ["regime", "time_bin", "price_bin", "win_bin", "pred_ret_bin"]
 
     rows = []
     for key, sub in df.groupby(group_cols, dropna=True):
@@ -249,27 +364,30 @@ def compute_bucket_sigmas(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         resid = sub["resid"].values
-        w = sub["sample_weight"].values
+        if resid.size == 0:
+            continue
 
         # Unweighted sigma
-        sigma_unw = float(np.std(resid, ddof=0))
+        sigma_unweighted = float(np.std(resid, ddof=1)) if resid.size > 1 else 0.0
 
-        # Weighted sigma (using same weights as training)
-        w_sum = w.sum()
-        if w_sum > 0:
-            sigma_w = float(np.sqrt(np.average(resid**2, weights=w)))
-        else:
-            sigma_w = float("nan")
+        # Weighted sigma (based on sample_weight)
+        w = sub["sample_weight"].values
+        if not np.any(np.isfinite(w)):
+            w = np.ones_like(resid)
+        w = w / np.mean(w)
+        mse = np.average(resid ** 2, weights=w)
+        sigma_weighted = float(np.sqrt(mse))
 
         rows.append(
             {
-                "time_bin": str(key[0]),
-                "price_bin": str(key[1]),
-                "win_bin": str(key[2]),
-                "pred_ret_bin": str(key[3]),
+                "regime": key[0],
+                "time_bin": key[1],
+                "price_bin": key[2],
+                "win_bin": key[3],
+                "pred_ret_bin": key[4],
                 "n_rows": int(n),
-                "sigma_unweighted": sigma_unw,
-                "sigma_weighted": sigma_w,
+                "sigma_unweighted": sigma_unweighted,
+                "sigma_weighted": sigma_weighted,
                 "mean_future_return": float(sub["future_return"].mean()),
                 "mean_pred_return": float(sub["future_return_hat"].mean()),
                 "mean_prob_profit": float(sub["prob_profit"].mean()),
@@ -304,12 +422,63 @@ def print_marginal_summaries(df_buckets: pd.DataFrame):
         grp = grp.sort_index()
         print(grp.to_string())
 
-    for col in ["time_bin", "price_bin", "win_bin", "pred_ret_bin"]:
-        summarize(col)
+    for col in ["regime", "time_bin", "price_bin", "win_bin", "pred_ret_bin"]:
+        if col in df_buckets.columns:
+            summarize(col)
+
+
+def compute_regime_summaries(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute overall sigma per regime (unweighted and weighted) for the main horizon.
+    """
+    rows = []
+    for regime_name, sub in df.groupby("regime"):
+        n = len(sub)
+        resid = sub["resid"].values
+        if n < MIN_ROWS_PER_BUCKET or resid.size == 0:
+            continue
+
+        sigma_unweighted = float(np.std(resid, ddof=1)) if resid.size > 1 else 0.0
+
+        w = sub["sample_weight"].values
+        if not np.any(np.isfinite(w)):
+            w = np.ones_like(resid)
+        w = w / np.mean(w)
+        mse = np.average(resid ** 2, weights=w)
+        sigma_weighted = float(np.sqrt(mse))
+
+        rows.append(
+            {
+                "regime": regime_name,
+                "n_rows": int(n),
+                "sigma_unweighted": sigma_unweighted,
+                "sigma_weighted": sigma_weighted,
+                "mean_future_return": float(sub["future_return"].mean()),
+                "mean_pred_return": float(sub["future_return_hat"].mean()),
+                "mean_prob_profit": float(sub["prob_profit"].mean()),
+                "mean_pred_net_return": float(sub["net_return_hat"].mean()),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "regime",
+            "n_rows",
+            "sigma_unweighted",
+            "sigma_weighted",
+            "mean_future_return",
+            "mean_pred_return",
+            "mean_prob_profit",
+            "mean_pred_net_return",
+        ])
+
+    df_reg = pd.DataFrame(rows)
+    df_reg.sort_values("sigma_unweighted", ascending=False, inplace=True)
+    return df_reg
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
@@ -322,15 +491,16 @@ def main():
         print("[main] No eval data, exiting.")
         return
 
-    # 2) Load regressor and meta
-    reg_main, sigma_main, feature_cols = load_latest_regressor(s3, bucket)
-    print(f"[main] Loaded regressor for {HORIZON_MINUTES}m; global sigma_main = {sigma_main:.6f}")
+    # 2) Load regressors and meta
+    reg_main_map, sigma_main_per_regime, feature_cols, regime_defs = load_latest_regressor(s3, bucket)
+    print(f"[main] Loaded main-horizon regressors for regimes: {list(reg_main_map.keys())}")
+    print(f"[main] sigma_main_per_regime: {sigma_main_per_regime}")
     print(f"[main] Using {len(feature_cols)} features:", feature_cols)
 
-    # 3) Add predictions, residuals, Win%
-    df = add_predictions_and_residuals(df, reg_main, sigma_main, feature_cols)
+    # 3) Add predictions, residuals, Win%, regimes
+    df = add_predictions_and_residuals(df, reg_main_map, sigma_main_per_regime, feature_cols, regime_defs)
 
-    # 4) Add bin columns
+    # 4) Add bins (time, price, Win%, predicted return)
     df = add_bins(df)
 
     # 5) Compute bucket sigmas
@@ -344,7 +514,14 @@ def main():
     df_buckets.to_csv(out_csv, index=False)
     print(f"[main] Wrote detailed bucket table to {out_csv} (rows: {len(df_buckets)})")
 
-    # 7) Print marginal summaries (small enough to paste into chat)
+    # 7) Compute and save per-regime summary
+    df_reg = compute_regime_summaries(df)
+    reg_csv = "sigma_regimes.csv"
+    df_reg.to_csv(reg_csv, index=False)
+    print(f"[main] Wrote per-regime summary to {reg_csv}:")
+    print(df_reg.to_string(index=False))
+
+    # 8) Print marginal summaries (small enough to paste into chat)
     print_marginal_summaries(df_buckets)
 
 
