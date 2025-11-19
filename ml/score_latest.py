@@ -15,6 +15,8 @@ from features import (
     HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
 
+EXPERIMENT = "quantile"
+
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
@@ -86,8 +88,8 @@ def load_latest_models(s3, bucket):
     """
     Load the latest regressors and metadata from R2.
     """
-    key_reg = "models/xgb/latest_reg.pkl"
-    key_meta = "models/xgb/latest_meta.json"
+    key_reg = "models/{EXPERIMENT}/latest_reg.pkl"
+    key_meta = "models/{EXPERIMENT}/latest_meta.json"
 
     obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
     obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
@@ -468,9 +470,10 @@ def main():
     import json
 
     buf = json.dumps(out).encode("utf-8")
-
-    key_signals = f"signals/{date_part}.json"
-    key_latest = "signals/latest.json"
+    
+    SIGNALS_NAMESPACE = EXPERIMENT
+    key_signals = f"signals/{SIGNALS_NAMESPACE}/{date_part}.json"
+    key_latest = "signals/{SIGNALS_NAMESPACE}/latest.json"
     s3.put_object(Bucket=bucket, Key=key_signals, Body=buf)
     s3.put_object(Bucket=bucket, Key=key_latest, Body=buf)
 
