@@ -20,13 +20,20 @@ from features import (
 # Config
 # ---------------------------------------------------------------------------
 
-HORIZON_MINUTES = 60      # main decision horizon (must be in HORIZONS_MINUTES)
-WINDOW_DAYS = 30          # how many days back to train
-DECAY_DAYS = 14           # recency weighting half-life (days)
-TAX_RATE = 0.02
-MARGIN = 0.002            # extra 0.2% above tax for "profitable"
+# Main decision horizon (must be in HORIZONS_MINUTES)
+HORIZON_MINUTES = 60
 
-# Features used by both regressors and probability-of-profit
+# How many days back to train
+WINDOW_DAYS = 30
+
+# Recency weighting half-life (days)
+DECAY_DAYS = 14
+
+# Tax and margin used to define "profitable"
+TAX_RATE = 0.02
+MARGIN = 0.002  # extra 0.2% above tax for "profitable"
+
+# Features used by all regressors
 FEATURE_COLS = [
     "mid_price",
     "spread_pct",
@@ -44,8 +51,24 @@ FEATURE_COLS = [
     "dow_cos",
 ]
 
-# how many samples we require to train a regressor for a given horizon
+# Minimum samples required to fit a regressor for a given horizon
 MIN_SAMPLES_PER_HORIZON = 50
+
+# ----------------------------
+# Robustness: label / sigma
+# ----------------------------
+
+# Clip targets (future returns) used for training – applied to ALL horizons.
+# This removes pathological labels (10x, 20x) while leaving room for real trends.
+FUTURE_RETURN_CLIP_LOWER = -0.8   # -80%
+FUTURE_RETURN_CLIP_UPPER = +1.0   # +100%
+
+# Sigma calibration slice (for the Normal CDF Win%):
+# Only use residuals from a stable regime to estimate sigma_main.
+SIGMA_PRICE_MIN_GP = 10_000         # ≥ 10k gp
+SIGMA_ABS_RETURN_MAX = 0.50         # |gross future return| ≤ 50%
+SIGMA_ABS_NET_HAT_MAX = 0.05        # |predicted net return| ≤ 5%
+MIN_SAMPLES_FOR_SIGMA = 1000        # fallback to full if fewer rows
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +111,20 @@ def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
     Add:
       - model features
       - multi-horizon return columns: ret_5m, ret_10m, ..., ret_120m
-      - 60m "profit_ok" label
+      - main-horizon future_return / net_return
+      - profit_ok
       - recency-based sample_weight
     """
     df = add_model_features(df_raw)
 
     # Add multi-horizon returns (targets)
     df = add_multi_horizon_returns(df, horizons_minutes=HORIZONS_MINUTES)
+
+    # Clip all horizon targets to robust bounds (guards against extreme regimes)
+    for H in HORIZONS_MINUTES:
+        col = f"ret_{H}m"
+        if col in df.columns:
+            df[col] = df[col].clip(FUTURE_RETURN_CLIP_LOWER, FUTURE_RETURN_CLIP_UPPER)
 
     # Check we have the main horizon
     col_60 = f"ret_{HORIZON_MINUTES}m"
@@ -106,11 +136,10 @@ def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
     # Require non-missing target at main horizon
     df = df.dropna(subset=[col_60]).copy()
 
-    # Define main 60m future return
+    # Define main 60m future return (already clipped above)
     df["future_return"] = df[col_60]
 
-    # "Profitable" event: net return after tax + margin > 0
-    # net_return = (1 + future_return) * (1 - TAX_RATE) - 1
+    # Net return after tax; "profitable" if net_return > MARGIN
     df["net_return"] = (1.0 + df["future_return"]) * (1.0 - TAX_RATE) - 1.0
     df["profit_ok"] = (df["net_return"] > MARGIN).astype(int)
 
@@ -130,15 +159,16 @@ def train_models(df: pd.DataFrame):
     """
     Train:
       - A dict of XGBRegressors, one per horizon in HORIZONS_MINUTES
-        reg_models[h].predict(X) ~= ret_{h}m
+        reg_models[h].predict(X) ~= ret_{h}m (targets were clipped)
       - Estimate residual std for the main horizon (for probability-of-profit)
+        using a stability-trimmed slice.
     """
     X_all = df[FEATURE_COLS].values
     w = df["sample_weight"].values
 
     reg_models = {}
-    sigma_main = None
 
+    # Fit a regressor for each horizon (using clipped targets)
     for H in HORIZONS_MINUTES:
         col = f"ret_{H}m"
         if col not in df.columns:
@@ -166,22 +196,57 @@ def train_models(df: pd.DataFrame):
         reg.fit(X_all[mask], y_h[mask], sample_weight=w[mask])
         reg_models[H] = reg
 
-        # After fitting the main horizon model, compute residual std
-        if H == HORIZON_MINUTES:
-            y_true = y_h[mask]
-            y_pred = reg.predict(X_all[mask])
-            w_h = w[mask]
-            # Normalise weights to avoid numerical issues
-            w_h = w_h / np.mean(w_h)
-            mse = np.average((y_true - y_pred) ** 2, weights=w_h)
-            sigma = float(np.sqrt(mse))
-            sigma_main = max(sigma, 1e-8)  # avoid degenerate zero
-
     if not reg_models:
         raise RuntimeError("No regression models were trained (not enough data for any horizon).")
+    if HORIZON_MINUTES not in reg_models:
+        raise RuntimeError(f"Missing regressor for main horizon {HORIZON_MINUTES}m.")
 
-    if sigma_main is None:
-        raise RuntimeError(f"No residual std computed for main horizon {HORIZON_MINUTES}m.")
+    # ------------------------------
+    # Robust sigma_main estimation
+    # ------------------------------
+    reg_main = reg_models[HORIZON_MINUTES]
+    col_60 = f"ret_{HORIZON_MINUTES}m"
+
+    y_true_all = df[col_60].values  # already clipped via add_labels_and_weights
+    mask_main = np.isfinite(y_true_all)
+
+    y_true_all = y_true_all[mask_main]
+    X_main = X_all[mask_main]
+    w_main = w[mask_main]
+
+    y_pred_all = reg_main.predict(X_main)
+    mid_all = df.loc[mask_main, "mid_price"].to_numpy()
+
+    # Predicted net return (after tax) for the slice filter
+    net_hat_all = (1.0 + y_pred_all) * (1.0 - TAX_RATE) - 1.0
+
+    good_mask = (
+        np.isfinite(mid_all) &
+        (mid_all >= SIGMA_PRICE_MIN_GP) &
+        np.isfinite(y_true_all) &
+        (np.abs(y_true_all) <= SIGMA_ABS_RETURN_MAX) &
+        np.isfinite(net_hat_all) &
+        (np.abs(net_hat_all) <= SIGMA_ABS_NET_HAT_MAX)
+    )
+
+    n_good = int(good_mask.sum())
+    if n_good < MIN_SAMPLES_FOR_SIGMA:
+        print(
+            f"[train] Trimmed sigma slice too small ({n_good} rows) – "
+            "falling back to full main-horizon sample."
+        )
+        good_mask = np.isfinite(y_true_all)
+
+    y_true = y_true_all[good_mask]
+    y_pred = y_pred_all[good_mask]
+    w_h = w_main[good_mask]
+
+    # Normalise weights to avoid numerical issues
+    w_h = w_h / max(np.mean(w_h), 1e-8)
+
+    mse = np.average((y_true - y_pred) ** 2, weights=w_h)
+    sigma_main = float(np.sqrt(mse))
+    sigma_main = max(sigma_main, 1e-8)
 
     return reg_models, sigma_main, FEATURE_COLS
 
@@ -226,6 +291,14 @@ def save_models(s3, bucket, reg_models, sigma_main, feature_cols):
         "margin": MARGIN,
         "sigma_main": float(sigma_main),
         "generated_at_iso": now.isoformat(),
+        # Document robustness settings for transparency
+        "label_clip": [FUTURE_RETURN_CLIP_LOWER, FUTURE_RETURN_CLIP_UPPER],
+        "sigma_trim": {
+            "min_mid_price_gp": SIGMA_PRICE_MIN_GP,
+            "max_abs_future_return": SIGMA_ABS_RETURN_MAX,
+            "max_abs_net_return_hat": SIGMA_ABS_NET_HAT_MAX,
+            "min_rows": MIN_SAMPLES_FOR_SIGMA,
+        },
     }
 
     meta_bytes = json_bytes(meta)
@@ -264,7 +337,7 @@ def main():
     reg_models, sigma_main, feature_cols = train_models(df)
     save_models(s3, bucket, reg_models, sigma_main, feature_cols)
     print("Training complete.")
-    print(f"Main-horizon residual sigma: {sigma_main:.6f}")
+    print(f"Main-horizon residual sigma (trimmed): {sigma_main:.6f}")
 
 
 if __name__ == "__main__":
