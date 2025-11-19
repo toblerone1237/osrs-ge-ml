@@ -512,7 +512,7 @@ function setCachedPriceSeries(cacheKey, payload) {
 }
 
 async function handleSignals(env) {
-  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/remove-noisy-sections/latest.json");
   if (!obj) return new Response(JSON.stringify({ error: "No signals found" }), { status: 404, headers: { "Content-Type": "application/json" } });
   const text = await obj.text();
   return new Response(text, { status: 200, headers: { "Content-Type": "application/json" } });
