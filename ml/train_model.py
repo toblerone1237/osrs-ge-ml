@@ -17,16 +17,23 @@ from features import (
 )
 
 # ---------------------------------------------------------------------------
-# Config
+# Training config
 # ---------------------------------------------------------------------------
 
-HORIZON_MINUTES = 60      # main decision horizon (must be in HORIZONS_MINUTES)
-WINDOW_DAYS = 30          # how many days back to train
-DECAY_DAYS = 14           # recency weighting half-life (days)
-TAX_RATE = 0.02
-MARGIN = 0.002            # extra 0.2% above tax for "profitable"
+# Main decision horizon in minutes (used for sigma_main)
+HORIZON_MINUTES = 60
 
-# Features used by both regressors and probability-of-profit
+# How many days of 5m snapshots to train on
+WINDOW_DAYS = 30
+
+# Recency decay (days) for sample weights
+DECAY_DAYS = 14
+
+# Economic parameters (must match score_latest.py and analyse_sigma_buckets.py)
+TAX_RATE = 0.02
+MARGIN = 0.002
+
+# Feature columns for the regressors (built by add_model_features)
 FEATURE_COLS = [
     "mid_price",
     "spread_pct",
@@ -44,13 +51,87 @@ FEATURE_COLS = [
     "dow_cos",
 ]
 
-# how many samples we require to train a regressor for a given horizon
+# Minimum samples per horizon per regime
 MIN_SAMPLES_PER_HORIZON = 50
 
+# ---------------------------------------------------------------------------
+# Regime definitions and label clipping
+# ---------------------------------------------------------------------------
+
+# Regimes by mid_price (gp)
+# These are also saved into meta and reused at score/eval time.
+REGIME_DEFS = {
+    "low": {
+        "mid_price_min": 0,
+        "mid_price_max": 10_000,
+    },
+    "mid": {
+        "mid_price_min": 10_000,
+        "mid_price_max": 100_000,
+    },
+    "high": {
+        "mid_price_min": 100_000,
+        "mid_price_max": None,  # no upper bound
+    },
+}
+
+# Per‑regime clipping for training targets (returns are in decimal form)
+REGIME_CLIPPING = {
+    "high": {"min": -0.40, "max": 0.40},   # ±40%
+    "mid":  {"min": -0.60, "max": 0.60},   # ±60%
+    "low":  {"min": -1.50, "max": 1.50},   # ±150%
+}
+
+
+def assign_regime_for_price(mid_price: float, regime_defs=None) -> str:
+    """
+    Map a mid_price to a regime name using regime_defs (defaults to REGIME_DEFS).
+
+    Falls back to "mid" if price is missing or doesn't match any range.
+    """
+    if regime_defs is None:
+        regime_defs = REGIME_DEFS
+
+    try:
+        p = float(mid_price)
+    except (TypeError, ValueError):
+        return "mid"
+
+    if not np.isfinite(p) or p <= 0:
+        return "mid"
+
+    for name, bounds in regime_defs.items():
+        lo = bounds.get("mid_price_min", 0.0)
+        hi = bounds.get("mid_price_max", None)
+        if hi is None:
+            if p >= lo:
+                return name
+        else:
+            if lo <= p < hi:
+                return name
+
+    return "mid"
+
+
+def clip_returns_for_regime(y: np.ndarray, regime_name: str) -> np.ndarray:
+    """
+    Apply regime-specific clipping to a vector of returns.
+
+    y is expected to be a numpy array of decimal returns (e.g. 0.05 = +5%).
+    """
+    cfg = REGIME_CLIPPING.get(regime_name)
+    if cfg is None:
+        return y
+
+    ymin = cfg["min"]
+    ymax = cfg["max"]
+    return np.clip(y, ymin, ymax)
+
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data loading and labelling
 # ---------------------------------------------------------------------------
+
 
 def build_training_dataframe(s3, bucket):
     """
@@ -78,10 +159,6 @@ def build_training_dataframe(s3, bucket):
     df = pd.concat(chunks, ignore_index=True)
     return df
 
-
-# ---------------------------------------------------------------------------
-# Labels & weights
-# ---------------------------------------------------------------------------
 
 def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
@@ -123,78 +200,133 @@ def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training loop (multi-regime)
 # ---------------------------------------------------------------------------
+
 
 def train_models(df: pd.DataFrame):
     """
-    Train:
-      - A dict of XGBRegressors, one per horizon in HORIZONS_MINUTES
-        reg_models[h].predict(X) ~= ret_{h}m
-      - Estimate residual std for the main horizon (for probability-of-profit)
+    Train multi-regime, multi-horizon XGB regressors.
+
+    Returns:
+      - reg_models: dict[regime_name][horizon_minutes] -> XGBRegressor
+      - sigma_main_per_regime: dict[regime_name] -> float residual std at main horizon
+      - feature_cols: the list of feature column names used
     """
-    X_all = df[FEATURE_COLS].values
-    w = df["sample_weight"].values
+    df = df.copy()
+    df["regime"] = df["mid_price"].apply(assign_regime_for_price)
 
     reg_models = {}
-    sigma_main = None
+    sigma_main_per_regime = {}
 
-    for H in HORIZONS_MINUTES:
-        col = f"ret_{H}m"
-        if col not in df.columns:
-            print(f"[train] Horizon {H}m: missing {col}, skipping.")
+    for regime_name in REGIME_DEFS.keys():
+        df_reg = df[df["regime"] == regime_name].copy()
+        if df_reg.empty:
+            print(f"[train] Regime {regime_name}: no rows, skipping.")
             continue
 
-        y_h = df[col].values
-        mask = np.isfinite(y_h)
-        n = int(mask.sum())
-        if n < MIN_SAMPLES_PER_HORIZON:
-            print(f"[train] Horizon {H}m: only {n} samples, skipping.")
+        X_reg = df_reg[FEATURE_COLS].values
+        w_reg = df_reg["sample_weight"].values
+
+        reg_models[regime_name] = {}
+        sigma_main_regime = None
+
+        for H in HORIZONS_MINUTES:
+            col = f"ret_{H}m"
+            if col not in df_reg.columns:
+                print(
+                    f"[train] Regime {regime_name}, Horizon {H}m: "
+                    f"missing {col}, skipping."
+                )
+                continue
+
+            y_h = df_reg[col].values.astype("float64")
+            mask = np.isfinite(y_h)
+            n = int(mask.sum())
+            if n < MIN_SAMPLES_PER_HORIZON:
+                print(
+                    f"[train] Regime {regime_name}, Horizon {H}m: "
+                    f"only {n} samples, skipping."
+                )
+                continue
+
+            # Regime-specific clipping for robustness
+            y_h_clipped = clip_returns_for_regime(y_h, regime_name)
+
+            print(
+                f"[train] Regime {regime_name}: training regressor for {H}m on {n} samples."
+            )
+            reg = xgb.XGBRegressor(
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective="reg:squarederror",
+                n_jobs=4,
+                tree_method="hist",
+            )
+            reg.fit(X_reg[mask], y_h_clipped[mask], sample_weight=w_reg[mask])
+            reg_models[regime_name][H] = reg
+
+            # After fitting the main horizon model, compute residual std for this regime
+            if H == HORIZON_MINUTES:
+                y_true = y_h_clipped[mask]
+                y_pred = reg.predict(X_reg[mask])
+                w_h = w_reg[mask]
+
+                if not np.any(np.isfinite(w_h)):
+                    w_h = np.ones_like(y_true)
+
+                # Normalise weights to avoid numerical issues
+                w_h_norm = w_h / np.mean(w_h)
+
+                resid = y_true - y_pred
+
+                # Trim 5–95% quantiles to avoid a few extreme outliers
+                if resid.size >= 20:
+                    lo = np.percentile(resid, 5)
+                    hi = np.percentile(resid, 95)
+                    keep = (resid >= lo) & (resid <= hi)
+                    if keep.sum() >= 5:
+                        resid = resid[keep]
+                        w_h_norm = w_h_norm[keep]
+
+                mse = np.average(resid ** 2, weights=w_h_norm)
+                sigma = float(np.sqrt(mse))
+                sigma_main_regime = max(sigma, 1e-8)  # avoid degenerate zero
+
+        if not reg_models[regime_name]:
+            print(f"[train] Regime {regime_name}: no models trained, dropping regime.")
+            reg_models.pop(regime_name, None)
             continue
 
-        print(f"[train] Training regressor for {H}m on {n} samples.")
-        reg = xgb.XGBRegressor(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            objective="reg:squarederror",
-            n_jobs=4,
-            tree_method="hist",
-        )
-        reg.fit(X_all[mask], y_h[mask], sample_weight=w[mask])
-        reg_models[H] = reg
+        if sigma_main_regime is None:
+            raise RuntimeError(
+                f"No residual std computed for main horizon {HORIZON_MINUTES}m "
+                f"in regime {regime_name}."
+            )
 
-        # After fitting the main horizon model, compute residual std
-        if H == HORIZON_MINUTES:
-            y_true = y_h[mask]
-            y_pred = reg.predict(X_all[mask])
-            w_h = w[mask]
-            # Normalise weights to avoid numerical issues
-            w_h = w_h / np.mean(w_h)
-            mse = np.average((y_true - y_pred) ** 2, weights=w_h)
-            sigma = float(np.sqrt(mse))
-            sigma_main = max(sigma, 1e-8)  # avoid degenerate zero
+        sigma_main_per_regime[regime_name] = sigma_main_regime
 
     if not reg_models:
-        raise RuntimeError("No regression models were trained (not enough data for any horizon).")
+        raise RuntimeError(
+            "No regression models were trained for any regime/horizon."
+        )
 
-    if sigma_main is None:
-        raise RuntimeError(f"No residual std computed for main horizon {HORIZON_MINUTES}m.")
-
-    return reg_models, sigma_main, FEATURE_COLS
+    return reg_models, sigma_main_per_regime, FEATURE_COLS
 
 
 # ---------------------------------------------------------------------------
-# Saving
+# Persist models and metadata
 # ---------------------------------------------------------------------------
 
-def save_models(s3, bucket, reg_models, sigma_main, feature_cols):
+
+def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
     """
     Save:
-      - reg_models (dict: horizon -> regressor) as latest_reg.pkl
-      - meta.json with horizon, feature, and distribution info
+      - reg_models (dict: regime -> horizon -> regressor) as latest_reg.pkl
+      - meta.json with horizon, feature, regime, and distribution info
     """
     now = datetime.now(timezone.utc)
     date_part = now.strftime("%Y/%m/%d")
@@ -215,6 +347,18 @@ def save_models(s3, bucket, reg_models, sigma_main, feature_cols):
         Body=buf_reg.getvalue(),
     )
 
+    # Choose a global sigma_main for backwards compatibility (use mid if available)
+    if isinstance(sigma_main_per_regime, dict) and sigma_main_per_regime:
+        if "mid" in sigma_main_per_regime:
+            sigma_main_global = float(sigma_main_per_regime["mid"])
+        else:
+            sigma_main_global = float(
+                np.mean(list(sigma_main_per_regime.values()))
+            )
+    else:
+        # Fallback: treat input as already a scalar
+        sigma_main_global = float(sigma_main_per_regime)
+
     # Metadata
     meta = {
         "horizon_minutes": HORIZON_MINUTES,          # main horizon (60m)
@@ -224,7 +368,11 @@ def save_models(s3, bucket, reg_models, sigma_main, feature_cols):
         "feature_cols": feature_cols,                # used for regressors
         "tax_rate": TAX_RATE,
         "margin": MARGIN,
-        "sigma_main": float(sigma_main),
+        "sigma_main": float(sigma_main_global),
+        "sigma_main_per_regime": {
+            k: float(v) for k, v in sigma_main_per_regime.items()
+        },
+        "regime_defs": REGIME_DEFS,
         "generated_at_iso": now.isoformat(),
     }
 
@@ -243,10 +391,6 @@ def json_bytes(obj):
     return json.dumps(obj).encode("utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
@@ -261,10 +405,12 @@ def main():
         print("No rows after labels/weights.")
         return
 
-    reg_models, sigma_main, feature_cols = train_models(df)
-    save_models(s3, bucket, reg_models, sigma_main, feature_cols)
+    reg_models, sigma_main_per_regime, feature_cols = train_models(df)
+    save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols)
     print("Training complete.")
-    print(f"Main-horizon residual sigma: {sigma_main:.6f}")
+    print("Main-horizon residual sigma by regime:")
+    for name, sigma in sigma_main_per_regime.items():
+        print(f"  - {name}: {sigma:.6f}")
 
 
 if __name__ == "__main__":
