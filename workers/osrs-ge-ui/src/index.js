@@ -182,10 +182,12 @@ const HTML = `<!DOCTYPE html>
       <div class="small" style="margin-bottom:0.4rem;">
         Click a row to see up to the last 14 days (or as far back as available) of mid prices:
         5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
-        Click the ★ column to pin an item. Pins persist across refreshes.
+        Click the ★ column to pin an item. Pins persist across refreshes.<br/>
+        Regime column: H = high-value (≥100k), M = mid-value (10k–100k), L = low-value (&lt;10k, noisier / experimental).
       </div>
       <div id="tableContainer">Waiting for data...</div>
     </div>
+
 
     <div class="card">
       <h2>Search &amp; watchlist</h2>
@@ -423,19 +425,19 @@ const HTML = `<!DOCTYPE html>
         tableContainer.textContent = "No signals available.";
         return;
       }
-
+    
       const pins = getPinnedSet();
-
+    
       const rows = overviewSignals
         .map((s) => {
           const id = s.item_id;
           const name = s.name || ("Item " + id);
-
+    
           const winProb =
             typeof s.prob_profit === "number" ? s.prob_profit : 0;
           const profit =
             typeof s.expected_profit === "number" ? s.expected_profit : 0;
-
+    
           const gpPerSec =
             typeof s.expected_profit_per_second === "number"
               ? s.expected_profit_per_second
@@ -444,18 +446,30 @@ const HTML = `<!DOCTYPE html>
             gpPerSec != null && Number.isFinite(gpPerSec)
               ? gpPerSec * 3600
               : null;
-
+    
           const volWindow =
             typeof s.volume_window === "number" ? s.volume_window : 0;
-
+    
           const liqScore =
             volWindow > 0 ? Math.log10(1 + volWindow) : 0;
-
+    
+          // Regime info from signals
+          const regime =
+            typeof s.regime === "string" && s.regime.length
+              ? s.regime
+              : null;
+          const regimePenalty =
+            typeof s.regime_penalty === "number" && Number.isFinite(s.regime_penalty)
+              ? s.regime_penalty
+              : 1;
+    
+          // Combined score: Win% × profit × liquidity × regimePenalty
           const score =
             Math.max(0, winProb) *
             Math.max(0, profit) *
-            Math.max(1e-3, liqScore || 1);
-
+            Math.max(1e-3, liqScore || 1) *
+            Math.max(0.1, regimePenalty || 1);
+    
           return {
             raw: s,
             id,
@@ -466,24 +480,27 @@ const HTML = `<!DOCTYPE html>
             volWindow,
             holdMinutes:
               typeof s.hold_minutes === "number" ? s.hold_minutes : null,
+            regime,
+            regimePenalty,
             combinedScore: Number.isFinite(score) ? score : 0,
             pinned: pins.has(String(id))
           };
         })
         .filter((row) => Number.isFinite(row.combinedScore));
-
+    
       rows.sort((a, b) => b.combinedScore - a.combinedScore);
-
+    
       const top10 = rows.slice(0, 10);
-
+    
       const table = document.createElement("table");
       const thead = document.createElement("thead");
       const tbody = document.createElement("tbody");
-
+    
       const trHead = document.createElement("tr");
       [
         "★",
         "Item",
+        "Regime",
         "Win %",
         "Exp. profit (gp)",
         "GP/hr @limit",
@@ -495,11 +512,11 @@ const HTML = `<!DOCTYPE html>
         trHead.appendChild(th);
       });
       thead.appendChild(trHead);
-
+    
       top10.forEach((row) => {
         const tr = document.createElement("tr");
         tr.className = "clickable";
-
+    
         const tdStar = document.createElement("td");
         const btn = document.createElement("button");
         btn.type = "button";
@@ -511,54 +528,71 @@ const HTML = `<!DOCTYPE html>
         });
         tdStar.appendChild(btn);
         tr.appendChild(tdStar);
-
+    
         const tdName = document.createElement("td");
         tdName.textContent = row.name;
         tr.appendChild(tdName);
-
+    
+        const tdRegime = document.createElement("td");
+        if (row.regime === "high") {
+          tdRegime.textContent = "H";
+          tdRegime.title = "High-value regime (mid_price ≥ 100k)";
+        } else if (row.regime === "mid") {
+          tdRegime.textContent = "M";
+          tdRegime.title = "Mid-value regime (10k ≤ mid_price < 100k)";
+        } else if (row.regime === "low") {
+          tdRegime.textContent = "L";
+          tdRegime.title = "Low-value regime (<10k; noisier / experimental)";
+        } else if (row.regime) {
+          tdRegime.textContent = row.regime;
+          tdRegime.title = "Unknown regime";
+        } else {
+          tdRegime.textContent = "-";
+          tdRegime.title = "No regime info";
+        }
+        tr.appendChild(tdRegime);
+    
         const tdWin = document.createElement("td");
         tdWin.textContent = formatPercent(row.winProb);
         tr.appendChild(tdWin);
-
+    
         const tdProfit = document.createElement("td");
         tdProfit.textContent = formatProfitGp(row.profit);
         tr.appendChild(tdProfit);
-
+    
         const tdHr = document.createElement("td");
         tdHr.textContent =
           row.gpPerHour != null && Number.isFinite(row.gpPerHour)
             ? formatGpPerHour(row.gpPerHour)
             : "-";
         tr.appendChild(tdHr);
-
+    
         const tdVol = document.createElement("td");
         tdVol.textContent =
           row.volWindow != null
             ? row.volWindow.toLocaleString("en-US")
             : "-";
         tr.appendChild(tdVol);
-
+    
         const tdHold = document.createElement("td");
         tdHold.textContent =
           row.holdMinutes != null ? row.holdMinutes + "m" : "-";
         tr.appendChild(tdHold);
-
+    
         tr.addEventListener("click", () => {
           loadPriceSeries(row.id, row.name);
         });
-
+    
         tbody.appendChild(tr);
       });
-
+    
       table.appendChild(thead);
       table.appendChild(tbody);
+    
       tableContainer.innerHTML = "";
       tableContainer.appendChild(table);
-
-      if (top10.length > 0) {
-        loadPriceSeries(top10[0].id, top10[0].name);
-      }
     }
+
 
     function runSearch() {
       const q = (searchInput.value || "").trim().toLowerCase();
