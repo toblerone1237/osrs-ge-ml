@@ -16,6 +16,8 @@ from features import (
     HORIZONS_MINUTES,
 )
 
+EXPERIMENT = "quantile"
+
 # ---------------------------------------------------------------------------
 # Config (constants should match your training config)
 # ---------------------------------------------------------------------------
@@ -141,8 +143,8 @@ def load_latest_regressor(s3, bucket: str):
       - feature_cols: list of feature columns
       - regime_defs: dict used for regime assignment
     """
-    key_reg = "models/xgb/latest_reg.pkl"
-    key_meta = "models/xgb/latest_meta.json"
+    key_reg = "models/{EXPERIMENT}/latest_reg.pkl"
+    key_meta = "models/{EXPERIMENT}/latest_meta.json"
 
     obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
     obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
