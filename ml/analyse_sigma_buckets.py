@@ -486,11 +486,47 @@ def compute_regime_summaries(df: pd.DataFrame) -> pd.DataFrame:
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
+    local_path = "sigma_buckets_full.csv"
+
+    def write_and_push(out_df: pd.DataFrame, reason: str = ""):
+        """Write CSV locally (always) and push to R2 (unless no prefix)."""
+        out_df.to_csv(local_path, index=False)
+        print(f"[save] Wrote bucket CSV locally to {local_path} (rows={len(out_df)}){(' - ' + reason) if reason else ''}")
+
+        prefix = os.environ.get("SIGMA_BUCKET_PREFIX") or os.environ.get("SIGMA_PREFIX")
+        if not prefix:
+            branch = os.environ.get("GITHUB_REF_NAME", "").lower()
+            if "remove-noisy-sections" in branch:
+                prefix = "analysis/remove-noisy-sections"
+            elif "quantile" in branch:
+                prefix = "analysis/quantile"
+            elif branch:
+                prefix = f"analysis/{branch}"
+            else:
+                prefix = "analysis/default"
+        prefix = prefix.rstrip("/")
+
+        now = datetime.now(timezone.utc)
+        key = f"{prefix}/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+        buf = io.BytesIO(out_df.to_csv(index=False).encode("utf-8"))
+        s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+        print(f"[save] Wrote bucket CSV to r2://{bucket}/{key}")
+
+    empty_cols = [
+        "time_bin", "price_bin", "win_bin", "pred_ret_bin",
+        "n_rows", "sigma_unweighted", "sigma_weighted",
+        "mean_future_return", "mean_pred_return",
+        "mean_prob_profit", "mean_pred_net_return",
+    ]
 
     # 1) Load eval data
     df = build_eval_dataframe(s3, bucket)
     if df.empty:
-        print("[main] No eval data, exiting.")
+        write_and_push(pd.DataFrame(columns=empty_cols), reason="no eval data")
+        # Still write an empty regime summary for completeness
+        pd.DataFrame(columns=["regime", "n_rows", "sigma_unweighted", "sigma_weighted"]).to_csv(
+            "sigma_regimes.csv", index=False
+        )
         return
 
     # 2) Load regressors and meta
@@ -507,25 +543,33 @@ def main():
 
     # 5) Compute bucket sigmas
     df_buckets = compute_bucket_sigmas(df)
+
     if df_buckets.empty:
-        print("[main] No buckets with at least", MIN_ROWS_PER_BUCKET, "rows.")
+        write_and_push(pd.DataFrame(columns=empty_cols), reason="no buckets met min rows")
+        df_reg = compute_regime_summaries(df)
+        df_reg.to_csv("sigma_regimes.csv", index=False)
+        print(f"[main] Wrote per-regime summary to sigma_regimes.csv (rows: {len(df_reg)})")
         return
 
-    # 6) Save full bucket table to CSV
-    out_csv = "sigma_buckets_full.csv"
-    df_buckets.to_csv(out_csv, index=False)
-    print(f"[main] Wrote detailed bucket table to {out_csv} (rows: {len(df_buckets)})")
+    # Save a full CSV so we can paste summaries externally if needed
+    out_csv = df_buckets.copy()
+    out_csv["sigma_unweighted"] = out_csv["sigma_unweighted"].round(3)
+    out_csv["sigma_weighted"] = out_csv["sigma_weighted"].round(3)
+    out_csv["mean_future_return"] = out_csv["mean_future_return"].round(3)
+    out_csv["mean_pred_return"] = out_csv["mean_pred_return"].round(3)
+    out_csv["mean_prob_profit"] = out_csv["mean_prob_profit"].round(3)
+    out_csv["mean_pred_net_return"] = out_csv["mean_pred_net_return"].round(3)
 
-    # 7) Compute and save per-regime summary
+    write_and_push(out_csv)
+
+    # Compute and save per-regime summary
     df_reg = compute_regime_summaries(df)
-    reg_csv = "sigma_regimes.csv"
-    df_reg.to_csv(reg_csv, index=False)
-    print(f"[main] Wrote per-regime summary to {reg_csv}:")
+    df_reg.to_csv("sigma_regimes.csv", index=False)
+    print(f"[main] Wrote per-regime summary to sigma_regimes.csv:")
     print(df_reg.to_string(index=False))
 
-    # 8) Print marginal summaries (small enough to paste into chat)
+    # Print marginal summaries (small enough to paste into chat)
     print_marginal_summaries(df_buckets)
-
 
 if __name__ == "__main__":
     main()
