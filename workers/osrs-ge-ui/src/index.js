@@ -990,26 +990,34 @@ const HTML = `<!DOCTYPE html>
           data.meta && typeof data.meta.truncated === "boolean"
             ? data.meta.truncated
             : false;
+        const historyLatestIso =
+          data.meta && data.meta.history_latest_iso ? data.meta.history_latest_iso : null;
+        const latest5mIso =
+          data.meta && data.meta.latest_5m_timestamp_iso ? data.meta.latest_5m_timestamp_iso : null;
         const hasForecast = forecast && forecast.length > 1;
+        const historySourceText =
+          "History source: " + src + (truncated ? " (truncated)" : "") + ".";
+        const lastTimestampText = historyLatestIso
+          ? " Last price timestamp: " + historyLatestIso + "."
+          : latest5mIso
+          ? " Last price timestamp: " + latest5mIso + "."
+          : "";
 
         if (!hasForecast) {
           priceStatusEl.textContent =
-            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. History source: " +
-            src +
-            (truncated ? " (truncated)" : "") +
-            ".";
+            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
+            historySourceText +
+            lastTimestampText;
         } else if (starInfo) {
           priceStatusEl.textContent =
-            "History source: " +
-            src +
-            (truncated ? " (truncated)" : "") +
-            ". Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
+            historySourceText +
+            lastTimestampText +
+            " Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
         } else {
           priceStatusEl.textContent =
-            "History source: " +
-            src +
-            (truncated ? " (truncated)" : "") +
-            ". Blue = history; green = current forecast (5–120 minute horizons).";
+            historySourceText +
+            lastTimestampText +
+            " Blue = history; green = current forecast (5–120 minute horizons).";
         }
       } catch (err) {
         console.error("Error loading price series:", err);
@@ -1088,6 +1096,11 @@ const PRICE_CACHE = new Map();
 const PRICE_CACHE_TTL_MS = 5 * 60 * 1000;
 const PRICE_CACHE_MAX_ITEMS = 64;
 
+const LATEST_5M_CACHE_TTL_MS = 2 * 60 * 1000; // refresh latest 5m snapshot every ~2 minutes
+let LAST_5M_SNAPSHOT = null;
+let LAST_5M_FETCHED_AT = 0;
+let LAST_5M_KEY = null;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1147,6 +1160,88 @@ async function bucketListWithRetry(env, options, { attempts = 3, baseDelayMs = 2
     lastError
   );
   return null;
+}
+
+async function loadLatestFiveMinuteSnapshot(env) {
+  const nowMs = Date.now();
+  if (LAST_5M_SNAPSHOT && nowMs - LAST_5M_FETCHED_AT < LATEST_5M_CACHE_TTL_MS) {
+    return { snapshot: LAST_5M_SNAPSHOT, key: LAST_5M_KEY };
+  }
+
+  const today = new Date();
+  for (let delta = 0; delta < 2; delta++) {
+    const d = new Date(today.getTime() - delta * 86400000);
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    const prefix = "5m/" + year + "/" + month + "/" + day + "/";
+
+    const listing = await bucketListWithRetry(env, { prefix, limit: 1000 });
+    if (!listing || !listing.objects || !listing.objects.length) {
+      continue;
+    }
+
+    const objects = listing.objects.slice().sort((a, b) => (a.key < b.key ? -1 : 1));
+    const latest = objects[objects.length - 1];
+    const obj = await bucketGetWithRetry(env, latest.key, { attempts: 2, baseDelayMs: 150 });
+    if (!obj) continue;
+
+    try {
+      const text = await obj.text();
+      const parsed = JSON.parse(text);
+      LAST_5M_SNAPSHOT = parsed;
+      LAST_5M_FETCHED_AT = nowMs;
+      LAST_5M_KEY = latest.key;
+      return { snapshot: parsed, key: latest.key };
+    } catch (err) {
+      console.error("Failed to parse latest 5m snapshot for " + latest.key, err);
+    }
+  }
+
+  return { snapshot: LAST_5M_SNAPSHOT, key: LAST_5M_KEY };
+}
+
+function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
+  if (!latestSnap || !latestSnap.five_minute || !latestSnap.five_minute.data) {
+    return { history, added: false, latestIso: null };
+  }
+
+  const tsSec = Number(latestSnap.five_minute.timestamp);
+  const entry = latestSnap.five_minute.data[String(itemId)];
+  if (!entry || !Number.isFinite(tsSec)) {
+    return { history, added: false, latestIso: null };
+  }
+
+  const ah = entry.avgHighPrice;
+  const al = entry.avgLowPrice;
+  if (typeof ah !== "number" || typeof al !== "number") {
+    return { history, added: false, latestIso: null };
+  }
+
+  const mid = (ah + al) / 2;
+  if (!Number.isFinite(mid) || mid <= 0) {
+    return { history, added: false, latestIso: null };
+  }
+
+  const tsMs = Math.floor(tsSec * 1000);
+  const iso = new Date(tsMs).toISOString();
+
+  let lastTs = null;
+  if (history.length) {
+    const last = history[history.length - 1];
+    const isoStr = last.timestamp_iso || last.timestamp || null;
+    const parsed = isoStr ? Date.parse(isoStr) : NaN;
+    if (Number.isFinite(parsed)) {
+      lastTs = parsed;
+    }
+  }
+
+  if (lastTs != null && tsMs <= lastTs) {
+    return { history, added: false, latestIso: iso };
+  }
+
+  const newHistory = history.concat([{ timestamp_iso: iso, price: mid }]);
+  return { history: newHistory, added: true, latestIso: iso };
 }
 
 async function loadSignalsWithCache(env) {
@@ -1356,7 +1451,31 @@ async function handlePriceSeries(env, itemId) {
     });
   }
 
-  const { history, found } = await loadPrecomputedHistory(env, itemId);
+  const { history: baseHistory, found } = await loadPrecomputedHistory(env, itemId);
+  let history = Array.isArray(baseHistory) ? baseHistory.slice() : [];
+
+  let source = found ? "precomputed" : "missing";
+  let latest5mIso = null;
+  let latest5mKey = null;
+
+  const latest5m = await loadLatestFiveMinuteSnapshot(env);
+  if (latest5m && latest5m.snapshot) {
+    latest5mKey = latest5m.key;
+    const res = maybeAppendLatestFiveMinute(history, latest5m.snapshot, itemId);
+    history = res.history;
+    latest5mIso = res.latestIso;
+    if (res.added && source === "precomputed") {
+      source = "precomputed+latest_5m";
+    } else if (res.added && source === "missing") {
+      source = "latest_5m_only";
+    }
+  }
+
+  const historyLatestIso =
+    history.length && history[history.length - 1]
+      ? history[history.length - 1].timestamp_iso || history[history.length - 1].timestamp || null
+      : null;
+
   const forecast = await buildForecast(env, itemId, history);
   const truncated = !found;
 
@@ -1366,7 +1485,10 @@ async function handlePriceSeries(env, itemId) {
     forecast,
     meta: {
       truncated: truncated,
-      source: found ? "precomputed" : "missing"
+      source,
+      history_latest_iso: historyLatestIso,
+      latest_5m_snapshot_key: latest5mKey,
+      latest_5m_timestamp_iso: latest5mIso
     }
   });
 
