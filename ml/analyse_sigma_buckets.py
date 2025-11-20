@@ -257,10 +257,41 @@ def print_marginal_summaries(df_buckets: pd.DataFrame):
 def summarize():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
+    local_path = "sigma_buckets_full.csv"
+
+    def write_and_push(out_df: pd.DataFrame, reason: str = ""):
+        """Write CSV locally (always) and push to R2 (unless no prefix)."""
+        out_df.to_csv(local_path, index=False)
+        print(f"[save] Wrote bucket CSV locally to {local_path} (rows={len(out_df)}){(' - ' + reason) if reason else ''}")
+
+        prefix = os.environ.get("SIGMA_BUCKET_PREFIX") or os.environ.get("SIGMA_PREFIX")
+        if not prefix:
+            branch = os.environ.get("GITHUB_REF_NAME", "").lower()
+            if "remove-noisy-sections" in branch:
+                prefix = "analysis/remove-noisy-sections"
+            elif "quantile" in branch:
+                prefix = "analysis/quantile"
+            elif branch:
+                prefix = f"analysis/{branch}"
+            else:
+                prefix = "analysis/default"
+        prefix = prefix.rstrip("/")
+
+        now = datetime.now(timezone.utc)
+        key = f"{prefix}/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+        buf = io.BytesIO(out_df.to_csv(index=False).encode("utf-8"))
+        s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+        print(f"[save] Wrote bucket CSV to r2://{bucket}/{key}")
 
     df = build_eval_dataframe(s3, bucket)
     if df.empty:
-        print("No data to evaluate.")
+        empty_cols = [
+            "time_bin", "price_bin", "win_bin", "pred_ret_bin",
+            "n_rows", "sigma_unweighted", "sigma_weighted",
+            "mean_future_return", "mean_pred_return",
+            "mean_prob_profit", "mean_pred_net_return",
+        ]
+        write_and_push(pd.DataFrame(columns=empty_cols), reason="no eval data")
         return
 
     reg_main, sigma_main, feature_cols = load_latest_regressor(s3, bucket)
@@ -275,6 +306,16 @@ def summarize():
 
     print_marginal_summaries(df_buckets)
 
+    if df_buckets.empty:
+        empty_cols = [
+            "time_bin", "price_bin", "win_bin", "pred_ret_bin",
+            "n_rows", "sigma_unweighted", "sigma_weighted",
+            "mean_future_return", "mean_pred_return",
+            "mean_prob_profit", "mean_pred_net_return",
+        ]
+        write_and_push(pd.DataFrame(columns=empty_cols), reason="no buckets met min rows")
+        return
+
     # Save a full CSV so we can paste summaries externally if needed
     out_csv = df_buckets.copy()
     out_csv["sigma_unweighted"] = out_csv["sigma_unweighted"].round(3)
@@ -284,11 +325,7 @@ def summarize():
     out_csv["mean_prob_profit"] = out_csv["mean_prob_profit"].round(3)
     out_csv["mean_pred_net_return"] = out_csv["mean_pred_net_return"].round(3)
 
-    now = datetime.now(timezone.utc)
-    key = f"analysis/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
-    buf = io.BytesIO(out_csv.to_csv(index=False).encode("utf-8"))
-    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-    print(f"[save] Wrote bucket CSV to r2://{bucket}/{key}")
+    write_and_push(out_csv)
 
 
 def main():
