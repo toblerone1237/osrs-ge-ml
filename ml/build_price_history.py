@@ -3,7 +3,7 @@ import json
 import math
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from features import get_r2_client, list_keys_with_prefix
 
@@ -79,56 +79,66 @@ def load_existing_histories(s3, bucket: str, cutoff_oldest_unix: int, cutoff_rec
     history_keys = [k for k in history_keys if k.endswith(".json") and k != HISTORY_META_KEY]
     history_keys.sort()
 
-    for idx, key in enumerate(history_keys, start=1):
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        data = json.loads(obj["Body"].read())
-        item_id = data.get("item_id")
-        if item_id is None:
-            # Fallback: try to parse from filename history/{id}.json
-            try:
-                item_id = int(os.path.splitext(os.path.basename(key))[0])
-            except Exception:
-                continue
+    def load_one(key):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            return key, json.loads(obj["Body"].read())
+        except Exception:
+            return key, None
 
-        entries = data.get("history") or []
-        pairs = []
-        for entry in entries:
-            price = entry.get("price")
-            ts_iso = entry.get("timestamp_iso") or entry.get("timestamp")
-            if price is None or ts_iso is None:
+    with ThreadPoolExecutor(max_workers=SNAPSHOT_FETCH_WORKERS) as pool:
+        futures = [pool.submit(load_one, key) for key in history_keys]
+        for idx, fut in enumerate(as_completed(futures), start=1):
+            key, data = fut.result()
+            if data is None:
                 continue
-            try:
-                price_f = float(price)
-            except Exception:
-                continue
-            if not math.isfinite(price_f) or price_f <= 0:
-                continue
-            ts_unix = parse_iso_to_unix(str(ts_iso))
-            if ts_unix is None:
-                continue
-            pairs.append((ts_unix, price_f))
+            item_id = data.get("item_id")
+            if item_id is None:
+                # Fallback: try to parse from filename history/{id}.json
+                try:
+                    item_id = int(os.path.splitext(os.path.basename(key))[0])
+                except Exception:
+                    continue
 
-            if ts_unix < cutoff_oldest_unix:
-                continue
-            if ts_unix >= cutoff_recent_unix:
-                recent_points[item_id].append((ts_unix, price_f))
-            else:
-                bucket_sec = (ts_unix // (OLDER_INTERVAL_MIN * 60)) * (OLDER_INTERVAL_MIN * 60)
-                older_buckets[item_id][bucket_sec] = price_f
+            entries = data.get("history") or []
+            pairs = []
+            for entry in entries:
+                price = entry.get("price")
+                ts_iso = entry.get("timestamp_iso") or entry.get("timestamp")
+                if price is None or ts_iso is None:
+                    continue
+                try:
+                    price_f = float(price)
+                except Exception:
+                    continue
+                if not math.isfinite(price_f) or price_f <= 0:
+                    continue
+                ts_unix = parse_iso_to_unix(str(ts_iso))
+                if ts_unix is None:
+                    continue
+                pairs.append((ts_unix, price_f))
 
-        pairs.sort(key=lambda t: t[0])
-        dedup_pairs = []
-        last_ts = None
-        for ts, price in pairs:
-            if last_ts is not None and ts == last_ts:
-                dedup_pairs[-1] = (ts, price)
-            else:
-                dedup_pairs.append((ts, price))
-                last_ts = ts
-        stored_pairs[item_id] = dedup_pairs
+                if ts_unix < cutoff_oldest_unix:
+                    continue
+                if ts_unix >= cutoff_recent_unix:
+                    recent_points[item_id].append((ts_unix, price_f))
+                else:
+                    bucket_sec = (ts_unix // (OLDER_INTERVAL_MIN * 60)) * (OLDER_INTERVAL_MIN * 60)
+                    older_buckets[item_id][bucket_sec] = price_f
 
-        if idx % 500 == 0:
-            print(f"... loaded {idx} existing history files")
+            pairs.sort(key=lambda t: t[0])
+            dedup_pairs = []
+            last_ts = None
+            for ts, price in pairs:
+                if last_ts is not None and ts == last_ts:
+                    dedup_pairs[-1] = (ts, price)
+                else:
+                    dedup_pairs.append((ts, price))
+                    last_ts = ts
+            stored_pairs[item_id] = dedup_pairs
+
+            if idx % 500 == 0:
+                print(f"... loaded {idx} existing history files")
 
     return older_buckets, recent_points, stored_pairs
 
@@ -330,6 +340,10 @@ def main():
         seed_from_existing = False
 
     print(f"Will process {len(new_keys)} new snapshots (from {len(all_keys)} total).")
+
+    if seed_from_existing and not new_keys:
+        print("No new snapshots since last_processed_key; skipping rebuild.")
+        return
 
     older_buckets, recent_points, stored_pairs = load_existing_histories(
         s3, bucket, cutoff_oldest_unix, cutoff_recent_unix
