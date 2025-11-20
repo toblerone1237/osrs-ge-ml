@@ -84,6 +84,26 @@ def get_latest_5m_key(s3, bucket):
     return keys[-1]
 
 
+def select_recent_keys_by_name(all_keys, latest_key, window_minutes, bucket_minutes=5):
+    """
+    Pick the most recent keys that should cover the window, based on filename order.
+    Assumes keys are named 5m/YYYY/MM/DD/HH-MM.json so lexical order == time order.
+    """
+    if not all_keys:
+        return []
+
+    all_keys = sorted(all_keys)
+    try:
+        latest_idx = all_keys.index(latest_key)
+    except ValueError:
+        latest_idx = len(all_keys) - 1
+
+    # Add a small buffer (+1) to account for alignment/fuzz in bucket timing
+    buckets_needed = max(1, int(np.ceil(window_minutes / bucket_minutes)) + 1)
+    start_idx = max(0, latest_idx - buckets_needed + 1)
+    return all_keys[start_idx : latest_idx + 1]
+
+
 def load_latest_models(s3, bucket):
     """
     Load the latest regressors and metadata from R2.
@@ -111,27 +131,20 @@ def build_scoring_dataframe(s3, bucket):
     # All snapshots for that day
     day_prefix = latest_key.rsplit("/", 1)[0] + "/"
     all_keys = list_keys_with_prefix(s3, bucket, day_prefix)
-    all_keys.sort()
 
-    # Determine the latest timestamp
+    # Determine the latest timestamp (fetch only the latest file once)
     obj_latest = s3.get_object(Bucket=bucket, Key=latest_key)
     import json as _json
     latest_json = _json.loads(obj_latest["Body"].read())
     latest_ts = latest_json["five_minute"]["timestamp"]
 
-    # Filter keys to within WINDOW_MINUTES of latest_ts
-    window_start_ts = latest_ts - WINDOW_MINUTES * 60
-
-    recent_keys = []
-    for key in all_keys:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        snap = _json.loads(obj["Body"].read())
-        ts = snap["five_minute"]["timestamp"]
-        if ts >= window_start_ts:
-            recent_keys.append(key)
+    # Choose last-hour keys purely by filename ordering (no per-file downloads)
+    recent_keys = select_recent_keys_by_name(
+        all_keys, latest_key, WINDOW_MINUTES, bucket_minutes=5
+    )
 
     print(
-        f"Using {len(recent_keys)} snapshots from the last {WINDOW_MINUTES} minutes."
+        f"Using {len(recent_keys)} snapshots from the last {WINDOW_MINUTES} minutes (by filename ordering)."
     )
 
     df = flatten_5m_snapshots(s3, bucket, recent_keys)
