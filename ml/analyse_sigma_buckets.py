@@ -284,8 +284,19 @@ def summarize():
     out_csv["mean_prob_profit"] = out_csv["mean_prob_profit"].round(3)
     out_csv["mean_pred_net_return"] = out_csv["mean_pred_net_return"].round(3)
 
+    # Write locally so the workflow can upload an artifact / push to R2
+    local_path = "sigma_buckets_full.csv"
+    out_csv.to_csv(local_path, index=False)
+    print(f"[save] Wrote bucket CSV locally to {local_path} (rows={len(out_csv)})")
+
+    prefix = (
+        os.environ.get("SIGMA_BUCKET_PREFIX")
+        or os.environ.get("SIGMA_PREFIX")
+        or "analysis/remove-noisy-sections"
+    )
+    prefix = prefix.rstrip("/")
     now = datetime.now(timezone.utc)
-    key = f"analysis/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+    key = f"{prefix}/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
     buf = io.BytesIO(out_csv.to_csv(index=False).encode("utf-8"))
     s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
     print(f"[save] Wrote bucket CSV to r2://{bucket}/{key}")
