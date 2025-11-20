@@ -37,7 +37,7 @@ jobs:
         run: |
           python analyse_sigma_buckets.py
 
-      - name: Upload sigma buckets to R2 (analysis/quantile/)
+      - name: Upload sigma buckets to R2 (branch-specific path)
         working-directory: ./ml
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -50,11 +50,19 @@ jobs:
           import os
           import boto3
 
+          branch = os.environ.get("GITHUB_REF_NAME", "").lower()
+          if "remove-noisy-sections" in branch:
+              prefix = "analysis/remove-noisy-sections"
+          elif "quantile" in branch:
+              prefix = "analysis/quantile"
+          else:
+              prefix = f"analysis/{branch or 'default'}"
+
           endpoint = os.environ["R2_ENDPOINT"]
           access_key = os.environ["R2_ACCESS_KEY_ID"]
           secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
           bucket = os.environ["R2_BUCKET"]
-          key = f"analysis/quantile/sigma_buckets_{datetime.datetime.utcnow():%Y%m%d_%H%M%S}.csv"
+          key = f"{prefix}/sigma_buckets_{datetime.datetime.utcnow():%Y%m%d_%H%M%S}.csv"
 
           session = boto3.session.Session()
           s3 = session.client(
@@ -67,7 +75,7 @@ jobs:
           with open("sigma_buckets_full.csv", "rb") as f:
               s3.put_object(Bucket=bucket, Key=key, Body=f.read())
 
-          print(f"Uploaded sigma buckets to r2://{bucket}/{key}")
+          print(f"[branch={branch or 'unknown'}] Uploaded sigma buckets to r2://{bucket}/{key}")
           PY
 
       - name: Upload sigma buckets CSV
