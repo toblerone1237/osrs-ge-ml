@@ -289,11 +289,17 @@ def summarize():
     out_csv.to_csv(local_path, index=False)
     print(f"[save] Wrote bucket CSV locally to {local_path} (rows={len(out_csv)})")
 
-    prefix = (
-        os.environ.get("SIGMA_BUCKET_PREFIX")
-        or os.environ.get("SIGMA_PREFIX")
-        or "analysis/remove-noisy-sections"
-    )
+    prefix = os.environ.get("SIGMA_BUCKET_PREFIX") or os.environ.get("SIGMA_PREFIX")
+    if not prefix:
+        branch = os.environ.get("GITHUB_REF_NAME", "").lower()
+        if "remove-noisy-sections" in branch:
+            prefix = "analysis/remove-noisy-sections"
+        elif "quantile" in branch:
+            prefix = "analysis/quantile"
+        elif branch:
+            prefix = f"analysis/{branch}"
+        else:
+            prefix = "analysis/default"
     prefix = prefix.rstrip("/")
     now = datetime.now(timezone.utc)
     key = f"{prefix}/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
