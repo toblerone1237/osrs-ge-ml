@@ -85,7 +85,7 @@ def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
       - item_id
       - mid_price
       - model features
-      - future_return (60m actual return)
+      - future_return (60m actual return, UNCLIPPED on purpose)
       - sample_weight (recency-based)
     """
     now = datetime.now(timezone.utc)
@@ -120,17 +120,17 @@ def build_eval_dataframe(s3, bucket: str) -> pd.DataFrame:
         raise RuntimeError(f"Expected column {col_60} from add_multi_horizon_returns().")
 
     df = df.dropna(subset=[col_60]).copy()
-    df["future_return"] = df[col_60]
+    df["future_return"] = df[col_60]  # UNCLIPPED (so we see the true tails)
 
     # Recency-based sample weights (same as training)
     latest_ts = df["timestamp"].max()
     age_days = (latest_ts - df["timestamp"]).dt.total_seconds() / (3600 * 24)
     df["sample_weight"] = np.exp(-age_days / DECAY_DAYS)
 
-    # Keep only rows with reasonable mid_price
+    # Keep only rows with positive mid_price
     df = df[df["mid_price"] > 0].copy()
 
-    print(f"[load] Eval dataframe rows after cleaning: {len(df)}")
+    print(f"[load] Eval dataframe rows after basic cleaning: {len(df)}")
     return df
 
 
@@ -201,11 +201,9 @@ def load_latest_regressor(s3, bucket: str):
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
-    """
-    Vectorised Normal(0,1) CDF using math.erf.
-    """
     def _cdf_scalar(x):
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+    return np.vectorize(_cdf_scalar, otypes=[float])(z)
 
     vec = np.vectorize(_cdf_scalar, otypes=[float])
     return vec(z)
@@ -220,12 +218,12 @@ def add_predictions_and_residuals(
     use_return_scaling: bool,
 ) -> pd.DataFrame:
     """
-    Given a dataframe with features and future_return, add:
+    Given a dataframe with features and UNCLIPPED future_return, add:
 
       - regime (based on mid_price)
       - future_return_hat
       - net_return_hat (after tax)
-      - prob_profit (Win%)
+      - prob_profit (Win%) via Normal CDF using sigma_main
       - resid = future_return - future_return_hat
     """
     df = df.copy()
@@ -284,7 +282,6 @@ def add_predictions_and_residuals(
     df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
     df["resid"] = df["future_return"] - df["future_return_hat"]
-
     return df
 
 
@@ -325,36 +322,17 @@ def add_bins(df: pd.DataFrame) -> pd.DataFrame:
     # Price ranges (in gp), matching your previous analysis
     price_edges = [-np.inf, 1_000, 10_000, 100_000, 1_000_000, np.inf]
     price_labels = ["<=1k", "1k-10k", "10k-100k", "100k-1m", ">1m"]
-    df["price_bin"] = pd.cut(
-        df["mid_price"],
-        bins=price_edges,
-        labels=price_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["price_bin"] = pd.cut(df["mid_price"], bins=price_edges, labels=price_labels, right=False, include_lowest=True)
 
     # Predicted Win% bins
     win_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0000001]
     win_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
-    df["win_bin"] = pd.cut(
-        df["prob_profit"],
-        bins=win_edges,
-        labels=win_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["win_bin"] = pd.cut(df["prob_profit"], bins=win_edges, labels=win_labels, right=False, include_lowest=True)
 
-    # Predicted net return bins (profit/loss%)
-    # net_return_hat is in decimal form (e.g. 0.05 = +5%)
+    # Predicted net return bins (decimal, e.g. 0.05=+5%)
     ret_edges = [-1.0, -0.05, 0.0, 0.05, 0.2, np.inf]
     ret_labels = ["<-5%", "-5-0%", "0-5%", "5-20%", ">20%"]
-    df["pred_ret_bin"] = pd.cut(
-        df["net_return_hat"],
-        bins=ret_edges,
-        labels=ret_labels,
-        right=False,
-        include_lowest=True,
-    )
+    df["pred_ret_bin"] = pd.cut(df["net_return_hat"], bins=ret_edges, labels=ret_labels, right=False, include_lowest=True)
 
     return df
 
@@ -410,19 +388,11 @@ def compute_bucket_sigmas(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df_buckets = pd.DataFrame(rows)
-    df_buckets.sort_values(
-        ["sigma_unweighted", "n_rows"],
-        ascending=[False, False],
-        inplace=True,
-    )
+    df_buckets.sort_values(["sigma_unweighted", "n_rows"], ascending=[False, False], inplace=True)
     return df_buckets
 
 
 def print_marginal_summaries(df_buckets: pd.DataFrame):
-    """
-    Print marginal sigma summaries by each bin dimension separately
-    (this is what you'll paste back into ChatGPT).
-    """
     def summarize(col):
         print("\n=== MARGINAL by", col, "===")
         grp = df_buckets.groupby(col).agg(
@@ -528,7 +498,6 @@ def main():
         "mean_prob_profit", "mean_pred_net_return",
     ]
 
-    # 1) Load eval data
     df = build_eval_dataframe(s3, bucket)
     if df.empty:
         write_and_push(pd.DataFrame(columns=empty_cols), reason="no eval data")
