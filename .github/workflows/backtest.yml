@@ -54,15 +54,22 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
-          python ml/backtest.py \
+          python ml/backtest_v2.py \
             --start-date "${{ env.BACKTEST_START }}" \
-            --end-date "${{ env.BACKTEST_END }}"
+            --end-date "${{ env.BACKTEST_END }}" \
+            --meta-key models/quantile/latest_meta.json \
+            --train-window-days 4 \
+            --test-window-days 1 \
+            --embargo-minutes 60
 
       - name: Upload backtest results
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
-          path: backtest_results.csv
+          path: |
+            ml/backtest_v2_trades.csv
+            ml/backtest_v2_folds.csv
+            ml/backtest_v2_summary.csv
 
       - name: Push backtest results to R2
         env:
@@ -80,6 +87,7 @@ jobs:
           export AWS_EC2_METADATA_DISABLED=true
           PREFIX="analysis/backtest"
           DATE_PART=$(date -u +%Y-%m-%dT%H%M%SZ)
-          KEY="$PREFIX/backtest_results_${DATE_PART}.csv"
-          aws s3 cp backtest_results.csv "s3://$R2_BUCKET/$KEY" --endpoint-url "$R2_ENDPOINT"
-          echo "Pushed backtest results to s3://$R2_BUCKET/$KEY"
+          aws s3 cp ml/backtest_v2_trades.csv "s3://$R2_BUCKET/$PREFIX/backtest_v2_trades_${DATE_PART}.csv" --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp ml/backtest_v2_folds.csv "s3://$R2_BUCKET/$PREFIX/backtest_v2_folds_${DATE_PART}.csv" --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp ml/backtest_v2_summary.csv "s3://$R2_BUCKET/$PREFIX/backtest_v2_summary_${DATE_PART}.csv" --endpoint-url "$R2_ENDPOINT"
+          echo "Pushed backtest v2 results to s3://$R2_BUCKET/$PREFIX/*_${DATE_PART}.csv"
