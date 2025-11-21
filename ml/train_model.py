@@ -13,6 +13,7 @@ from features import (
     flatten_5m_snapshots,
     add_model_features,
     add_multi_horizon_returns,
+    compute_return_scale,
     HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
 
@@ -34,6 +35,12 @@ DECAY_DAYS = 14
 # Economic parameters (must match score_latest.py and analyse_sigma_buckets.py)
 TAX_RATE = 0.02
 MARGIN = 0.002
+
+# Return scaling (volatility/tick) to stabilise micro-price tails
+USE_RETURN_SCALING = True
+TICK_SIZE = 1.0
+MIN_RETURN_SCALE = 1e-4
+MAX_RETURN_SCALE = 5.0
 
 # Feature columns for the regressors (built by add_model_features)
 FEATURE_COLS = [
@@ -193,6 +200,16 @@ def add_labels_and_weights(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["net_return"] = (1.0 + df["future_return"]) * (1.0 - TAX_RATE) - 1.0
     df["profit_ok"] = (df["net_return"] > MARGIN).astype(int)
 
+    if USE_RETURN_SCALING:
+        df["return_scale"] = compute_return_scale(
+            df,
+            tick_size=TICK_SIZE,
+            min_scale=MIN_RETURN_SCALE,
+            max_scale=MAX_RETURN_SCALE,
+        )
+    else:
+        df["return_scale"] = 1.0
+
     # Recency weights: exponential decay by age in days
     now_ts = df["timestamp"].max()
     age_days = (now_ts - df["timestamp"]).dt.total_seconds() / (3600 * 24)
@@ -229,6 +246,12 @@ def train_models(df: pd.DataFrame):
 
         X_reg = df_reg[FEATURE_COLS].values
         w_reg = df_reg["sample_weight"].values
+        scale_reg = df_reg["return_scale"].values.astype("float64")
+        scale_reg = np.where(
+            (np.isfinite(scale_reg)) & (scale_reg > 0.0),
+            scale_reg,
+            1.0,
+        )
 
         reg_models[regime_name] = {}
         sigma_main_regime = None
@@ -254,6 +277,8 @@ def train_models(df: pd.DataFrame):
 
             # Regime-specific clipping for robustness
             y_h_clipped = clip_returns_for_regime(y_h, regime_name)
+            scale_h = scale_reg[mask]
+            target = y_h_clipped[mask] / scale_h
 
             print(
                 f"[train] Regime {regime_name}: training regressor for {H}m on {n} samples."
@@ -268,13 +293,14 @@ def train_models(df: pd.DataFrame):
                 n_jobs=4,
                 tree_method="hist",
             )
-            reg.fit(X_reg[mask], y_h_clipped[mask], sample_weight=w_reg[mask])
+            reg.fit(X_reg[mask], target, sample_weight=w_reg[mask])
             reg_models[regime_name][H] = reg
 
             # After fitting the main horizon model, compute residual std for this regime
             if H == HORIZON_MINUTES:
                 y_true = y_h_clipped[mask]
-                y_pred = reg.predict(X_reg[mask])
+                y_pred_scaled = reg.predict(X_reg[mask])
+                y_pred = y_pred_scaled * scale_h
                 w_h = w_reg[mask]
 
                 if not np.any(np.isfinite(w_h)):
@@ -376,6 +402,12 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
         },
         "regime_defs": REGIME_DEFS,
         "generated_at_iso": now.isoformat(),
+        "return_scaling": {
+            "type": "volatility_tick" if USE_RETURN_SCALING else "none",
+            "tick_size": TICK_SIZE,
+            "min_scale": MIN_RETURN_SCALE,
+            "max_scale": MAX_RETURN_SCALE,
+        },
     }
 
     meta_bytes = json_bytes(meta)

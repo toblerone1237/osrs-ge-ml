@@ -127,6 +127,37 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_return_scale(
+    df: pd.DataFrame,
+    tick_size: float = 1.0,
+    min_scale: float = 1e-4,
+    max_scale: float = 5.0,
+    volatility_col: str = "volatility_60m",
+    mid_col: str = "mid_price",
+) -> pd.Series:
+    """
+    Build a per-row scaling factor for returns using recent volatility plus a tick floor.
+
+    This is used to train/predict in volatility units so microcap buckets (where 1 tick
+    is a huge %) cannot dominate the loss.
+    """
+    mid = df[mid_col].to_numpy(dtype="float64")
+    mid_safe = np.where(np.isfinite(mid) & (mid > 0), mid, tick_size)
+
+    vol = df.get(volatility_col)
+    if vol is None:
+        vol_arr = np.zeros_like(mid_safe)
+    else:
+        vol_arr = vol.to_numpy(dtype="float64")
+    vol_arr = np.where(np.isfinite(vol_arr), vol_arr, 0.0)
+
+    tick_pct = tick_size / np.maximum(mid_safe, tick_size)
+    scale = np.maximum(vol_arr, tick_pct)
+    scale = np.clip(scale, min_scale, max_scale)
+
+    return pd.Series(scale, index=df.index, name="return_scale")
+
+
 def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add all features used by the ML models (training & scoring).

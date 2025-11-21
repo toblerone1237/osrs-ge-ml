@@ -12,6 +12,7 @@ from features import (
     list_keys_with_prefix,
     flatten_5m_snapshots,
     add_model_features,
+    compute_return_scale,
     HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
 
@@ -280,6 +281,11 @@ def main():
 
     sigma_main_per_regime_meta = meta.get("sigma_main_per_regime")
     regime_defs_meta = meta.get("regime_defs")
+    return_scaling_cfg = meta.get("return_scaling") or {}
+    use_return_scaling = return_scaling_cfg.get("type") == "volatility_tick"
+    tick_size = float(return_scaling_cfg.get("tick_size", 1.0))
+    min_return_scale = float(return_scaling_cfg.get("min_scale", 1e-4))
+    max_return_scale = float(return_scaling_cfg.get("max_scale", 5.0))
 
     # Normalise model structure to: regime -> horizon -> regressor
     if not reg_models_raw:
@@ -318,6 +324,16 @@ def main():
 
     df = df_raw.merge(df_active[["item_id"]], on="item_id", how="inner")
 
+    if use_return_scaling:
+        df["return_scale"] = compute_return_scale(
+            df,
+            tick_size=tick_size,
+            min_scale=min_return_scale,
+            max_scale=max_return_scale,
+        )
+    else:
+        df["return_scale"] = 1.0
+
     # Assign regimes based on current mid_price
     df["regime"] = df["mid_price"].apply(
         lambda p: assign_regime_for_price(p, regime_defs)
@@ -346,7 +362,11 @@ def main():
             if not mask.any():
                 continue
             X_reg = df.loc[mask, feature_cols].values
-            preds_all[mask.values] = reg_h.predict(X_reg)
+            preds = reg_h.predict(X_reg)
+            if use_return_scaling:
+                scale_vec = df.loc[mask, "return_scale"].to_numpy(dtype="float64")
+                preds = preds * scale_vec
+            preds_all[mask.values] = preds
         path_results[H] = preds_all
         print(f"[score] Predicting horizon {H}m for {n_rows} rows (all regimes).")
 
