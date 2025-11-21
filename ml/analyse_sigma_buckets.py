@@ -13,6 +13,7 @@ from features import (
     flatten_5m_snapshots,
     add_model_features,
     add_multi_horizon_returns,
+    compute_return_scale,
     HORIZONS_MINUTES,
 )
 
@@ -142,6 +143,7 @@ def load_latest_regressor(s3, bucket: str):
       - sigma_main_per_regime: dict[regime_name] -> float
       - feature_cols: list of feature columns
       - regime_defs: dict used for regime assignment
+      - return_scaling_cfg: dict describing return scaling (if any)
     """
     key_reg = "models/quantile/latest_reg.pkl"
     key_meta = "models/quantile/latest_meta.json"
@@ -155,6 +157,7 @@ def load_latest_regressor(s3, bucket: str):
     sigma_main_global = float(meta.get("sigma_main", 0.02))
     sigma_main_per_regime_meta = meta.get("sigma_main_per_regime")
     regime_defs_meta = meta.get("regime_defs")
+    return_scaling_cfg = meta.get("return_scaling") or {}
     feature_cols = meta.get(
         "feature_cols",
         ["mid_price", "spread_pct", "log_volume_5m"],
@@ -194,7 +197,7 @@ def load_latest_regressor(s3, bucket: str):
                 regime_name: sigma_main_global for regime_name in reg_main_map.keys()
             }
 
-    return reg_main_map, sigma_main_per_regime, feature_cols, regime_defs
+    return reg_main_map, sigma_main_per_regime, feature_cols, regime_defs, return_scaling_cfg
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
@@ -214,6 +217,7 @@ def add_predictions_and_residuals(
     sigma_main_per_regime: dict,
     feature_cols,
     regime_defs,
+    use_return_scaling: bool,
 ) -> pd.DataFrame:
     """
     Given a dataframe with features and future_return, add:
@@ -243,7 +247,12 @@ def add_predictions_and_residuals(
         if not mask.any():
             continue
         X_reg = X_all[mask.values]
-        y_hat = reg.predict(X_reg)
+        y_hat_scaled = reg.predict(X_reg)
+        if use_return_scaling:
+            scale_vec = df.loc[mask, "return_scale"].to_numpy(dtype="float64")
+            y_hat = y_hat_scaled * scale_vec
+        else:
+            y_hat = y_hat_scaled
         future_return_hat[mask.values] = y_hat
 
         sigma = sigma_main_per_regime.get(regime_name)
@@ -530,16 +539,49 @@ def main():
         return
 
     # 2) Load regressors and meta
-    reg_main_map, sigma_main_per_regime, feature_cols, regime_defs = load_latest_regressor(s3, bucket)
+    reg_main_map, sigma_main_per_regime, feature_cols, regime_defs, return_scaling_cfg = load_latest_regressor(s3, bucket)
     print(f"[main] Loaded main-horizon regressors for regimes: {list(reg_main_map.keys())}")
     print(f"[main] sigma_main_per_regime: {sigma_main_per_regime}")
     print(f"[main] Using {len(feature_cols)} features:", feature_cols)
+    use_return_scaling = (return_scaling_cfg.get("type") == "volatility_tick")
+    tick_size = float(return_scaling_cfg.get("tick_size", 1.0))
+    min_scale = float(return_scaling_cfg.get("min_scale", 1e-4))
+    max_scale = float(return_scaling_cfg.get("max_scale", 5.0))
+    if use_return_scaling:
+        df["return_scale"] = compute_return_scale(
+            df,
+            tick_size=tick_size,
+            min_scale=min_scale,
+            max_scale=max_scale,
+        )
+    else:
+        df["return_scale"] = 1.0
 
     # 3) Add predictions, residuals, Win%, regimes
-    df = add_predictions_and_residuals(df, reg_main_map, sigma_main_per_regime, feature_cols, regime_defs)
+    df = add_predictions_and_residuals(
+        df,
+        reg_main_map,
+        sigma_main_per_regime,
+        feature_cols,
+        regime_defs,
+        use_return_scaling,
+    )
 
     # 4) Add bins (time, price, Win%, predicted return)
     df = add_bins(df)
+
+    # 4b) Quick diagnostics: scaling and volatility in the late-day high-return hotspot
+    hotspot_mask = (df["time_bin"] == "20-24") & (df["pred_ret_bin"] == ">20%")
+    hotspot = df.loc[hotspot_mask, ["return_scale", "volatility_60m"]]
+    if not hotspot.empty:
+        qs = [1, 5, 25, 50, 75, 95, 99]
+        def fmt(series):
+            return {f"p{q}": float(np.percentile(series, q)) for q in qs}
+        print("[diag] Hotspot rows (time 20-24 & pred_ret_bin >20%):", len(hotspot))
+        print("[diag] return_scale percentiles:", fmt(hotspot["return_scale"]))
+        print("[diag] volatility_60m percentiles:", fmt(hotspot["volatility_60m"].replace([np.inf, -np.inf], np.nan).fillna(0.0)))
+    else:
+        print("[diag] No rows in hotspot (time 20-24 & pred_ret_bin >20%).")
 
     # 5) Compute bucket sigmas
     df_buckets = compute_bucket_sigmas(df)
