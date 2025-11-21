@@ -312,7 +312,12 @@ def train_models(df: pd.DataFrame):
                 # Normalise weights to avoid numerical issues
                 w_h_norm = w_h / np.mean(w_h)
 
-                resid = y_true - y_pred
+                # Consistently trimmed arrays for sigma/calibration
+                y_true_use = y_true
+                y_pred_use = y_pred
+                w_use = w_h_norm
+
+                resid = y_true_use - y_pred_use
 
                 # Trim 5–95% quantiles to avoid a few extreme outliers
                 if resid.size >= 20:
@@ -321,22 +326,24 @@ def train_models(df: pd.DataFrame):
                     keep = (resid >= lo) & (resid <= hi)
                     if keep.sum() >= 5:
                         resid = resid[keep]
-                        w_h_norm = w_h_norm[keep]
+                        y_true_use = y_true_use[keep]
+                        y_pred_use = y_pred_use[keep]
+                        w_use = w_use[keep]
 
-                mse = np.average(resid ** 2, weights=w_h_norm)
+                mse = np.average(resid ** 2, weights=w_use)
                 sigma = float(np.sqrt(mse))
                 sigma_main_regime = max(sigma, 1e-8)  # avoid degenerate zero
 
                 # Simple weighted linear calibration y_true ≈ slope * y_pred + intercept
-                x = y_pred
-                x_bar = np.average(x, weights=w_h_norm)
-                y_bar = np.average(y_true, weights=w_h_norm)
-                var_x = np.average((x - x_bar) ** 2, weights=w_h_norm)
+                x = y_pred_use
+                x_bar = np.average(x, weights=w_use)
+                y_bar = np.average(y_true_use, weights=w_use)
+                var_x = np.average((x - x_bar) ** 2, weights=w_use)
                 if var_x < 1e-12:
                     slope = 1.0
                     intercept = 0.0
                 else:
-                    cov_xy = np.average((x - x_bar) * (y_true - y_bar), weights=w_h_norm)
+                    cov_xy = np.average((x - x_bar) * (y_true_use - y_bar), weights=w_use)
                     slope = cov_xy / var_x
                     intercept = y_bar - slope * x_bar
                 calib_main_regime = {"slope": float(slope), "intercept": float(intercept)}
