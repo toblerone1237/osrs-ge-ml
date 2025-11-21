@@ -45,6 +45,31 @@ REGIME_DEFS_DEFAULT = {
 
 
 # ---------------------------------------------------------------------------
+# Branch / prefix helpers
+# ---------------------------------------------------------------------------
+
+def resolve_model_prefix():
+    """
+    Decide which model prefix to load from, allowing env overrides and
+    branch-based selection for consistency with the sigma upload prefix.
+    Defaults to the current experiment (quantile on main).
+    """
+    override = os.environ.get("SIGMA_MODEL_PREFIX") or os.environ.get("MODEL_PREFIX")
+    if override:
+        return override.rstrip("/")
+
+    branch = os.environ.get("GITHUB_REF_NAME", "").lower()
+    if "remove-noisy-sections" in branch:
+        return "models/remove-noisy-sections/xgb"
+    if "quantile" in branch:
+        return "models/quantile"
+
+    if EXPERIMENT:
+        return f"models/{EXPERIMENT}"
+    return "models/quantile"
+
+
+# ---------------------------------------------------------------------------
 # Helpers to load data and models
 # ---------------------------------------------------------------------------
 
@@ -145,8 +170,9 @@ def load_latest_regressor(s3, bucket: str):
       - regime_defs: dict used for regime assignment
       - return_scaling_cfg: dict describing return scaling (if any)
     """
-    key_reg = "models/quantile/latest_reg.pkl"
-    key_meta = "models/quantile/latest_meta.json"
+    prefix = resolve_model_prefix()
+    key_reg = f"{prefix}/latest_reg.pkl"
+    key_meta = f"{prefix}/latest_meta.json"
 
     obj_reg = s3.get_object(Bucket=bucket, Key=key_reg)
     obj_meta = s3.get_object(Bucket=bucket, Key=key_meta)
