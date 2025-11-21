@@ -181,13 +181,13 @@ def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
     Add all features used by the ML models (training & scoring).
 
     This builds on add_basic_features and then adds:
-      - Lagged returns: ret_5m_past, ret_15m_past, ret_60m_past
-      - Volatility over last 60m: volatility_60m (std of 5m returns)
-      - Rolling 60m volume and relative volume:
-            rolling_volume_60m, log_rolling_volume_60m,
-            volume_ratio_5m_to_60m
-      - Time-of-day and day-of-week encodings:
-            hour_sin, hour_cos, dow_sin, dow_cos
+      - Price/volume basics: mid_price, spread (+ pct), raw high/low prices
+      - Lagged returns: 5m/10m/15m/30m/60m
+      - Volatility: 30m + 60m (std and MAD)
+      - Rolling volume + ratios: 30m/60m sums, z-score, imbalance
+      - Spread posture: spread_pct vs 60m median
+      - Price posture: z-score and distance to 60m high/low
+      - Time encodings: hour/dow sin-cos
     """
     df = add_basic_features(df)
     df = df.dropna(subset=["mid_price"]).copy()
@@ -197,39 +197,137 @@ def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
     # Group by item for lag/rolling features
     grp_mid = df.groupby("item_id", sort=False)["mid_price"]
     grp_vol = df.groupby("item_id", sort=False)["total_volume_5m"]
+    grp_spread_pct = df.groupby("item_id", sort=False)["spread_pct"]
 
     # Past returns (assuming 5m spacing between rows within an item series)
     df["ret_5m_past"] = grp_mid.pct_change(periods=1)
+    df["ret_10m_past"] = grp_mid.pct_change(periods=2)
     df["ret_15m_past"] = grp_mid.pct_change(periods=3)
+    df["ret_30m_past"] = grp_mid.pct_change(periods=6)
     df["ret_60m_past"] = grp_mid.pct_change(periods=12)
 
-    # 60m volatility of 5m returns
+    # Volatility of 5m returns on short/long windows
     grp_ret5 = df.groupby("item_id", sort=False)["ret_5m_past"]
+    roll_ret_30m = grp_ret5.rolling(window=6, min_periods=2)
+    roll_ret_60m = grp_ret5.rolling(window=12, min_periods=2)
+
+    df["volatility_30m"] = (
+        roll_ret_30m.std().reset_index(level=0, drop=True)
+    )
+    mad_rolling_30 = (
+        roll_ret_30m.apply(
+            lambda x: np.median(np.abs(x - np.median(x))), raw=False
+        ).reset_index(level=0, drop=True)
+    )
+    df["volatility_30m_mad"] = 1.4826 * mad_rolling_30
+
     df["volatility_60m"] = (
-        grp_ret5.rolling(window=12, min_periods=2)
-        .std()
-        .reset_index(level=0, drop=True)
+        roll_ret_60m.std().reset_index(level=0, drop=True)
     )
     # Robust (MAD-based) 60m volatility to handle flat/zero-return windows
     mad_rolling = (
-        grp_ret5.rolling(window=12, min_periods=2)
-        .apply(lambda x: np.median(np.abs(x - np.median(x))), raw=False)
-        .reset_index(level=0, drop=True)
+        roll_ret_60m.apply(
+            lambda x: np.median(np.abs(x - np.median(x))), raw=False
+        ).reset_index(level=0, drop=True)
     )
     df["volatility_60m_mad"] = 1.4826 * mad_rolling
 
-    # Rolling 60m volume (sum of 12 buckets)
+    # Rolling volume windows (30m/60m)
+    rolling_vol_30m = (
+        grp_vol.rolling(window=6, min_periods=1)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
     rolling_vol_60m = (
         grp_vol.rolling(window=12, min_periods=1)
         .sum()
         .reset_index(level=0, drop=True)
     )
+    df["rolling_volume_30m"] = rolling_vol_30m
+    df["log_rolling_volume_30m"] = np.log1p(rolling_vol_30m)
+
     df["rolling_volume_60m"] = rolling_vol_60m
     df["log_rolling_volume_60m"] = np.log1p(rolling_vol_60m)
 
     # Relative volume: current 5m vs average over last 60m
+    avg_vol_30m = rolling_vol_30m / 6.0
     avg_vol_60m = rolling_vol_60m / 12.0
+    df["volume_ratio_5m_to_30m"] = df["total_volume_5m"] / (1.0 + avg_vol_30m)
     df["volume_ratio_5m_to_60m"] = df["total_volume_5m"] / (1.0 + avg_vol_60m)
+
+    # Volume z-score (vs 60m mean/std)
+    rolling_vol_mean_60m = (
+        grp_vol.rolling(window=12, min_periods=2)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    rolling_vol_std_60m = (
+        grp_vol.rolling(window=12, min_periods=2)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+    df["volume_zscore_60m"] = (df["total_volume_5m"] - rolling_vol_mean_60m) / (
+        1.0 + rolling_vol_std_60m
+    )
+
+    # Volume imbalance (side vols) and rolling imbalance posture
+    df["volume_imbalance"] = (
+        df["high_volume"].fillna(0.0) - df["low_volume"].fillna(0.0)
+    )
+    df["volume_imbalance_ratio"] = df["volume_imbalance"] / (
+        df["total_volume_5m"] + 1.0
+    )
+    grp_imb = df.groupby("item_id", sort=False)["volume_imbalance"]
+    rolling_imbalance_60m = (
+        grp_imb.rolling(window=12, min_periods=1)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
+    df["rolling_volume_imbalance_60m"] = rolling_imbalance_60m
+    df["volume_imbalance_ratio_60m"] = rolling_imbalance_60m / (
+        1.0 + rolling_vol_60m
+    )
+
+    # Spread posture vs recent median
+    spread_pct_median_60m = (
+        grp_spread_pct.rolling(window=12, min_periods=1)
+        .median()
+        .reset_index(level=0, drop=True)
+    )
+    df["spread_pct_median_60m"] = spread_pct_median_60m
+    df["spread_pct_delta_from_median_60m"] = (
+        df["spread_pct"] - spread_pct_median_60m
+    )
+
+    # Price posture vs trailing distribution
+    rolling_mid_mean_60m = (
+        grp_mid.rolling(window=12, min_periods=2)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    rolling_mid_std_60m = (
+        grp_mid.rolling(window=12, min_periods=2)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+    df["price_zscore_60m"] = (df["mid_price"] - rolling_mid_mean_60m) / (
+        1e-9 + rolling_mid_std_60m
+    )
+
+    rolling_mid_max_60m = (
+        grp_mid.rolling(window=12, min_periods=2)
+        .max()
+        .reset_index(level=0, drop=True)
+    )
+    rolling_mid_min_60m = (
+        grp_mid.rolling(window=12, min_periods=2)
+        .min()
+        .reset_index(level=0, drop=True)
+    )
+    max_safe = rolling_mid_max_60m.replace(0, np.nan)
+    min_safe = rolling_mid_min_60m.replace(0, np.nan)
+    df["pct_from_60m_high"] = df["mid_price"] / max_safe - 1.0
+    df["pct_from_60m_low"] = df["mid_price"] / min_safe - 1.0
 
     # Time-of-day / day-of-week encodings
     ts = df["timestamp"]
@@ -250,13 +348,30 @@ def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
     # Clean up NaNs / infs in derived features (leave mid_price, etc. as-is)
     derived_cols = [
         "ret_5m_past",
+        "ret_10m_past",
         "ret_15m_past",
+        "ret_30m_past",
         "ret_60m_past",
+        "volatility_30m",
+        "volatility_30m_mad",
         "volatility_60m",
         "volatility_60m_mad",
+        "rolling_volume_30m",
+        "log_rolling_volume_30m",
         "rolling_volume_60m",
         "log_rolling_volume_60m",
+        "volume_ratio_5m_to_30m",
         "volume_ratio_5m_to_60m",
+        "volume_zscore_60m",
+        "volume_imbalance",
+        "volume_imbalance_ratio",
+        "rolling_volume_imbalance_60m",
+        "volume_imbalance_ratio_60m",
+        "spread_pct_median_60m",
+        "spread_pct_delta_from_median_60m",
+        "price_zscore_60m",
+        "pct_from_60m_high",
+        "pct_from_60m_low",
         "hour_sin",
         "hour_cos",
         "dow_sin",
