@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import erf, sqrt
 from typing import List, Tuple
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,7 @@ REGIME_CLIPPING = {
     "mid": {"min": -0.60, "max": 0.60},
     "low": {"min": -0.80, "max": 0.80},
 }
+OUTPUT_DIR = Path(__file__).parent
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
@@ -442,15 +444,19 @@ def run_backtest(params):
         .reset_index()
     )
 
-    trades_df.to_csv("backtest_v2_trades.csv", index=False)
-    summaries_df.to_csv("backtest_v2_folds.csv", index=False)
-    agg.to_csv("backtest_v2_summary.csv", index=False)
+    out_trades = OUTPUT_DIR / "backtest_v2_trades.csv"
+    out_folds = OUTPUT_DIR / "backtest_v2_folds.csv"
+    out_summary = OUTPUT_DIR / "backtest_v2_summary.csv"
+
+    trades_df.to_csv(out_trades, index=False)
+    summaries_df.to_csv(out_folds, index=False)
+    agg.to_csv(out_summary, index=False)
 
     print("Fold-level summary:")
     print(summaries_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print("\nAggregate by policy/slippage:")
     print(agg.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-    print("\nWrote backtest_v2_trades.csv, backtest_v2_folds.csv, backtest_v2_summary.csv")
+    print(f"\nWrote backtest outputs to {OUTPUT_DIR} (trades/folds/summary)")
 
 
 def parse_args():
