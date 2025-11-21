@@ -2,22 +2,26 @@ name: Backtest
 
 on:
   workflow_dispatch:
-    inputs:
-      train_end_iso:
-        description: "Training cutoff ISO8601 (e.g., 2025-02-01T12:00:00Z). Must be at least 60m before backtest_start."
-        required: true
-      backtest_start:
-        description: "Backtest start date (YYYY-MM-DD, inclusive)"
-        required: true
-      backtest_end:
-        description: "Backtest end date (YYYY-MM-DD, inclusive; at least 60m before latest data)"
-        required: true
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute time windows
+        id: times
+        run: |
+          TRAIN_END_ISO=$(date -u -d '90 minutes ago' --iso-8601=seconds)
+          # backtest window: last 14 full days ending today-minus-60m (date-based)
+          BACKTEST_END=$(date -u -d '60 minutes ago' +%Y-%m-%d)
+          BACKTEST_START=$(date -u -d '14 days ago' +%Y-%m-%d)
+          echo "TRAIN_END_ISO=$TRAIN_END_ISO" >> $GITHUB_ENV
+          echo "BACKTEST_START=$BACKTEST_START" >> $GITHUB_ENV
+          echo "BACKTEST_END=$BACKTEST_END" >> $GITHUB_ENV
+          echo "train_end_iso=$TRAIN_END_ISO"
+          echo "backtest_start=$BACKTEST_START"
+          echo "backtest_end=$BACKTEST_END"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,7 +37,7 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          TRAIN_END_ISO: ${{ github.event.inputs.train_end_iso }}
+          TRAIN_END_ISO: ${{ env.TRAIN_END_ISO }}
         run: |
           python ml/train_model.py
 
@@ -45,8 +49,8 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           python ml/backtest.py \
-            --start-date "${{ github.event.inputs.backtest_start }}" \
-            --end-date "${{ github.event.inputs.backtest_end }}"
+            --start-date "${{ env.BACKTEST_START }}" \
+            --end-date "${{ env.BACKTEST_END }}"
 
       - name: Upload backtest results
         uses: actions/upload-artifact@v4
