@@ -2,12 +2,18 @@ name: Backtest
 
 on:
   workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch or tag to run from (defaults to triggering ref)"
+        required: false
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_ref || github.ref }}
 
       - name: Compute time windows
         id: times
