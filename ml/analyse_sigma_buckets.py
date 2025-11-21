@@ -144,6 +144,7 @@ def load_latest_regressor(s3, bucket: str):
       - feature_cols: list of feature columns
       - regime_defs: dict used for regime assignment
       - return_scaling_cfg: dict describing return scaling (if any)
+      - calibration_main_per_regime: dict describing per-regime calibration (if any)
     """
     key_reg = "models/quantile/latest_reg.pkl"
     key_meta = "models/quantile/latest_meta.json"
@@ -158,6 +159,7 @@ def load_latest_regressor(s3, bucket: str):
     sigma_main_per_regime_meta = meta.get("sigma_main_per_regime")
     regime_defs_meta = meta.get("regime_defs")
     return_scaling_cfg = meta.get("return_scaling") or {}
+    calibration_main_per_regime = meta.get("calibration_main_per_regime") or {}
     feature_cols = meta.get(
         "feature_cols",
         ["mid_price", "spread_pct", "log_volume_5m"],
@@ -197,7 +199,14 @@ def load_latest_regressor(s3, bucket: str):
                 regime_name: sigma_main_global for regime_name in reg_main_map.keys()
             }
 
-    return reg_main_map, sigma_main_per_regime, feature_cols, regime_defs, return_scaling_cfg
+    return (
+        reg_main_map,
+        sigma_main_per_regime,
+        feature_cols,
+        regime_defs,
+        return_scaling_cfg,
+        calibration_main_per_regime,
+    )
 
 
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
@@ -216,6 +225,7 @@ def add_predictions_and_residuals(
     feature_cols,
     regime_defs,
     use_return_scaling: bool,
+    calibration_main_per_regime: dict,
 ) -> pd.DataFrame:
     """
     Given a dataframe with features and UNCLIPPED future_return, add:
@@ -251,6 +261,8 @@ def add_predictions_and_residuals(
             y_hat = y_hat_scaled * scale_vec
         else:
             y_hat = y_hat_scaled
+        calib = calibration_main_per_regime.get(regime_name, {"slope": 1.0, "intercept": 0.0})
+        y_hat = float(calib.get("slope", 1.0)) * y_hat + float(calib.get("intercept", 0.0))
         future_return_hat[mask.values] = y_hat
 
         sigma = sigma_main_per_regime.get(regime_name)
@@ -508,13 +520,20 @@ def main():
         return
 
     # 2) Load regressors and meta
-    reg_main_map, sigma_main_per_regime, feature_cols, regime_defs, return_scaling_cfg = load_latest_regressor(s3, bucket)
+    (
+        reg_main_map,
+        sigma_main_per_regime,
+        feature_cols,
+        regime_defs,
+        return_scaling_cfg,
+        calibration_main_per_regime,
+    ) = load_latest_regressor(s3, bucket)
     print(f"[main] Loaded main-horizon regressors for regimes: {list(reg_main_map.keys())}")
     print(f"[main] sigma_main_per_regime: {sigma_main_per_regime}")
     print(f"[main] Using {len(feature_cols)} features:", feature_cols)
     use_return_scaling = (return_scaling_cfg.get("type") == "volatility_tick")
     tick_size = float(return_scaling_cfg.get("tick_size", 1.0))
-    min_scale = float(return_scaling_cfg.get("min_scale", 1e-4))
+    min_scale = float(return_scaling_cfg.get("min_scale", 1e-3))
     max_scale = float(return_scaling_cfg.get("max_scale", 5.0))
     if use_return_scaling:
         df["return_scale"] = compute_return_scale(
@@ -534,6 +553,7 @@ def main():
         feature_cols,
         regime_defs,
         use_return_scaling,
+        calibration_main_per_regime,
     )
 
     # 4) Add bins (time, price, Win%, predicted return)

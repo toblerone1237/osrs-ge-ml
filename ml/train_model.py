@@ -88,7 +88,7 @@ REGIME_DEFS = {
 REGIME_CLIPPING = {
     "high": {"min": -0.40, "max": 0.40},   # ±40%
     "mid":  {"min": -0.60, "max": 0.60},   # ±60%
-    "low":  {"min": -1.50, "max": 1.50},   # ±150%
+    "low":  {"min": -0.80, "max": 0.80},   # ±80% (tighter to curb tail bias)
 }
 
 
@@ -231,12 +231,14 @@ def train_models(df: pd.DataFrame):
       - reg_models: dict[regime_name][horizon_minutes] -> XGBRegressor
       - sigma_main_per_regime: dict[regime_name] -> float residual std at main horizon
       - feature_cols: the list of feature column names used
+      - calibration_main_per_regime: dict[regime_name] -> {"slope": float, "intercept": float}
     """
     df = df.copy()
     df["regime"] = df["mid_price"].apply(assign_regime_for_price)
 
     reg_models = {}
     sigma_main_per_regime = {}
+    calibration_main_per_regime = {}
 
     for regime_name in REGIME_DEFS.keys():
         df_reg = df[df["regime"] == regime_name].copy()
@@ -255,6 +257,7 @@ def train_models(df: pd.DataFrame):
 
         reg_models[regime_name] = {}
         sigma_main_regime = None
+        calib_main_regime = None
 
         for H in HORIZONS_MINUTES:
             col = f"ret_{H}m"
@@ -324,6 +327,20 @@ def train_models(df: pd.DataFrame):
                 sigma = float(np.sqrt(mse))
                 sigma_main_regime = max(sigma, 1e-8)  # avoid degenerate zero
 
+                # Simple weighted linear calibration y_true ≈ slope * y_pred + intercept
+                x = y_pred
+                x_bar = np.average(x, weights=w_h_norm)
+                y_bar = np.average(y_true, weights=w_h_norm)
+                var_x = np.average((x - x_bar) ** 2, weights=w_h_norm)
+                if var_x < 1e-12:
+                    slope = 1.0
+                    intercept = 0.0
+                else:
+                    cov_xy = np.average((x - x_bar) * (y_true - y_bar), weights=w_h_norm)
+                    slope = cov_xy / var_x
+                    intercept = y_bar - slope * x_bar
+                calib_main_regime = {"slope": float(slope), "intercept": float(intercept)}
+
         if not reg_models[regime_name]:
             print(f"[train] Regime {regime_name}: no models trained, dropping regime.")
             reg_models.pop(regime_name, None)
@@ -336,13 +353,14 @@ def train_models(df: pd.DataFrame):
             )
 
         sigma_main_per_regime[regime_name] = sigma_main_regime
+        calibration_main_per_regime[regime_name] = calib_main_regime or {"slope": 1.0, "intercept": 0.0}
 
     if not reg_models:
         raise RuntimeError(
             "No regression models were trained for any regime/horizon."
         )
 
-    return reg_models, sigma_main_per_regime, FEATURE_COLS
+    return reg_models, sigma_main_per_regime, FEATURE_COLS, calibration_main_per_regime
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +368,7 @@ def train_models(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 
-def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
+def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols, calibration_main_per_regime):
     """
     Save:
       - reg_models (dict: regime -> horizon -> regressor) as latest_reg.pkl
@@ -400,6 +418,7 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
         "sigma_main_per_regime": {
             k: float(v) for k, v in sigma_main_per_regime.items()
         },
+        "calibration_main_per_regime": calibration_main_per_regime,
         "regime_defs": REGIME_DEFS,
         "generated_at_iso": now.isoformat(),
         "return_scaling": {
@@ -444,12 +463,17 @@ def main():
         print("No rows after labels/weights.")
         return
 
-    reg_models, sigma_main_per_regime, feature_cols = train_models(df)
-    save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols)
+    reg_models, sigma_main_per_regime, feature_cols, calibration_main_per_regime = train_models(df)
+    save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols, calibration_main_per_regime)
     print("Training complete.")
     print("Main-horizon residual sigma by regime:")
     for name, sigma in sigma_main_per_regime.items():
         print(f"  - {name}: {sigma:.6f}")
+    print("Calibration (slope, intercept) by regime:")
+    for name, params in calibration_main_per_regime.items():
+        slope = params.get("slope", 1.0)
+        intercept = params.get("intercept", 0.0)
+        print(f"  - {name}: slope={slope:.4f}, intercept={intercept:.4f}")
 
 
 if __name__ == "__main__":

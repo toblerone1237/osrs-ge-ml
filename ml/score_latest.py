@@ -286,6 +286,7 @@ def main():
     tick_size = float(return_scaling_cfg.get("tick_size", 1.0))
     min_return_scale = float(return_scaling_cfg.get("min_scale", 1e-3))
     max_return_scale = float(return_scaling_cfg.get("max_scale", 5.0))
+    calibration_main_per_regime = meta.get("calibration_main_per_regime") or {}
 
     # Normalise model structure to: regime -> horizon -> regressor
     if not reg_models_raw:
@@ -373,7 +374,17 @@ def main():
     # Main horizon predictions
     if horizon_minutes not in path_results:
         raise RuntimeError(f"Missing regressor for main horizon {horizon_minutes}m.")
-    df["future_return_hat"] = path_results[horizon_minutes]
+    main_preds = path_results[horizon_minutes].copy()
+    # Apply per-regime calibration if available
+    for regime_name in reg_models.keys():
+        mask = df["regime"] == regime_name
+        if not mask.any():
+            continue
+        calib = calibration_main_per_regime.get(regime_name, {"slope": 1.0, "intercept": 0.0})
+        slope = float(calib.get("slope", 1.0))
+        intercept = float(calib.get("intercept", 0.0))
+        main_preds[mask.values] = slope * main_preds[mask.values] + intercept
+    df["future_return_hat"] = main_preds
 
     # Net return and expected profit
     df["net_return_hat"] = (1.0 + df["future_return_hat"]) * (1.0 - tax_rate) - 1.0
@@ -408,6 +419,10 @@ def main():
     path_rows = []
     for _, r in last_per_item.iterrows():
         item_id = r["item_id"]
+        regime_name = r["regime"]
+        calib = calibration_main_per_regime.get(regime_name, {"slope": 1.0, "intercept": 0.0})
+        slope = float(calib.get("slope", 1.0))
+        intercept = float(calib.get("intercept", 0.0))
         row_path = []
         # Find the last index for this item in df
         mask = (df["item_id"] == item_id)
@@ -417,6 +432,8 @@ def main():
             if preds_h is None:
                 continue
             ret_hat = preds_h[row_idx]
+            if h == horizon_minutes:
+                ret_hat = slope * ret_hat + intercept
             row_path.append({"minutes": int(h), "future_return_hat": float(ret_hat)})
         path_rows.append(row_path)
 
