@@ -21,6 +21,8 @@ SNAPSHOT_FETCH_WORKERS = int(os.environ.get("SNAPSHOT_FETCH_WORKERS", "8"))
 
 # Metadata key to track the last processed snapshot
 HISTORY_META_KEY = "history/_meta.json"
+HISTORY_FETCH_WORKERS = int(os.environ.get("HISTORY_FETCH_WORKERS", "16"))
+HISTORY_WRITE_WORKERS = int(os.environ.get("HISTORY_WRITE_WORKERS", "16"))
 
 
 def parse_iso_to_unix(ts_iso: str) -> int | None:
@@ -86,7 +88,7 @@ def load_existing_histories(s3, bucket: str, cutoff_oldest_unix: int, cutoff_rec
         except Exception:
             return key, None
 
-    with ThreadPoolExecutor(max_workers=SNAPSHOT_FETCH_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=HISTORY_FETCH_WORKERS) as pool:
         futures = [pool.submit(load_one, key) for key in history_keys]
         for idx, fut in enumerate(as_completed(futures), start=1):
             key, data = fut.result()
@@ -232,7 +234,7 @@ def write_histories(
     all_item_ids = set(older_buckets.keys()) | set(recent_points.keys()) | set(stored_pairs.keys())
     print("Building histories for", len(all_item_ids), "items.")
 
-    written = 0
+    to_write = []
     skipped = 0
 
     for item_id in sorted(all_item_ids):
@@ -272,33 +274,44 @@ def write_histories(
             skipped += 1
             continue
 
-        history_entries = []
-        for ts, price in new_pairs:
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            iso = dt.isoformat().replace("+00:00", "Z")
-            history_entries.append(
-                {
-                    "timestamp_iso": iso,
-                    "price": float(price),
-                }
+        to_write.append((item_id, new_pairs))
+
+    written = 0
+    if to_write:
+        def write_one(item_id, pairs):
+            history_entries = []
+            for ts, price in pairs:
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                iso = dt.isoformat().replace("+00:00", "Z")
+                history_entries.append(
+                    {
+                        "timestamp_iso": iso,
+                        "price": float(price),
+                    }
+                )
+
+            out = {
+                "item_id": int(item_id),
+                "history": history_entries,
+            }
+            body = json.dumps(out).encode("utf-8")
+            key = f"history/{int(item_id)}.json"
+
+            s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
             )
+            return item_id
 
-        out = {
-            "item_id": int(item_id),
-            "history": history_entries,
-        }
-        body = json.dumps(out).encode("utf-8")
-        key = f"history/{int(item_id)}.json"
-
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=body,
-            ContentType="application/json",
-        )
-        written += 1
-        if written % 200 == 0:
-            print(f"... wrote history for {written} items so far")
+        with ThreadPoolExecutor(max_workers=HISTORY_WRITE_WORKERS) as pool:
+            futures = [pool.submit(write_one, item_id, pairs) for item_id, pairs in to_write]
+            for fut in as_completed(futures):
+                fut.result()
+                written += 1
+                if written % 200 == 0:
+                    print(f"... wrote history for {written} items so far")
 
     print(f"Done. Wrote history for {written} items. Skipped {skipped} unchanged files.")
 
