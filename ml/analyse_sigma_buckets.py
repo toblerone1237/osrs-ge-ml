@@ -36,6 +36,10 @@ DECAY_DAYS = 14
 # Minimum rows for a bucket combination to be included in the detailed output
 MIN_ROWS_PER_BUCKET = 100
 
+# Controls for permutation importance (kept modest to avoid huge runtime)
+PERMUTATION_SAMPLE_ROWS = int(os.environ.get("PERMUTATION_SAMPLE_ROWS", "8000"))
+PERMUTATION_RANDOM_SEED = int(os.environ.get("PERMUTATION_RANDOM_SEED", "1337"))
+
 # Default regime definitions (used if meta has none)
 REGIME_DEFS_DEFAULT = {
     "low":  {"mid_price_min": 0,       "mid_price_max": 10_000},
@@ -212,10 +216,320 @@ def load_latest_regressor(s3, bucket: str):
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
     def _cdf_scalar(x):
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
-    return np.vectorize(_cdf_scalar, otypes=[float])(z)
 
     vec = np.vectorize(_cdf_scalar, otypes=[float])
     return vec(z)
+
+
+# ---------------------------------------------------------------------------
+# Metrics helpers
+# ---------------------------------------------------------------------------
+
+def _safe_weights(w: np.ndarray, n: int) -> np.ndarray:
+    if w is None:
+        return np.ones(n, dtype="float64")
+    w = np.asarray(w, dtype="float64")
+    if w.shape[0] != n:
+        return np.ones(n, dtype="float64")
+    w = np.where(np.isfinite(w) & (w > 0.0), w, 0.0)
+    if not np.any(w):
+        w = np.ones(n, dtype="float64")
+    # normalise to keep scales comparable
+    return w / np.mean(w)
+
+
+def weighted_mean(x: np.ndarray, w: np.ndarray) -> float:
+    w = _safe_weights(w, len(x))
+    x = np.asarray(x, dtype="float64")
+    mask = np.isfinite(x)
+    if not np.any(mask):
+        return float("nan")
+    return float(np.average(x[mask], weights=w[mask]))
+
+
+def weighted_mse(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray) -> float:
+    w = _safe_weights(w, len(y_true))
+    err = y_true - y_pred
+    err = np.where(np.isfinite(err), err, 0.0)
+    return float(np.average(err ** 2, weights=w))
+
+
+def weighted_mae(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray) -> float:
+    w = _safe_weights(w, len(y_true))
+    err = np.abs(y_true - y_pred)
+    err = np.where(np.isfinite(err), err, 0.0)
+    return float(np.average(err, weights=w))
+
+
+def weighted_corr(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+    x = np.asarray(x, dtype="float64")
+    y = np.asarray(y, dtype="float64")
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return float("nan")
+    x = x[mask]
+    y = y[mask]
+    w = _safe_weights(w, len(x))[mask]
+    wx = np.average(x, weights=w)
+    wy = np.average(y, weights=w)
+    cov = np.average((x - wx) * (y - wy), weights=w)
+    var_x = np.average((x - wx) ** 2, weights=w)
+    var_y = np.average((y - wy) ** 2, weights=w)
+    if var_x <= 0 or var_y <= 0:
+        return float("nan")
+    return float(cov / np.sqrt(var_x * var_y))
+
+
+def weighted_r2(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype="float64")
+    y_pred = np.asarray(y_pred, dtype="float64")
+    w = _safe_weights(w, len(y_true))
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(mask):
+        return float("nan")
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    w = w[mask]
+    y_bar = np.average(y_true, weights=w)
+    sst = np.average((y_true - y_bar) ** 2, weights=w)
+    if sst <= 0:
+        return float("nan")
+    sse = np.average((y_true - y_pred) ** 2, weights=w)
+    return float(1.0 - sse / sst)
+
+
+def residual_quantiles(resid: np.ndarray, quantiles=None) -> dict:
+    if quantiles is None:
+        quantiles = [1, 5, 25, 50, 75, 95, 99]
+    resid = resid[np.isfinite(resid)]
+    if resid.size == 0:
+        return {f"p{q}": float("nan") for q in quantiles}
+    return {f"p{q}": float(np.percentile(resid, q)) for q in quantiles}
+
+
+def calibration_stats(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray) -> dict:
+    w = _safe_weights(w, len(y_true))
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(mask):
+        return {"slope": float("nan"), "intercept": float("nan")}
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    w = w[mask]
+    x_bar = np.average(y_pred, weights=w)
+    y_bar = np.average(y_true, weights=w)
+    var_x = np.average((y_pred - x_bar) ** 2, weights=w)
+    if var_x <= 1e-12:
+        return {"slope": 1.0, "intercept": 0.0}
+    cov_xy = np.average((y_pred - x_bar) * (y_true - y_bar), weights=w)
+    slope = cov_xy / var_x
+    intercept = y_bar - slope * x_bar
+    return {"slope": float(slope), "intercept": float(intercept)}
+
+
+def compute_overall_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Overall regression metrics (weighted + unweighted), residual stats, and calibration.
+    """
+    y_true_raw = df["future_return"].to_numpy(dtype="float64")
+    y_pred_raw = df["future_return_hat"].to_numpy(dtype="float64")
+    w_raw = df["sample_weight"].to_numpy(dtype="float64")
+
+    mask = np.isfinite(y_true_raw) & np.isfinite(y_pred_raw)
+    if not np.any(mask):
+        return pd.DataFrame()
+
+    y_true = y_true_raw[mask]
+    y_pred = y_pred_raw[mask]
+    w = w_raw[mask]
+    resid = y_true - y_pred
+
+    mse_w = weighted_mse(y_true, y_pred, w)
+    mae_w = weighted_mae(y_true, y_pred, w)
+    r2_w = weighted_r2(y_true, y_pred, w)
+    corr_w = weighted_corr(y_pred, y_true, w)
+
+    mse = float(np.mean((resid) ** 2))
+    mae = float(np.mean(np.abs(resid)))
+    r2 = float(1.0 - mse / np.var(y_true)) if np.var(y_true) > 0 else float("nan")
+    corr = float(np.corrcoef(y_pred, y_true)[0, 1]) if len(y_true) > 1 else float("nan")
+
+    calib = calibration_stats(y_true, y_pred, w)
+    resid_q = residual_quantiles(resid)
+
+    net_true = (1.0 + y_true) * (1.0 - TAX_RATE) - 1.0
+    net_pred = df.loc[mask, "net_return_hat"].to_numpy(dtype="float64")
+
+    out = {
+        "n_rows": int(len(y_true)),
+        "mean_future_return": float(np.mean(y_true)),
+        "mean_pred_return": float(np.mean(y_pred)),
+        "mean_net_true": float(np.mean(net_true)),
+        "mean_net_pred": float(np.mean(net_pred)),
+        "rmse": float(np.sqrt(mse)),
+        "rmse_weighted": float(np.sqrt(mse_w)),
+        "mae": mae,
+        "mae_weighted": mae_w,
+        "r2": r2,
+        "r2_weighted": r2_w,
+        "corr": corr,
+        "corr_weighted": corr_w,
+        "calibration_slope": calib["slope"],
+        "calibration_intercept": calib["intercept"],
+    }
+    out.update({f"resid_{k}": v for k, v in resid_q.items()})
+    return pd.DataFrame([out])
+
+
+def compute_prob_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classification-like metrics on profit prediction (using prob_profit and profit_ok).
+    """
+    if "profit_ok" not in df.columns:
+        return pd.DataFrame()
+
+    y_true = df["profit_ok"].to_numpy(dtype="int32")
+    prob = df["prob_profit"].to_numpy(dtype="float64")
+    w = df["sample_weight"].to_numpy(dtype="float64")
+
+    prob = np.clip(prob, 1e-6, 1 - 1e-6)
+    w_safe = _safe_weights(w, len(prob))
+
+    brier = float(np.average((prob - y_true) ** 2, weights=w_safe))
+    logloss = float(
+        -np.average(
+            y_true * np.log(prob) + (1 - y_true) * np.log(1 - prob),
+            weights=w_safe,
+        )
+    )
+
+    base_rate = float(np.mean(y_true)) if len(y_true) else float("nan")
+    pred_rate = float(np.mean(prob))
+
+    def threshold_stats(thresh: float):
+        mask = prob >= thresh
+        if not np.any(mask):
+            return {"n": 0, "hit_rate": float("nan"), "avg_net": float("nan")}
+        hits = y_true[mask]
+        net = df.loc[mask, "net_return"].to_numpy(dtype="float64")
+        return {
+            "n": int(mask.sum()),
+            "hit_rate": float(np.mean(hits)),
+            "avg_net": float(np.mean(net)),
+        }
+
+    t0 = threshold_stats(0.5)
+    t60 = threshold_stats(0.6)
+
+    return pd.DataFrame(
+        [
+            {
+                "brier_weighted": brier,
+                "logloss_weighted": logloss,
+                "base_rate_profit": base_rate,
+                "mean_pred_prob": pred_rate,
+                "p0_5_n": t0["n"],
+                "p0_5_hit_rate": t0["hit_rate"],
+                "p0_5_avg_net": t0["avg_net"],
+                "p0_6_n": t60["n"],
+                "p0_6_hit_rate": t60["hit_rate"],
+                "p0_6_avg_net": t60["avg_net"],
+            }
+        ]
+    )
+
+
+def compute_feature_correlations(df: pd.DataFrame, feature_cols) -> pd.DataFrame:
+    """
+    Univariate correlation of each feature with future_return and residuals.
+    """
+    rows = []
+    y_true = df["future_return"].to_numpy(dtype="float64")
+    resid = (df["future_return"] - df["future_return_hat"]).to_numpy(dtype="float64")
+    w = df["sample_weight"].to_numpy(dtype="float64")
+
+    for feat in feature_cols:
+        if feat not in df.columns:
+            continue
+        x = df[feat].to_numpy(dtype="float64")
+        mask = np.isfinite(x) & np.isfinite(y_true)
+        n = int(mask.sum())
+        if n < 10:
+            continue
+        corr_y = weighted_corr(x[mask], y_true[mask], w[mask])
+        corr_resid = weighted_corr(x[mask], resid[mask], w[mask])
+        rows.append(
+            {
+                "feature": feat,
+                "n": n,
+                "mean": float(np.mean(x[mask])),
+                "std": float(np.std(x[mask])) if n > 1 else 0.0,
+                "corr_future": corr_y,
+                "corr_residual": corr_resid,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("corr_residual", ascending=False)
+
+
+def compute_permutation_importance(
+    df: pd.DataFrame,
+    reg_main_map,
+    sigma_main_per_regime,
+    feature_cols,
+    regime_defs,
+    use_return_scaling: bool,
+    calibration_main_per_regime: dict,
+    sample_rows: int = PERMUTATION_SAMPLE_ROWS,
+) -> pd.DataFrame:
+    """
+    Permutation importance on a sampled subset using weighted MSE on future_return.
+    """
+    if len(df) == 0 or sample_rows <= 0:
+        return pd.DataFrame()
+
+    n_sample = min(len(df), sample_rows)
+    sample = df.sample(n=n_sample, random_state=PERMUTATION_RANDOM_SEED).copy()
+
+    def predict_and_score(sub: pd.DataFrame) -> float:
+        tmp = add_predictions_and_residuals(
+            sub,
+            reg_main_map,
+            sigma_main_per_regime,
+            feature_cols,
+            regime_defs,
+            use_return_scaling,
+            calibration_main_per_regime,
+        )
+        return weighted_mse(
+            tmp["future_return"].to_numpy(dtype="float64"),
+            tmp["future_return_hat"].to_numpy(dtype="float64"),
+            tmp["sample_weight"].to_numpy(dtype="float64"),
+        )
+
+    base_mse = predict_and_score(sample)
+    rows = []
+
+    rng = np.random.default_rng(PERMUTATION_RANDOM_SEED)
+    for feat in feature_cols:
+        if feat not in sample.columns:
+            continue
+        sub = sample.copy()
+        arr = sub[feat].to_numpy()
+        rng.shuffle(arr)
+        sub[feat] = arr
+        mse_perm = predict_and_score(sub)
+        rows.append(
+            {
+                "feature": feat,
+                "n_sample": n_sample,
+                "mse_weighted_baseline": base_mse,
+                "mse_weighted_permuted": mse_perm,
+                "delta_mse_weighted": mse_perm - base_mse,
+                "delta_mse_pct": (mse_perm - base_mse) / base_mse if base_mse else float("inf"),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("delta_mse_weighted", ascending=False)
 
 
 def add_predictions_and_residuals(
@@ -294,6 +608,8 @@ def add_predictions_and_residuals(
     df["prob_profit"] = np.clip(prob_profit, 1e-4, 1.0 - 1e-4)
 
     df["resid"] = df["future_return"] - df["future_return_hat"]
+    df["net_return"] = (1.0 + df["future_return"]) * (1.0 - TAX_RATE) - 1.0
+    df["profit_ok"] = (df["net_return"] > MARGIN).astype(int)
     return df
 
 
@@ -440,6 +756,16 @@ def compute_regime_summaries(df: pd.DataFrame) -> pd.DataFrame:
         mse = np.average(resid ** 2, weights=w)
         sigma_weighted = float(np.sqrt(mse))
 
+        y_true = sub["future_return"].to_numpy(dtype="float64")
+        y_pred = sub["future_return_hat"].to_numpy(dtype="float64")
+        y_net = sub["net_return"].to_numpy(dtype="float64")
+        net_pred = sub["net_return_hat"].to_numpy(dtype="float64")
+        mae = float(np.mean(np.abs(resid)))
+        mae_w = weighted_mae(y_true, y_pred, sub["sample_weight"].to_numpy(dtype="float64"))
+        r2 = float(1.0 - np.mean(resid ** 2) / np.var(y_true)) if np.var(y_true) > 0 else float("nan")
+        r2_w = weighted_r2(y_true, y_pred, sub["sample_weight"].to_numpy(dtype="float64"))
+        calib = calibration_stats(y_true, y_pred, sub["sample_weight"].to_numpy(dtype="float64"))
+
         rows.append(
             {
                 "regime": regime_name,
@@ -450,6 +776,15 @@ def compute_regime_summaries(df: pd.DataFrame) -> pd.DataFrame:
                 "mean_pred_return": float(sub["future_return_hat"].mean()),
                 "mean_prob_profit": float(sub["prob_profit"].mean()),
                 "mean_pred_net_return": float(sub["net_return_hat"].mean()),
+                "mean_net_return": float(np.mean(y_net)),
+                "rmse": float(np.sqrt(np.mean(resid ** 2))),
+                "rmse_weighted": float(np.sqrt(mse)),
+                "mae": mae,
+                "mae_weighted": mae_w,
+                "r2": r2,
+                "r2_weighted": r2_w,
+                "calibration_slope": calib["slope"],
+                "calibration_intercept": calib["intercept"],
             }
         )
 
@@ -463,6 +798,15 @@ def compute_regime_summaries(df: pd.DataFrame) -> pd.DataFrame:
             "mean_pred_return",
             "mean_prob_profit",
             "mean_pred_net_return",
+            "mean_net_return",
+            "rmse",
+            "rmse_weighted",
+            "mae",
+            "mae_weighted",
+            "r2",
+            "r2_weighted",
+            "calibration_slope",
+            "calibration_intercept",
         ])
 
     df_reg = pd.DataFrame(rows)
@@ -477,31 +821,29 @@ def compute_regime_summaries(df: pd.DataFrame) -> pd.DataFrame:
 def main():
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
-    local_path = "sigma_buckets_full.csv"
+    prefix = os.environ.get("SIGMA_BUCKET_PREFIX") or os.environ.get("SIGMA_PREFIX")
+    if not prefix:
+        branch = os.environ.get("GITHUB_REF_NAME", "").lower()
+        if "remove-noisy-sections" in branch:
+            prefix = "analysis/remove-noisy-sections"
+        elif "quantile" in branch:
+            prefix = "analysis/quantile"
+        elif branch:
+            prefix = f"analysis/{branch}"
+        else:
+            prefix = "analysis/default"
+    prefix = prefix.rstrip("/")
 
-    def write_and_push(out_df: pd.DataFrame, reason: str = ""):
-        """Write CSV locally (always) and push to R2 (unless no prefix)."""
+    def write_and_push(out_df: pd.DataFrame, local_path: str, key_stub: str, reason: str = ""):
+        """Write CSV locally (always) and push to R2 with a consistent stub."""
         out_df.to_csv(local_path, index=False)
-        print(f"[save] Wrote bucket CSV locally to {local_path} (rows={len(out_df)}){(' - ' + reason) if reason else ''}")
-
-        prefix = os.environ.get("SIGMA_BUCKET_PREFIX") or os.environ.get("SIGMA_PREFIX")
-        if not prefix:
-            branch = os.environ.get("GITHUB_REF_NAME", "").lower()
-            if "remove-noisy-sections" in branch:
-                prefix = "analysis/remove-noisy-sections"
-            elif "quantile" in branch:
-                prefix = "analysis/quantile"
-            elif branch:
-                prefix = f"analysis/{branch}"
-            else:
-                prefix = "analysis/default"
-        prefix = prefix.rstrip("/")
+        print(f"[save] Wrote {local_path} (rows={len(out_df)}){(' - ' + reason) if reason else ''}")
 
         now = datetime.now(timezone.utc)
-        key = f"{prefix}/sigma_buckets_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+        key = f"{prefix}/{key_stub}_{now.strftime('%Y%m%d_%H%M%S')}.csv"
         buf = io.BytesIO(out_df.to_csv(index=False).encode("utf-8"))
         s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-        print(f"[save] Wrote bucket CSV to r2://{bucket}/{key}")
+        print(f"[save] Wrote r2://{bucket}/{key}")
 
     empty_cols = [
         "time_bin", "price_bin", "win_bin", "pred_ret_bin",
@@ -512,7 +854,7 @@ def main():
 
     df = build_eval_dataframe(s3, bucket)
     if df.empty:
-        write_and_push(pd.DataFrame(columns=empty_cols), reason="no eval data")
+        write_and_push(pd.DataFrame(columns=empty_cols), "sigma_buckets_full.csv", "sigma_buckets", reason="no eval data")
         # Still write an empty regime summary for completeness
         pd.DataFrame(columns=["regime", "n_rows", "sigma_unweighted", "sigma_weighted"]).to_csv(
             "sigma_regimes.csv", index=False
@@ -572,13 +914,35 @@ def main():
     else:
         print("[diag] No rows in hotspot (time 20-24 & pred_ret_bin >20%).")
 
+    # 4c) Global diagnostics
+    overall = compute_overall_metrics(df)
+    prob_stats = compute_prob_metrics(df)
+    feature_corr = compute_feature_correlations(df, feature_cols)
+    perm_importance = compute_permutation_importance(
+        df,
+        reg_main_map,
+        sigma_main_per_regime,
+        feature_cols,
+        regime_defs,
+        use_return_scaling,
+        calibration_main_per_regime,
+        sample_rows=PERMUTATION_SAMPLE_ROWS,
+    )
+    write_and_push(overall, "sigma_overall.csv", "sigma_overall")
+    if not prob_stats.empty:
+        write_and_push(prob_stats, "sigma_prob_metrics.csv", "sigma_prob")
+    if not feature_corr.empty:
+        write_and_push(feature_corr, "feature_correlations.csv", "feature_correlations")
+    if not perm_importance.empty:
+        write_and_push(perm_importance, "permutation_importance.csv", "permutation_importance")
+
     # 5) Compute bucket sigmas
     df_buckets = compute_bucket_sigmas(df)
 
     if df_buckets.empty:
-        write_and_push(pd.DataFrame(columns=empty_cols), reason="no buckets met min rows")
+        write_and_push(pd.DataFrame(columns=empty_cols), "sigma_buckets_full.csv", "sigma_buckets", reason="no buckets met min rows")
         df_reg = compute_regime_summaries(df)
-        df_reg.to_csv("sigma_regimes.csv", index=False)
+        write_and_push(df_reg, "sigma_regimes.csv", "sigma_regimes")
         print(f"[main] Wrote per-regime summary to sigma_regimes.csv (rows: {len(df_reg)})")
         return
 
@@ -591,11 +955,11 @@ def main():
     out_csv["mean_prob_profit"] = out_csv["mean_prob_profit"].round(3)
     out_csv["mean_pred_net_return"] = out_csv["mean_pred_net_return"].round(3)
 
-    write_and_push(out_csv)
+    write_and_push(out_csv, "sigma_buckets_full.csv", "sigma_buckets")
 
     # Compute and save per-regime summary
     df_reg = compute_regime_summaries(df)
-    df_reg.to_csv("sigma_regimes.csv", index=False)
+    write_and_push(df_reg, "sigma_regimes.csv", "sigma_regimes")
     print(f"[main] Wrote per-regime summary to sigma_regimes.csv:")
     print(df_reg.to_string(index=False))
 
