@@ -17,7 +17,8 @@ from features import (
     HORIZONS_MINUTES,  # [5, 10, ..., 120]
 )
 
-EXPERIMENT = "quantile"
+EXPERIMENT = "xgb"
+MODEL_PREFIX = (os.environ.get("MODEL_PREFIX") or "models/xgb").rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Training config
@@ -88,7 +89,7 @@ REGIME_DEFS = {
 REGIME_CLIPPING = {
     "high": {"min": -0.40, "max": 0.40},   # ±40%
     "mid":  {"min": -0.60, "max": 0.60},   # ±60%
-    "low":  {"min": -1.50, "max": 1.50},   # ±150%
+    "low":  {"min": -0.80, "max": 0.80},   # ±80% (tighter to curb tail bias)
 }
 
 
@@ -142,13 +143,37 @@ def clip_returns_for_regime(y: np.ndarray, regime_name: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def parse_train_end():
+    """
+    Optional override for training end timestamp via env:
+      - TRAIN_END_ISO: ISO8601 string (preferred)
+      - TRAIN_END_UNIX: Unix seconds
+    """
+    iso = os.environ.get("TRAIN_END_ISO")
+    if iso:
+        try:
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    unix = os.environ.get("TRAIN_END_UNIX")
+    if unix:
+        try:
+            return datetime.fromtimestamp(float(unix), tz=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
 def build_training_dataframe(s3, bucket):
     """
     Load raw 5-minute snapshots from the last WINDOW_DAYS into a single DataFrame.
     """
-    now = datetime.now(timezone.utc)
-    start_date = (now - timedelta(days=WINDOW_DAYS - 1)).date()
-    end_date = now.date()  # include today
+    end_dt = parse_train_end()
+    start_date = (end_dt - timedelta(days=WINDOW_DAYS - 1)).date()
+    end_date = end_dt.date()  # include today
 
     chunks = []
     d = start_date
@@ -166,6 +191,8 @@ def build_training_dataframe(s3, bucket):
         return pd.DataFrame()
 
     df = pd.concat(chunks, ignore_index=True)
+    # Enforce cutoff to end_dt (timestamp is tz-aware UTC)
+    df = df[df["timestamp"] <= end_dt].copy()
     return df
 
 
@@ -231,12 +258,14 @@ def train_models(df: pd.DataFrame):
       - reg_models: dict[regime_name][horizon_minutes] -> XGBRegressor
       - sigma_main_per_regime: dict[regime_name] -> float residual std at main horizon
       - feature_cols: the list of feature column names used
+      - calibration_main_per_regime: dict[regime_name] -> {"slope": float, "intercept": float}
     """
     df = df.copy()
     df["regime"] = df["mid_price"].apply(assign_regime_for_price)
 
     reg_models = {}
     sigma_main_per_regime = {}
+    calibration_main_per_regime = {}
 
     for regime_name in REGIME_DEFS.keys():
         df_reg = df[df["regime"] == regime_name].copy()
@@ -255,6 +284,7 @@ def train_models(df: pd.DataFrame):
 
         reg_models[regime_name] = {}
         sigma_main_regime = None
+        calib_main_regime = None
 
         for H in HORIZONS_MINUTES:
             col = f"ret_{H}m"
@@ -309,7 +339,12 @@ def train_models(df: pd.DataFrame):
                 # Normalise weights to avoid numerical issues
                 w_h_norm = w_h / np.mean(w_h)
 
-                resid = y_true - y_pred
+                # Consistently trimmed arrays for sigma/calibration
+                y_true_use = y_true
+                y_pred_use = y_pred
+                w_use = w_h_norm
+
+                resid = y_true_use - y_pred_use
 
                 # Trim 5–95% quantiles to avoid a few extreme outliers
                 if resid.size >= 20:
@@ -318,11 +353,27 @@ def train_models(df: pd.DataFrame):
                     keep = (resid >= lo) & (resid <= hi)
                     if keep.sum() >= 5:
                         resid = resid[keep]
-                        w_h_norm = w_h_norm[keep]
+                        y_true_use = y_true_use[keep]
+                        y_pred_use = y_pred_use[keep]
+                        w_use = w_use[keep]
 
-                mse = np.average(resid ** 2, weights=w_h_norm)
+                mse = np.average(resid ** 2, weights=w_use)
                 sigma = float(np.sqrt(mse))
                 sigma_main_regime = max(sigma, 1e-8)  # avoid degenerate zero
+
+                # Simple weighted linear calibration y_true ≈ slope * y_pred + intercept
+                x = y_pred_use
+                x_bar = np.average(x, weights=w_use)
+                y_bar = np.average(y_true_use, weights=w_use)
+                var_x = np.average((x - x_bar) ** 2, weights=w_use)
+                if var_x < 1e-12:
+                    slope = 1.0
+                    intercept = 0.0
+                else:
+                    cov_xy = np.average((x - x_bar) * (y_true_use - y_bar), weights=w_use)
+                    slope = cov_xy / var_x
+                    intercept = y_bar - slope * x_bar
+                calib_main_regime = {"slope": float(slope), "intercept": float(intercept)}
 
         if not reg_models[regime_name]:
             print(f"[train] Regime {regime_name}: no models trained, dropping regime.")
@@ -336,13 +387,14 @@ def train_models(df: pd.DataFrame):
             )
 
         sigma_main_per_regime[regime_name] = sigma_main_regime
+        calibration_main_per_regime[regime_name] = calib_main_regime or {"slope": 1.0, "intercept": 0.0}
 
     if not reg_models:
         raise RuntimeError(
             "No regression models were trained for any regime/horizon."
         )
 
-    return reg_models, sigma_main_per_regime, FEATURE_COLS
+    return reg_models, sigma_main_per_regime, FEATURE_COLS, calibration_main_per_regime
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +402,7 @@ def train_models(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 
-def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
+def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols, calibration_main_per_regime):
     """
     Save:
       - reg_models (dict: regime -> horizon -> regressor) as latest_reg.pkl
@@ -365,13 +417,13 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
     buf_reg.seek(0)
 
     # Date-stamped key
-    key_reg = f"models/quantile/{date_part}/reg_multi.pkl"
+    key_reg = f"{MODEL_PREFIX}/{date_part}/reg_multi.pkl"
     s3.put_object(Bucket=bucket, Key=key_reg, Body=buf_reg.getvalue())
 
     # "Latest" pointer (what score_latest.py will load)
     s3.put_object(
         Bucket=bucket,
-        Key="models/quantile/latest_reg.pkl",
+        Key=f"{MODEL_PREFIX}/latest_reg.pkl",
         Body=buf_reg.getvalue(),
     )
 
@@ -400,6 +452,7 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
         "sigma_main_per_regime": {
             k: float(v) for k, v in sigma_main_per_regime.items()
         },
+        "calibration_main_per_regime": calibration_main_per_regime,
         "regime_defs": REGIME_DEFS,
         "generated_at_iso": now.isoformat(),
         "return_scaling": {
@@ -416,11 +469,11 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
     }
 
     meta_bytes = json_bytes(meta)
-    key_meta = f"models/quantile/{date_part}/meta.json"
+    key_meta = f"{MODEL_PREFIX}/{date_part}/meta.json"
     s3.put_object(Bucket=bucket, Key=key_meta, Body=meta_bytes)
     s3.put_object(
         Bucket=bucket,
-        Key="models/quantile/latest_meta.json",
+        Key=f"{MODEL_PREFIX}/latest_meta.json",
         Body=meta_bytes,
     )
 
@@ -444,12 +497,17 @@ def main():
         print("No rows after labels/weights.")
         return
 
-    reg_models, sigma_main_per_regime, feature_cols = train_models(df)
-    save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols)
+    reg_models, sigma_main_per_regime, feature_cols, calibration_main_per_regime = train_models(df)
+    save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols, calibration_main_per_regime)
     print("Training complete.")
     print("Main-horizon residual sigma by regime:")
     for name, sigma in sigma_main_per_regime.items():
         print(f"  - {name}: {sigma:.6f}")
+    print("Calibration (slope, intercept) by regime:")
+    for name, params in calibration_main_per_regime.items():
+        slope = params.get("slope", 1.0)
+        intercept = params.get("intercept", 0.0)
+        print(f"  - {name}: slope={slope:.4f}, intercept={intercept:.4f}")
 
 
 if __name__ == "__main__":
