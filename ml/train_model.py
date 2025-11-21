@@ -39,7 +39,7 @@ MARGIN = 0.002
 # Return scaling (volatility/tick) to stabilise micro-price tails
 USE_RETURN_SCALING = True
 TICK_SIZE = 1.0
-MIN_RETURN_SCALE = 1e-4
+MIN_RETURN_SCALE = 1e-3
 MAX_RETURN_SCALE = 5.0
 
 # Feature columns for the regressors (built by add_model_features)
@@ -407,6 +407,11 @@ def save_models(s3, bucket, reg_models, sigma_main_per_regime, feature_cols):
             "tick_size": TICK_SIZE,
             "min_scale": MIN_RETURN_SCALE,
             "max_scale": MAX_RETURN_SCALE,
+            "components": {
+                "volatility": True,
+                "robust_volatility": True,
+                "spread_floor": True,
+            },
         },
     }
 

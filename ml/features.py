@@ -130,9 +130,11 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
 def compute_return_scale(
     df: pd.DataFrame,
     tick_size: float = 1.0,
-    min_scale: float = 1e-4,
+    min_scale: float = 1e-3,
     max_scale: float = 5.0,
     volatility_col: str = "volatility_60m",
+    robust_vol_col: str = "volatility_60m_mad",
+    spread_col: str = "spread_pct",
     mid_col: str = "mid_price",
 ) -> pd.Series:
     """
@@ -151,8 +153,24 @@ def compute_return_scale(
         vol_arr = vol.to_numpy(dtype="float64")
     vol_arr = np.where(np.isfinite(vol_arr), vol_arr, 0.0)
 
+    robust_vol = df.get(robust_vol_col)
+    if robust_vol is None:
+        robust_vol_arr = np.zeros_like(mid_safe)
+    else:
+        robust_vol_arr = robust_vol.to_numpy(dtype="float64")
+    robust_vol_arr = np.where(np.isfinite(robust_vol_arr), robust_vol_arr, 0.0)
+
+    spread = df.get(spread_col)
+    if spread is None:
+        spread_arr = np.zeros_like(mid_safe)
+    else:
+        spread_arr = spread.to_numpy(dtype="float64")
+    spread_arr = np.where(np.isfinite(spread_arr), np.abs(spread_arr), 0.0)
+
     tick_pct = tick_size / np.maximum(mid_safe, tick_size)
-    scale = np.maximum(vol_arr, tick_pct)
+    vol_combined = np.maximum(vol_arr, robust_vol_arr)
+    scale = np.maximum(vol_combined, tick_pct)
+    scale = np.maximum(scale, spread_arr)
     scale = np.clip(scale, min_scale, max_scale)
 
     return pd.Series(scale, index=df.index, name="return_scale")
@@ -192,6 +210,13 @@ def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
         .std()
         .reset_index(level=0, drop=True)
     )
+    # Robust (MAD-based) 60m volatility to handle flat/zero-return windows
+    mad_rolling = (
+        grp_ret5.rolling(window=12, min_periods=2)
+        .apply(lambda x: np.median(np.abs(x - np.median(x))), raw=False)
+        .reset_index(level=0, drop=True)
+    )
+    df["volatility_60m_mad"] = 1.4826 * mad_rolling
 
     # Rolling 60m volume (sum of 12 buckets)
     rolling_vol_60m = (
@@ -228,6 +253,7 @@ def add_model_features(df: pd.DataFrame) -> pd.DataFrame:
         "ret_15m_past",
         "ret_60m_past",
         "volatility_60m",
+        "volatility_60m_mad",
         "rolling_volume_60m",
         "log_rolling_volume_60m",
         "volume_ratio_5m_to_60m",

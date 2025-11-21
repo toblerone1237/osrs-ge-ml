@@ -284,7 +284,7 @@ def main():
     return_scaling_cfg = meta.get("return_scaling") or {}
     use_return_scaling = return_scaling_cfg.get("type") == "volatility_tick"
     tick_size = float(return_scaling_cfg.get("tick_size", 1.0))
-    min_return_scale = float(return_scaling_cfg.get("min_scale", 1e-4))
+    min_return_scale = float(return_scaling_cfg.get("min_scale", 1e-3))
     max_return_scale = float(return_scaling_cfg.get("max_scale", 5.0))
 
     # Normalise model structure to: regime -> horizon -> regressor
