@@ -1,0 +1,55 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      train_end_iso:
+        description: "Training cutoff ISO8601 (e.g., 2025-02-01T12:00:00Z). Must be at least 60m before backtest_start."
+        required: true
+      backtest_start:
+        description: "Backtest start date (YYYY-MM-DD, inclusive)"
+        required: true
+      backtest_end:
+        description: "Backtest end date (YYYY-MM-DD, inclusive; at least 60m before latest data)"
+        required: true
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r ml/requirements.txt
+
+      - name: Train with cutoff
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TRAIN_END_ISO: ${{ github.event.inputs.train_end_iso }}
+        run: |
+          python ml/train_model.py
+
+      - name: Backtest with latest artifacts
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python ml/backtest.py \
+            --start-date "${{ github.event.inputs.backtest_start }}" \
+            --end-date "${{ github.event.inputs.backtest_end }}"
+
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: backtest_results.csv

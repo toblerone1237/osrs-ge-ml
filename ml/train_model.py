@@ -142,13 +142,37 @@ def clip_returns_for_regime(y: np.ndarray, regime_name: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def parse_train_end():
+    """
+    Optional override for training end timestamp via env:
+      - TRAIN_END_ISO: ISO8601 string (preferred)
+      - TRAIN_END_UNIX: Unix seconds
+    """
+    iso = os.environ.get("TRAIN_END_ISO")
+    if iso:
+        try:
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    unix = os.environ.get("TRAIN_END_UNIX")
+    if unix:
+        try:
+            return datetime.fromtimestamp(float(unix), tz=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
 def build_training_dataframe(s3, bucket):
     """
     Load raw 5-minute snapshots from the last WINDOW_DAYS into a single DataFrame.
     """
-    now = datetime.now(timezone.utc)
-    start_date = (now - timedelta(days=WINDOW_DAYS - 1)).date()
-    end_date = now.date()  # include today
+    end_dt = parse_train_end()
+    start_date = (end_dt - timedelta(days=WINDOW_DAYS - 1)).date()
+    end_date = end_dt.date()  # include today
 
     chunks = []
     d = start_date
@@ -166,6 +190,8 @@ def build_training_dataframe(s3, bucket):
         return pd.DataFrame()
 
     df = pd.concat(chunks, ignore_index=True)
+    # Enforce cutoff to end_dt (timestamp is tz-aware UTC)
+    df = df[df["timestamp"] <= end_dt].copy()
     return df
 
 
