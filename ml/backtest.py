@@ -2,6 +2,7 @@ import argparse
 import io
 import os
 from datetime import datetime, timedelta, timezone
+from math import erf, sqrt
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,15 @@ from features import (
 HORIZON_MINUTES = 60
 TAX_RATE = 0.02
 MARGIN = 0.002
+
+
+def normal_cdf_array(z: np.ndarray) -> np.ndarray:
+    """Vectorised Normal(0,1) CDF using math.erf."""
+    def _cdf_scalar(x):
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+    vec = np.vectorize(_cdf_scalar, otypes=[float])
+    return vec(z)
 
 
 def load_model_and_meta(s3, bucket, reg_key="models/quantile/latest_reg.pkl", meta_key="models/quantile/latest_meta.json"):
@@ -135,11 +145,11 @@ def add_labels_and_predictions(df_raw, reg_models, meta):
     else:
         sigma_fallback = float(meta.get("sigma_main", 0.02))
     df["regime_sigma"] = df["regime"].map(sigma_main_per_regime).astype(float)
-    df["regime_sigma"].fillna(sigma_fallback, inplace=True)
+    df["regime_sigma"] = df["regime_sigma"].fillna(sigma_fallback)
 
     gross_threshold = (1.0 + MARGIN) / (1.0 - TAX_RATE) - 1.0
     z = (df["future_return_hat"].values - gross_threshold) / np.maximum(df["regime_sigma"].values, 1e-8)
-    df["prob_profit"] = np.clip(0.5 * (1.0 + np.erf(z / np.sqrt(2.0))), 1e-4, 1.0 - 1e-4)
+    df["prob_profit"] = np.clip(normal_cdf_array(z), 1e-4, 1.0 - 1e-4)
 
     # Bins for filtering
     ts = df["timestamp"]
