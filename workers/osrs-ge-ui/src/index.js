@@ -182,10 +182,12 @@ const HTML = `<!DOCTYPE html>
       <div class="small" style="margin-bottom:0.4rem;">
         Click a row to see up to the last 14 days (or as far back as available) of mid prices:
         5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
-        Click the ★ column to pin an item. Pins persist across refreshes.
+        Click the ★ column to pin an item. Pins persist across refreshes.<br/>
+        Regime column: H = high-value (≥100k), M = mid-value (10k–100k), L = low-value (&lt;10k, noisier / experimental).
       </div>
       <div id="tableContainer">Waiting for data...</div>
     </div>
+
 
     <div class="card">
       <h2>Search &amp; watchlist</h2>
@@ -423,19 +425,19 @@ const HTML = `<!DOCTYPE html>
         tableContainer.textContent = "No signals available.";
         return;
       }
-
+    
       const pins = getPinnedSet();
-
+    
       const rows = overviewSignals
         .map((s) => {
           const id = s.item_id;
           const name = s.name || ("Item " + id);
-
+    
           const winProb =
             typeof s.prob_profit === "number" ? s.prob_profit : 0;
           const profit =
             typeof s.expected_profit === "number" ? s.expected_profit : 0;
-
+    
           const gpPerSec =
             typeof s.expected_profit_per_second === "number"
               ? s.expected_profit_per_second
@@ -444,18 +446,30 @@ const HTML = `<!DOCTYPE html>
             gpPerSec != null && Number.isFinite(gpPerSec)
               ? gpPerSec * 3600
               : null;
-
+    
           const volWindow =
             typeof s.volume_window === "number" ? s.volume_window : 0;
-
+    
           const liqScore =
             volWindow > 0 ? Math.log10(1 + volWindow) : 0;
-
+    
+          // Regime info from signals
+          const regime =
+            typeof s.regime === "string" && s.regime.length
+              ? s.regime
+              : null;
+          const regimePenalty =
+            typeof s.regime_penalty === "number" && Number.isFinite(s.regime_penalty)
+              ? s.regime_penalty
+              : 1;
+    
+          // Combined score: Win% × profit × liquidity × regimePenalty
           const score =
             Math.max(0, winProb) *
             Math.max(0, profit) *
-            Math.max(1e-3, liqScore || 1);
-
+            Math.max(1e-3, liqScore || 1) *
+            Math.max(0.1, regimePenalty || 1);
+    
           return {
             raw: s,
             id,
@@ -466,24 +480,27 @@ const HTML = `<!DOCTYPE html>
             volWindow,
             holdMinutes:
               typeof s.hold_minutes === "number" ? s.hold_minutes : null,
+            regime,
+            regimePenalty,
             combinedScore: Number.isFinite(score) ? score : 0,
             pinned: pins.has(String(id))
           };
         })
         .filter((row) => Number.isFinite(row.combinedScore));
-
+    
       rows.sort((a, b) => b.combinedScore - a.combinedScore);
-
+    
       const top10 = rows.slice(0, 10);
-
+    
       const table = document.createElement("table");
       const thead = document.createElement("thead");
       const tbody = document.createElement("tbody");
-
+    
       const trHead = document.createElement("tr");
       [
         "★",
         "Item",
+        "Regime",
         "Win %",
         "Exp. profit (gp)",
         "GP/hr @limit",
@@ -495,11 +512,11 @@ const HTML = `<!DOCTYPE html>
         trHead.appendChild(th);
       });
       thead.appendChild(trHead);
-
+    
       top10.forEach((row) => {
         const tr = document.createElement("tr");
         tr.className = "clickable";
-
+    
         const tdStar = document.createElement("td");
         const btn = document.createElement("button");
         btn.type = "button";
@@ -511,54 +528,71 @@ const HTML = `<!DOCTYPE html>
         });
         tdStar.appendChild(btn);
         tr.appendChild(tdStar);
-
+    
         const tdName = document.createElement("td");
         tdName.textContent = row.name;
         tr.appendChild(tdName);
-
+    
+        const tdRegime = document.createElement("td");
+        if (row.regime === "high") {
+          tdRegime.textContent = "H";
+          tdRegime.title = "High-value regime (mid_price ≥ 100k)";
+        } else if (row.regime === "mid") {
+          tdRegime.textContent = "M";
+          tdRegime.title = "Mid-value regime (10k ≤ mid_price < 100k)";
+        } else if (row.regime === "low") {
+          tdRegime.textContent = "L";
+          tdRegime.title = "Low-value regime (<10k; noisier / experimental)";
+        } else if (row.regime) {
+          tdRegime.textContent = row.regime;
+          tdRegime.title = "Unknown regime";
+        } else {
+          tdRegime.textContent = "-";
+          tdRegime.title = "No regime info";
+        }
+        tr.appendChild(tdRegime);
+    
         const tdWin = document.createElement("td");
         tdWin.textContent = formatPercent(row.winProb);
         tr.appendChild(tdWin);
-
+    
         const tdProfit = document.createElement("td");
         tdProfit.textContent = formatProfitGp(row.profit);
         tr.appendChild(tdProfit);
-
+    
         const tdHr = document.createElement("td");
         tdHr.textContent =
           row.gpPerHour != null && Number.isFinite(row.gpPerHour)
             ? formatGpPerHour(row.gpPerHour)
             : "-";
         tr.appendChild(tdHr);
-
+    
         const tdVol = document.createElement("td");
         tdVol.textContent =
           row.volWindow != null
             ? row.volWindow.toLocaleString("en-US")
             : "-";
         tr.appendChild(tdVol);
-
+    
         const tdHold = document.createElement("td");
         tdHold.textContent =
           row.holdMinutes != null ? row.holdMinutes + "m" : "-";
         tr.appendChild(tdHold);
-
+    
         tr.addEventListener("click", () => {
           loadPriceSeries(row.id, row.name);
         });
-
+    
         tbody.appendChild(tr);
       });
-
+    
       table.appendChild(thead);
       table.appendChild(tbody);
+    
       tableContainer.innerHTML = "";
       tableContainer.appendChild(table);
-
-      if (top10.length > 0) {
-        loadPriceSeries(top10[0].id, top10[0].name);
-      }
     }
+
 
     function runSearch() {
       const q = (searchInput.value || "").trim().toLowerCase();
@@ -956,26 +990,34 @@ const HTML = `<!DOCTYPE html>
           data.meta && typeof data.meta.truncated === "boolean"
             ? data.meta.truncated
             : false;
+        const historyLatestIso =
+          data.meta && data.meta.history_latest_iso ? data.meta.history_latest_iso : null;
+        const latest5mIso =
+          data.meta && data.meta.latest_5m_timestamp_iso ? data.meta.latest_5m_timestamp_iso : null;
         const hasForecast = forecast && forecast.length > 1;
+        const historySourceText =
+          "History source: " + src + (truncated ? " (truncated)" : "") + ".";
+        const lastTimestampText = historyLatestIso
+          ? " Last price timestamp: " + historyLatestIso + "."
+          : latest5mIso
+          ? " Last price timestamp: " + latest5mIso + "."
+          : "";
 
         if (!hasForecast) {
           priceStatusEl.textContent =
-            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. History source: " +
-            src +
-            (truncated ? " (truncated)" : "") +
-            ".";
+            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
+            historySourceText +
+            lastTimestampText;
         } else if (starInfo) {
           priceStatusEl.textContent =
-            "History source: " +
-            src +
-            (truncated ? " (truncated)" : "") +
-            ". Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
+            historySourceText +
+            lastTimestampText +
+            " Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
         } else {
           priceStatusEl.textContent =
-            "History source: " +
-            src +
-            (truncated ? " (truncated)" : "") +
-            ". Blue = history; green = current forecast (5–120 minute horizons).";
+            historySourceText +
+            lastTimestampText +
+            " Blue = history; green = current forecast (5–120 minute horizons).";
         }
       } catch (err) {
         console.error("Error loading price series:", err);
@@ -1054,6 +1096,11 @@ const PRICE_CACHE = new Map();
 const PRICE_CACHE_TTL_MS = 5 * 60 * 1000;
 const PRICE_CACHE_MAX_ITEMS = 64;
 
+const LATEST_5M_CACHE_TTL_MS = 2 * 60 * 1000; // refresh latest 5m snapshot every ~2 minutes
+let LAST_5M_SNAPSHOT = null;
+let LAST_5M_FETCHED_AT = 0;
+let LAST_5M_KEY = null;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1115,13 +1162,95 @@ async function bucketListWithRetry(env, options, { attempts = 3, baseDelayMs = 2
   return null;
 }
 
+async function loadLatestFiveMinuteSnapshot(env) {
+  const nowMs = Date.now();
+  if (LAST_5M_SNAPSHOT && nowMs - LAST_5M_FETCHED_AT < LATEST_5M_CACHE_TTL_MS) {
+    return { snapshot: LAST_5M_SNAPSHOT, key: LAST_5M_KEY };
+  }
+
+  const today = new Date();
+  for (let delta = 0; delta < 2; delta++) {
+    const d = new Date(today.getTime() - delta * 86400000);
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    const prefix = "5m/" + year + "/" + month + "/" + day + "/";
+
+    const listing = await bucketListWithRetry(env, { prefix, limit: 1000 });
+    if (!listing || !listing.objects || !listing.objects.length) {
+      continue;
+    }
+
+    const objects = listing.objects.slice().sort((a, b) => (a.key < b.key ? -1 : 1));
+    const latest = objects[objects.length - 1];
+    const obj = await bucketGetWithRetry(env, latest.key, { attempts: 2, baseDelayMs: 150 });
+    if (!obj) continue;
+
+    try {
+      const text = await obj.text();
+      const parsed = JSON.parse(text);
+      LAST_5M_SNAPSHOT = parsed;
+      LAST_5M_FETCHED_AT = nowMs;
+      LAST_5M_KEY = latest.key;
+      return { snapshot: parsed, key: latest.key };
+    } catch (err) {
+      console.error("Failed to parse latest 5m snapshot for " + latest.key, err);
+    }
+  }
+
+  return { snapshot: LAST_5M_SNAPSHOT, key: LAST_5M_KEY };
+}
+
+function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
+  if (!latestSnap || !latestSnap.five_minute || !latestSnap.five_minute.data) {
+    return { history, added: false, latestIso: null };
+  }
+
+  const tsSec = Number(latestSnap.five_minute.timestamp);
+  const entry = latestSnap.five_minute.data[String(itemId)];
+  if (!entry || !Number.isFinite(tsSec)) {
+    return { history, added: false, latestIso: null };
+  }
+
+  const ah = entry.avgHighPrice;
+  const al = entry.avgLowPrice;
+  if (typeof ah !== "number" || typeof al !== "number") {
+    return { history, added: false, latestIso: null };
+  }
+
+  const mid = (ah + al) / 2;
+  if (!Number.isFinite(mid) || mid <= 0) {
+    return { history, added: false, latestIso: null };
+  }
+
+  const tsMs = Math.floor(tsSec * 1000);
+  const iso = new Date(tsMs).toISOString();
+
+  let lastTs = null;
+  if (history.length) {
+    const last = history[history.length - 1];
+    const isoStr = last.timestamp_iso || last.timestamp || null;
+    const parsed = isoStr ? Date.parse(isoStr) : NaN;
+    if (Number.isFinite(parsed)) {
+      lastTs = parsed;
+    }
+  }
+
+  if (lastTs != null && tsMs <= lastTs) {
+    return { history, added: false, latestIso: iso };
+  }
+
+  const newHistory = history.concat([{ timestamp_iso: iso, price: mid }]);
+  return { history: newHistory, added: true, latestIso: iso };
+}
+
 async function loadSignalsWithCache(env) {
   const now = Date.now();
   if (LAST_SIGNALS_JSON && now - LAST_SIGNALS_FETCHED_AT < SIGNALS_CACHE_TTL_MS) {
     return { json: LAST_SIGNALS_JSON, source: "cache" };
   }
 
-  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/quantile/latest.json");
   if (obj) {
     try {
       const text = await obj.text();
@@ -1132,7 +1261,7 @@ async function loadSignalsWithCache(env) {
         return { json: parsed, source: "fresh" };
       }
     } catch (err) {
-      console.error("Error parsing signals/latest.json:", err);
+      console.error("Error parsing signals/quantile/latest.json:", err);
     }
   }
 
@@ -1161,7 +1290,7 @@ function setCachedPriceSeries(cacheKey, payload) {
 }
 
 async function handleSignals(env) {
-  const obj = await bucketGetWithRetry(env, "signals/latest.json");
+  const obj = await bucketGetWithRetry(env, "signals/quantile/latest.json");
   if (!obj) {
     return new Response(JSON.stringify({ error: "No signals found" }), {
       status: 404,
@@ -1322,7 +1451,31 @@ async function handlePriceSeries(env, itemId) {
     });
   }
 
-  const { history, found } = await loadPrecomputedHistory(env, itemId);
+  const { history: baseHistory, found } = await loadPrecomputedHistory(env, itemId);
+  let history = Array.isArray(baseHistory) ? baseHistory.slice() : [];
+
+  let source = found ? "precomputed" : "missing";
+  let latest5mIso = null;
+  let latest5mKey = null;
+
+  const latest5m = await loadLatestFiveMinuteSnapshot(env);
+  if (latest5m && latest5m.snapshot) {
+    latest5mKey = latest5m.key;
+    const res = maybeAppendLatestFiveMinute(history, latest5m.snapshot, itemId);
+    history = res.history;
+    latest5mIso = res.latestIso;
+    if (res.added && source === "precomputed") {
+      source = "precomputed+latest_5m";
+    } else if (res.added && source === "missing") {
+      source = "latest_5m_only";
+    }
+  }
+
+  const historyLatestIso =
+    history.length && history[history.length - 1]
+      ? history[history.length - 1].timestamp_iso || history[history.length - 1].timestamp || null
+      : null;
+
   const forecast = await buildForecast(env, itemId, history);
   const truncated = !found;
 
@@ -1332,7 +1485,10 @@ async function handlePriceSeries(env, itemId) {
     forecast,
     meta: {
       truncated: truncated,
-      source: found ? "precomputed" : "missing"
+      source,
+      history_latest_iso: historyLatestIso,
+      latest_5m_snapshot_key: latest5mKey,
+      latest_5m_timestamp_iso: latest5mIso
     }
   });
 
