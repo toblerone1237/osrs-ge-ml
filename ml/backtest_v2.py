@@ -217,6 +217,62 @@ def summarize_trades(trades: pd.DataFrame, policy_name: str, slippage: str, fold
     }
 
 
+def bin_series_quantile(series: pd.Series, q: int, label_na: str = "NA") -> pd.Series:
+    """
+    Bin a numeric series into quantile buckets; falls back to equal-width bins if not enough uniques.
+    """
+    vals = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if vals.empty:
+        return pd.Series([label_na] * len(series), index=series.index, dtype=object)
+    try:
+        bins = pd.qcut(vals, q, duplicates="drop")
+    except ValueError:
+        bins = pd.cut(vals, q, include_lowest=True, duplicates="drop")
+    out = pd.Series(label_na, index=series.index, dtype=object)
+    out.loc[vals.index] = bins.astype(str)
+    return out
+
+
+def build_factor_grid(trades: pd.DataFrame, prob_bins: int = 10, price_edges=None) -> pd.DataFrame:
+    """
+    Compute a compact factor breakdown (hit rate + P&L stats) across factor combinations.
+    Intended to be small enough to ship with backtest artifacts.
+    """
+    if trades.empty:
+        return pd.DataFrame()
+    if price_edges is None:
+        price_edges = [0, 1_000, 10_000, 50_000, 200_000, np.inf]
+
+    df = trades.copy()
+    df["prob_bin"] = bin_series_quantile(df["prob_profit"], prob_bins)
+    df["mid_price_bin"] = pd.cut(
+        df["mid_price"],
+        bins=price_edges,
+        include_lowest=True,
+        right=False,
+        duplicates="drop",
+    ).astype(str)
+
+    factor_cols = ["policy", "slippage", "regime", "prob_bin", "mid_price_bin"]
+    grid = (
+        df.groupby(factor_cols, observed=True)
+        .agg(
+            n_trades=("net_realised", "size"),
+            hit_rate=("net_realised", lambda r: float((r > 0).mean()) if len(r) else 0.0),
+            mean_return=("net_realised", "mean"),
+            median_return=("net_realised", "median"),
+            p95_return=("net_realised", lambda r: float(np.percentile(r, 95))),
+            p99_return=("net_realised", lambda r: float(np.percentile(r, 99))),
+            sum_return=("net_realised", "sum"),
+            avg_prob_profit=("prob_profit", "mean"),
+            avg_net_return_hat=("net_return_hat", "mean"),
+        )
+        .reset_index()
+        .sort_values(factor_cols)
+    )
+    return grid
+
+
 def train_fold_models(df_train: pd.DataFrame, feature_cols, regime_defs: dict) -> Tuple[dict, dict]:
     """
     Train regime-specific regressors for the fold and return sigma per regime.
@@ -444,19 +500,25 @@ def run_backtest(params):
         .reset_index()
     )
 
+    factor_grid = build_factor_grid(trades_df)
+
     out_trades = OUTPUT_DIR / "backtest_v2_trades.csv"
     out_folds = OUTPUT_DIR / "backtest_v2_folds.csv"
     out_summary = OUTPUT_DIR / "backtest_v2_summary.csv"
+    out_factor_grid = OUTPUT_DIR / "backtest_v2_factor_grid.csv"
 
     trades_df.to_csv(out_trades, index=False)
     summaries_df.to_csv(out_folds, index=False)
     agg.to_csv(out_summary, index=False)
+    factor_grid.to_csv(out_factor_grid, index=False)
 
     print("Fold-level summary:")
     print(summaries_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print("\nAggregate by policy/slippage:")
     print(agg.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-    print(f"\nWrote backtest outputs to {OUTPUT_DIR} (trades/folds/summary)")
+    print("\nFactor grid breakdown:")
+    print(factor_grid.head().to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    print(f"\nWrote backtest outputs to {OUTPUT_DIR} (trades/folds/summary/factor_grid)")
 
 
 def parse_args():
