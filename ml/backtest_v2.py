@@ -391,6 +391,8 @@ def build_folds(start_date: datetime, end_date: datetime, train_days: int, test_
 def run_backtest(params):
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
+    upload_prefix = getattr(params, "upload_prefix", None)
+    upload_date_part = getattr(params, "upload_date_part", None)
 
     meta_key = params.meta_key or "models/quantile/latest_meta.json"
     # Load meta for feature list and return-scaling config (models are trained per fold)
@@ -520,6 +522,23 @@ def run_backtest(params):
     print(factor_grid.head().to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print(f"\nWrote backtest outputs to {OUTPUT_DIR} (trades/folds/summary/factor_grid)")
 
+    if upload_prefix:
+        prefix = upload_prefix.rstrip("/")
+        date_part = upload_date_part or datetime.utcnow().strftime("%Y-%m-%dT%H%M%SZ")
+        uploads = {
+            "backtest_v2_trades": out_trades,
+            "backtest_v2_folds": out_folds,
+            "backtest_v2_summary": out_summary,
+            "backtest_v2_factor_grid": out_factor_grid,
+        }
+        print(f"\nUploading backtest outputs to s3://{bucket}/{prefix} with suffix _{date_part}.csv")
+        for name, path in uploads.items():
+            if not path.exists():
+                continue
+            key = f"{prefix}/{name}_{date_part}.csv"
+            s3.upload_file(str(path), bucket, key)
+            print(f" - {name}: s3://{bucket}/{key}")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Walk-forward backtest with embargoed folds.")
@@ -530,6 +549,8 @@ def parse_args():
     parser.add_argument("--test-window-days", type=int, default=1, help="Days per fold test window")
     parser.add_argument("--embargo-minutes", type=int, default=60, help="Minutes to embargo between train/test windows (protect label leakage)")
     parser.add_argument("--anchored", action="store_true", help="Use anchored expanding train windows instead of rolling")
+    parser.add_argument("--upload-prefix", default=None, help="Optional R2 prefix (e.g. analysis/backtest) to upload CSV outputs")
+    parser.add_argument("--upload-date-part", default=None, help="Optional date/tag to append to uploaded filenames; defaults to current UTC timestamp")
     args = parser.parse_args()
     args.start_date = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     args.end_date = datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)

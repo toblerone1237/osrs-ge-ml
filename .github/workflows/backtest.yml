@@ -22,12 +22,15 @@ jobs:
           # backtest window: last 14 full days ending today-minus-60m (date-based)
           BACKTEST_END=$(date -u -d '60 minutes ago' +%Y-%m-%d)
           BACKTEST_START=$(date -u -d '14 days ago' +%Y-%m-%d)
+          DATE_PART=$(date -u +%Y-%m-%dT%H%M%SZ)
           echo "TRAIN_END_ISO=$TRAIN_END_ISO" >> $GITHUB_ENV
           echo "BACKTEST_START=$BACKTEST_START" >> $GITHUB_ENV
           echo "BACKTEST_END=$BACKTEST_END" >> $GITHUB_ENV
+          echo "DATE_PART=$DATE_PART" >> $GITHUB_ENV
           echo "train_end_iso=$TRAIN_END_ISO"
           echo "backtest_start=$BACKTEST_START"
           echo "backtest_end=$BACKTEST_END"
+          echo "date_part=$DATE_PART"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -60,7 +63,9 @@ jobs:
             --meta-key models/quantile/latest_meta.json \
             --train-window-days 4 \
             --test-window-days 1 \
-            --embargo-minutes 60
+            --embargo-minutes 60 \
+            --upload-prefix analysis/backtest \
+            --upload-date-part "${{ env.DATE_PART }}"
 
       - name: Upload backtest results
         uses: actions/upload-artifact@v4
@@ -70,24 +75,4 @@ jobs:
             ml/backtest_v2_trades.csv
             ml/backtest_v2_folds.csv
             ml/backtest_v2_summary.csv
-
-      - name: Push backtest results to R2
-        env:
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: |
-          pip install awscli
-          aws configure set default.s3.addressing_style virtual
-          aws configure set default.s3.signature_version s3v4
-          aws configure set default.region auto
-          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-          export AWS_EC2_METADATA_DISABLED=true
-          PREFIX="analysis/backtest"
-          DATE_PART=$(date -u +%Y-%m-%dT%H%M%SZ)
-          aws s3 cp ml/backtest_v2_trades.csv "s3://$R2_BUCKET/$PREFIX/backtest_v2_trades_${DATE_PART}.csv" --endpoint-url "$R2_ENDPOINT"
-          aws s3 cp ml/backtest_v2_folds.csv "s3://$R2_BUCKET/$PREFIX/backtest_v2_folds_${DATE_PART}.csv" --endpoint-url "$R2_ENDPOINT"
-          aws s3 cp ml/backtest_v2_summary.csv "s3://$R2_BUCKET/$PREFIX/backtest_v2_summary_${DATE_PART}.csv" --endpoint-url "$R2_ENDPOINT"
-          echo "Pushed backtest v2 results to s3://$R2_BUCKET/$PREFIX/*_${DATE_PART}.csv"
+            ml/backtest_v2_factor_grid.csv
