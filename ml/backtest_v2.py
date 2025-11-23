@@ -143,6 +143,15 @@ def apply_policy_filters(df, policy):
             df.loc[low_mask, "net_return_hat"].values,
             policy["cap_net_return_low"],
         )
+    allowed_regimes = policy.get("allowed_regimes")
+    if allowed_regimes:
+        mask &= df["regime"].isin(allowed_regimes)
+    price_min = policy.get("mid_price_min")
+    if price_min is not None:
+        mask &= df["mid_price"] >= price_min
+    price_max = policy.get("mid_price_max")
+    if price_max is not None:
+        mask &= df["mid_price"] < price_max
     return mask
 
 
@@ -167,15 +176,24 @@ def slippage_per_side(row, preset):
     return 0.002
 
 
-def simulate_trades(df, policy, slippage):
+@dataclass
+class SlippageConfig:
+    name: str
+    preset: str
+    multiplier: float = 1.0
+
+
+def simulate_trades(df, policy, slip_cfg: SlippageConfig):
     trades_mask = apply_policy_filters(df.copy(), policy)
     trades = df.loc[trades_mask].copy()
     if trades.empty:
         return trades
-    slip = trades.apply(lambda r: slippage_per_side(r, slippage), axis=1).to_numpy(dtype="float64")
+    slip_base = trades.apply(lambda r: slippage_per_side(r, slip_cfg.preset), axis=1).to_numpy(dtype="float64")
+    slip = slip_base * float(slip_cfg.multiplier)
     net_realised = trades["net_return"].to_numpy(dtype="float64") - 2.0 * slip
     trades["net_realised"] = net_realised
     trades["slippage_per_side"] = slip
+    trades["slippage_multiplier"] = slip_cfg.multiplier
     return trades
 
 
@@ -388,6 +406,89 @@ def build_folds(start_date: datetime, end_date: datetime, train_days: int, test_
     return folds
 
 
+def parse_float_list(csv: str) -> List[float]:
+    vals = []
+    for part in csv.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            vals.append(float(part))
+        except ValueError:
+            continue
+    return vals
+
+
+def build_policies(extra_prob_thresholds: List[float], core_low_price_thresholds: List[float], midprice_prob_thresholds: List[float]):
+    """
+    Build policy configs (dicts) including defaults plus user-specified thresholds/filters.
+    """
+    base = [
+        {"name": "baseline", "prob_min": None, "ret_min": 0.0},
+        {"name": "prob_55", "prob_min": 0.55, "ret_min": 0.0},
+        {"name": "prob_60", "prob_min": 0.60, "ret_min": 0.0},
+        {"name": "prob_60_cap_low", "prob_min": 0.60, "ret_min": 0.0, "cap_net_return_low": 0.25},
+    ]
+
+    def _policy_name_from_prob(p):
+        return f"prob_{int(round(p * 100)):02d}"
+
+    seen_names = {p["name"] for p in base}
+    policies = list(base)
+
+    for p in extra_prob_thresholds:
+        name = _policy_name_from_prob(p)
+        if name in seen_names:
+            continue
+        policies.append({"name": name, "prob_min": p, "ret_min": 0.0})
+        seen_names.add(name)
+
+    # Core low-regime, cheap-price filters (mid_price < 1k)
+    for p in core_low_price_thresholds:
+        name = f"core_low_price1k_prob_{int(round(p * 100)):02d}"
+        if name in seen_names:
+            continue
+        policies.append(
+            {
+                "name": name,
+                "prob_min": p,
+                "ret_min": 0.0,
+                "allowed_regimes": ["low"],
+                "mid_price_max": 1_000.0,
+            }
+        )
+        seen_names.add(name)
+
+    # Low regime, mid-price bucket (1k–10k) high-prob exploration
+    for p in midprice_prob_thresholds:
+        name = f"low_regime_1k_10k_prob_{int(round(p * 100)):02d}"
+        if name in seen_names:
+            continue
+        policies.append(
+            {
+                "name": name,
+                "prob_min": p,
+                "ret_min": 0.0,
+                "allowed_regimes": ["low"],
+                "mid_price_min": 1_000.0,
+                "mid_price_max": 10_000.0,
+            }
+        )
+        seen_names.add(name)
+
+    return policies
+
+
+def build_slippage_configs(multipliers: List[float]) -> List[SlippageConfig]:
+    presets = ["spread_plus_tick", "tiered", "regime_based"]
+    configs: List[SlippageConfig] = []
+    for preset in presets:
+        for mult in multipliers:
+            name = preset if abs(mult - 1.0) < 1e-6 else f"{preset}_x{mult:g}"
+            configs.append(SlippageConfig(name=name, preset=preset, multiplier=mult))
+    return configs
+
+
 def run_backtest(params):
     bucket = os.environ["R2_BUCKET"]
     s3 = get_r2_client()
@@ -435,13 +536,15 @@ def run_backtest(params):
     if not folds:
         raise RuntimeError("No folds generated; check date range and window lengths.")
 
-    policies = [
-        {"name": "baseline", "prob_min": None, "ret_min": 0.0},
-        {"name": "prob_55", "prob_min": 0.55, "ret_min": 0.0},
-        {"name": "prob_60", "prob_min": 0.60, "ret_min": 0.0},
-        {"name": "prob_60_cap_low", "prob_min": 0.60, "ret_min": 0.0, "cap_net_return_low": 0.25},
-    ]
-    slippages = ["spread_plus_tick", "tiered", "regime_based"]
+    policies = build_policies(
+        extra_prob_thresholds=parse_float_list(params.prob_thresholds or ""),
+        core_low_price_thresholds=parse_float_list(params.core_low_price_thresholds or ""),
+        midprice_prob_thresholds=parse_float_list(params.low_regime_midprice_prob_thresholds or ""),
+    )
+    slip_multipliers = parse_float_list(params.slippage_multipliers or "")
+    if not slip_multipliers:
+        slip_multipliers = [1.0]
+    slippages = build_slippage_configs(slip_multipliers)
 
     summaries = []
     trades_all = []
@@ -470,14 +573,14 @@ def run_backtest(params):
         df_test = predict_with_models(df_test, reg_models, feature_cols, sigma_per_regime)
 
         for pol in policies:
-            for slip in slippages:
-                trades = simulate_trades(df_test, pol, slip)
+            for slip_cfg in slippages:
+                trades = simulate_trades(df_test, pol, slip_cfg)
                 if not trades.empty:
                     trades["fold_id"] = fold.fold_id
                     trades["policy"] = pol["name"]
-                    trades["slippage"] = slip
+                    trades["slippage"] = slip_cfg.name
                     trades_all.append(trades)
-                summary = summarize_trades(trades, pol["name"], slip, fold.fold_id)
+                summary = summarize_trades(trades, pol["name"], slip_cfg.name, fold.fold_id)
                 summaries.append(summary)
 
     if trades_all:
@@ -549,6 +652,10 @@ def parse_args():
     parser.add_argument("--test-window-days", type=int, default=1, help="Days per fold test window")
     parser.add_argument("--embargo-minutes", type=int, default=60, help="Minutes to embargo between train/test windows (protect label leakage)")
     parser.add_argument("--anchored", action="store_true", help="Use anchored expanding train windows instead of rolling")
+    parser.add_argument("--prob-thresholds", default="", help="Comma-separated extra prob_min thresholds (in addition to defaults)")
+    parser.add_argument("--core-low-price-thresholds", default="", help="Comma-separated prob_min thresholds for low-regime, mid_price < 1k policies")
+    parser.add_argument("--low-regime-midprice-prob-thresholds", default="", help="Comma-separated prob_min thresholds for low-regime, 1k<=mid_price<10k policies")
+    parser.add_argument("--slippage-multipliers", default="", help="Comma-separated multipliers applied to each slippage preset (default 1.0 only)")
     parser.add_argument("--upload-prefix", default=None, help="Optional R2 prefix (e.g. analysis/backtest) to upload CSV outputs")
     parser.add_argument("--upload-date-part", default=None, help="Optional date/tag to append to uploaded filenames; defaults to current UTC timestamp")
     args = parser.parse_args()
