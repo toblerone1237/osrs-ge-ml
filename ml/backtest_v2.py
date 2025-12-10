@@ -40,6 +40,24 @@ REGIME_CLIPPING = {
 OUTPUT_DIR = Path(__file__).parent
 
 
+def _log_resource_usage(prefix: str):
+    """
+    Best-effort resource logging for CI debugging.
+    """
+    try:
+        import resource  # type: ignore[attr-defined]
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # On Linux hosted runners ru_maxrss is kilobytes
+        rss_mb = usage.ru_maxrss / 1024.0
+        print(
+            f"[resource] {prefix} rss_mb={rss_mb:.1f} "
+            f"user_s={usage.ru_utime:.1f} sys_s={usage.ru_stime:.1f}"
+        )
+    except Exception as exc:
+        print(f"[resource] {prefix} failed: {exc}")
+
+
 def normal_cdf_array(z: np.ndarray) -> np.ndarray:
     def _cdf_scalar(x):
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
@@ -512,6 +530,10 @@ def run_backtest(params):
     max_scale = float(return_scaling_cfg.get("max_scale", 5.0))
 
     df_raw = load_snapshots_between(s3, bucket, params.start_date.date(), params.end_date.date())
+    print(
+        f"[debug] loaded_raw_snapshots rows={len(df_raw)} "
+        f"start_date={params.start_date.date()} end_date={params.end_date.date()}"
+    )
     if df_raw.empty:
         raise RuntimeError("No snapshots found for given date range.")
 
@@ -523,6 +545,12 @@ def run_backtest(params):
         max_scale=max_scale,
         regime_defs=regime_defs,
     )
+    df_mem_mb = df_all.memory_usage(deep=True).sum() / 1e6
+    print(
+        f"[debug] df_all shape={df_all.shape}, approx_mem_mb={df_mem_mb:.1f}, "
+        f"unique_items={df_all['item_id'].nunique()}"
+    )
+    _log_resource_usage("after_features")
     df_all = df_all[df_all["mid_price"] > 0].copy()
 
     folds = build_folds(
@@ -533,6 +561,7 @@ def run_backtest(params):
         params.embargo_minutes,
         params.anchored,
     )
+    print(f"[debug] built_folds n_folds={len(folds)} anchored={params.anchored}")
     if not folds:
         raise RuntimeError("No folds generated; check date range and window lengths.")
 
@@ -549,28 +578,38 @@ def run_backtest(params):
     summaries = []
     trades_all = []
 
-    for fold in folds:
+    for idx, fold in enumerate(folds, start=1):
+        print(
+            f"[debug] fold_start idx={idx}/{len(folds)} "
+            f"train_start={fold.train_start} train_end={fold.train_end} "
+            f"test_start={fold.test_start} test_end={fold.test_end}"
+        )
+        _log_resource_usage(f"fold_start {fold.fold_id}")
         # Train subset with embargo: ensure labels do not reach into test window
         train_cutoff = fold.test_start - timedelta(minutes=HORIZON_MINUTES)
         train_mask = (df_all["timestamp"] >= fold.train_start) & (df_all["timestamp"] < fold.train_end)
         train_mask &= df_all["timestamp"] < train_cutoff
         df_train = df_all.loc[train_mask].copy()
         if df_train.empty:
+            print(f"[debug] fold_skip {fold.fold_id} empty_train")
             continue
 
         df_train["sample_weight"] = compute_sample_weight(df_train["timestamp"])
 
         reg_models, sigma_per_regime = train_fold_models(df_train, feature_cols, regime_defs)
         if not reg_models:
+            print(f"[debug] fold_skip {fold.fold_id} no_models_trained")
             continue
 
         df_test = df_all[
             (df_all["timestamp"] >= fold.test_start) & (df_all["timestamp"] < fold.test_end)
         ].copy()
         if df_test.empty:
+            print(f"[debug] fold_skip {fold.fold_id} empty_test")
             continue
 
         df_test = predict_with_models(df_test, reg_models, feature_cols, sigma_per_regime)
+        _log_resource_usage(f"fold_after_predict {fold.fold_id}")
 
         for pol in policies:
             for slip_cfg in slippages:
