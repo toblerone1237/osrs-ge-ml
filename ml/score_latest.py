@@ -40,6 +40,20 @@ REGIME_DEFS_DEFAULT = {
     "high": {"mid_price_min": 100_000, "mid_price_max": None},
 }
 
+# Sizing policy constants (focused on low-regime, low-price, high-probability trades)
+LOW_PRICE_CAP = 1_000.0
+PROB_MIN_CORE = 0.85  # minimum calibrated prob to consider trading
+PROB_STEP_UP_1 = 0.90
+PROB_STEP_UP_2 = 0.95
+PROB_MULT_BASE = 1.0
+PROB_MULT_MID = 1.2
+PROB_MULT_HIGH = 1.5
+SIGMA_DROP_THRESHOLD = 2000.0
+SIGMA_QUARTER_THRESHOLD = 500.0
+SIGMA_HALF_THRESHOLD = 200.0
+MAX_POSITION_MULT = 2.0
+BASE_LOW_PRICE_NOTIONAL = float(os.getenv("BASE_LOW_PRICE_NOTIONAL", "1.0"))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,6 +83,65 @@ def assign_regime_for_price(mid_price: float, regime_defs) -> str:
                 return name
 
     return "mid"
+
+
+def decide_notional(
+    regime: str,
+    mid_price: float,
+    p_cal: float,
+    ret_cal: float,
+    sigma: float,
+    base_low_price_notional: float,
+) -> float:
+    """
+    Determine position notional based on regime, price, calibrated prob/return, and sigma.
+    Returns 0.0 when no trade should be taken.
+    """
+    try:
+        p = float(p_cal)
+        r = float(ret_cal)
+        price = float(mid_price)
+        s = float(sigma)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not np.isfinite(p) or not np.isfinite(r) or not np.isfinite(price) or not np.isfinite(s):
+        return 0.0
+
+    if regime != "low":
+        return 0.0
+
+    if price >= LOW_PRICE_CAP:
+        return 0.0
+
+    if p < PROB_MIN_CORE:
+        return 0.0
+
+    if r <= 0.0:
+        return 0.0
+
+    size = base_low_price_notional
+
+    if p >= PROB_STEP_UP_2:
+        prob_mult = PROB_MULT_HIGH
+    elif p >= PROB_STEP_UP_1:
+        prob_mult = PROB_MULT_MID
+    else:
+        prob_mult = PROB_MULT_BASE
+    size *= prob_mult
+
+    if s >= SIGMA_DROP_THRESHOLD:
+        sigma_mult = 0.0
+    elif s >= SIGMA_QUARTER_THRESHOLD:
+        sigma_mult = 0.25
+    elif s >= SIGMA_HALF_THRESHOLD:
+        sigma_mult = 0.5
+    else:
+        sigma_mult = 1.0
+
+    size *= sigma_mult
+    size = min(size, MAX_POSITION_MULT * base_low_price_notional)
+    return max(size, 0.0)
 
 
 def get_latest_5m_key(s3, bucket):
@@ -458,6 +531,19 @@ def main():
 
     last_per_item["regime_penalty"] = last_per_item["regime"].map(regime_penalty_map).fillna(1.0)
 
+    # Recommended notional based on low-regime, low-price, high-probability sizing policy
+    last_per_item["recommended_notional"] = last_per_item.apply(
+        lambda r: decide_notional(
+            regime=str(r.get("regime")),
+            mid_price=r.get("mid_price"),
+            p_cal=r.get("prob_profit"),
+            ret_cal=r.get("net_return_hat"),
+            sigma=r.get("regime_sigma", sigma_main_global),
+            base_low_price_notional=BASE_LOW_PRICE_NOTIONAL,
+        ),
+        axis=1,
+    )
+
     # Composite score: emphasise higher Win %, profit, liquidity, and regime quality
     liq = np.log1p(last_per_item["volume_window"].fillna(0)).clip(lower=1e-3)
     prob = last_per_item["prob_profit"].clip(0.0, 1.0)
@@ -501,6 +587,7 @@ def main():
                 "regime": str(r.get("regime") or ""),
                 "regime_sigma": float(r.get("regime_sigma") or sigma_main_global),
                 "regime_penalty": float(r.get("regime_penalty") or 1.0),
+                "recommended_notional": float(r.get("recommended_notional") or 0.0),
                 "path": r["path"],
             }
         )
@@ -514,6 +601,25 @@ def main():
         "sigma_main": float(sigma_main_global),
         "sigma_main_per_regime": sigma_main_per_regime,
         "regime_defs": regime_defs,
+        "sizing_policy": {
+            "type": "low_regime_low_price_high_prob_v1",
+            "base_low_price_notional": BASE_LOW_PRICE_NOTIONAL,
+            "low_price_cap": LOW_PRICE_CAP,
+            "prob_min_core": PROB_MIN_CORE,
+            "prob_step_up_1": PROB_STEP_UP_1,
+            "prob_step_up_2": PROB_STEP_UP_2,
+            "prob_multipliers": {
+                "base": PROB_MULT_BASE,
+                "mid": PROB_MULT_MID,
+                "high": PROB_MULT_HIGH,
+            },
+            "sigma_thresholds": {
+                "drop": SIGMA_DROP_THRESHOLD,
+                "quarter": SIGMA_QUARTER_THRESHOLD,
+                "half": SIGMA_HALF_THRESHOLD,
+            },
+            "max_position_mult": MAX_POSITION_MULT,
+        },
         "signals": signals,
     }
 
