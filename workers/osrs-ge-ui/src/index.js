@@ -152,6 +152,40 @@ const HTML = `<!DOCTYPE html>
       width: 100% !important;
       height: 100% !important;
     }
+    .pagination-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0.35rem 0;
+      font-size: 0.8rem;
+      color: #9ca3af;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .pagination-controls select {
+      margin-left: 0.25rem;
+      padding: 0.15rem 0.25rem;
+      border-radius: 0.35rem;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #e5e7eb;
+    }
+    .pagination-controls button {
+      padding: 0.25rem 0.6rem;
+      border-radius: 0.35rem;
+      border: 1px solid #4b5563;
+      background: #111827;
+      color: #e5e7eb;
+      cursor: pointer;
+      font-size: 0.8rem;
+    }
+    .pagination-controls button:hover:not(:disabled) {
+      background: #1f2937;
+    }
+    .pagination-controls button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
     @media (max-width: 750px) {
       table { font-size: 0.78rem; }
       header h1 { font-size: 1.2rem; }
@@ -178,7 +212,7 @@ const HTML = `<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>Top 10 items by probability-adjusted profit × liquidity</h2>
+      <h2>Ranked items by probability-adjusted profit × liquidity</h2>
       <div class="small" style="margin-bottom:0.4rem;">
         Click a row to see up to the last 14 days (or as far back as available) of mid prices:
         5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
@@ -246,6 +280,9 @@ const HTML = `<!DOCTYPE html>
     let MODEL_HORIZON = 60;
     let MODEL_TAX = 0.02;
     let priceChart = null;
+    let rankingPageSize = 10;
+    let rankingCurrentPage = 1;
+    const RANKING_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
 
     function loadPinnedState() {
       try {
@@ -420,6 +457,103 @@ const HTML = `<!DOCTYPE html>
       pinnedListEl.appendChild(table);
     }
 
+    function buildPaginationControls(totalRows, pageSize, currentPage) {
+      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
+      const clampedPage =
+        totalPages > 0 ? Math.min(Math.max(1, currentPage), totalPages) : 1;
+
+      if (clampedPage !== rankingCurrentPage) {
+        rankingCurrentPage = clampedPage;
+      }
+
+      const container = document.createElement("div");
+      container.className = "pagination-controls";
+
+      const startIndex =
+        totalRows === 0 ? 0 : (clampedPage - 1) * pageSize + 1;
+      const endIndex =
+        totalRows === 0
+          ? 0
+          : Math.min(totalRows, clampedPage * pageSize);
+
+      const left = document.createElement("div");
+      left.textContent =
+        totalRows === 0
+          ? "No items to display."
+          : "Showing items " +
+            startIndex +
+            "–" +
+            endIndex +
+            " of " +
+            totalRows +
+            ".";
+      container.appendChild(left);
+
+      const right = document.createElement("div");
+      right.style.display = "flex";
+      right.style.alignItems = "center";
+      right.style.gap = "0.5rem";
+
+      const perPageLabel = document.createElement("label");
+      perPageLabel.textContent = "Per page:";
+
+      const select = document.createElement("select");
+      RANKING_PAGE_SIZE_OPTIONS.forEach((size) => {
+        const opt = document.createElement("option");
+        opt.value = String(size);
+        opt.textContent = String(size);
+        if (size === pageSize) {
+          opt.selected = true;
+        }
+        select.appendChild(opt);
+      });
+
+      select.addEventListener("change", (ev) => {
+        const value = Number(ev.target.value);
+        if (Number.isFinite(value) && value > 0) {
+          rankingPageSize = value;
+          rankingCurrentPage = 1;
+          renderTopTable();
+        }
+      });
+
+      perPageLabel.appendChild(select);
+      right.appendChild(perPageLabel);
+
+      const prevBtn = document.createElement("button");
+      prevBtn.type = "button";
+      prevBtn.textContent = "Previous";
+      prevBtn.disabled = clampedPage <= 1;
+      prevBtn.addEventListener("click", () => {
+        if (rankingCurrentPage > 1) {
+          rankingCurrentPage -= 1;
+          renderTopTable();
+        }
+      });
+      right.appendChild(prevBtn);
+
+      const nextBtn = document.createElement("button");
+      nextBtn.type = "button";
+      nextBtn.textContent = "Next";
+      nextBtn.disabled = clampedPage >= totalPages || totalRows === 0;
+      nextBtn.addEventListener("click", () => {
+        if (rankingCurrentPage < totalPages) {
+          rankingCurrentPage += 1;
+          renderTopTable();
+        }
+      });
+      right.appendChild(nextBtn);
+
+      const pageInfo = document.createElement("div");
+      pageInfo.textContent =
+        "Page " + clampedPage + " of " + (totalRows === 0 ? 1 : totalPages) + ".";
+      right.appendChild(pageInfo);
+
+      container.appendChild(right);
+
+      return container;
+    }
+
     function renderTopTable() {
       if (!overviewSignals.length) {
         tableContainer.textContent = "No signals available.";
@@ -501,8 +635,23 @@ const HTML = `<!DOCTYPE html>
         );
     
       rows.sort((a, b) => b.combinedScore - a.combinedScore);
-    
-      const top10 = rows.slice(0, 10);
+
+      const pageSize =
+        rankingPageSize && Number.isFinite(rankingPageSize)
+          ? rankingPageSize
+          : 10;
+      const totalRows = rows.length;
+      const totalPages =
+        totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
+      if (rankingCurrentPage < 1) {
+        rankingCurrentPage = 1;
+      } else if (rankingCurrentPage > totalPages) {
+        rankingCurrentPage = totalPages;
+      }
+      const currentPage = rankingCurrentPage;
+      const start = totalRows === 0 ? 0 : (currentPage - 1) * pageSize;
+      const end = totalRows === 0 ? 0 : Math.min(totalRows, start + pageSize);
+      const pageRows = rows.slice(start, end);
     
       const table = document.createElement("table");
       const thead = document.createElement("thead");
@@ -526,7 +675,7 @@ const HTML = `<!DOCTYPE html>
       });
       thead.appendChild(trHead);
     
-      top10.forEach((row) => {
+      pageRows.forEach((row) => {
         const tr = document.createElement("tr");
         tr.className = "clickable";
     
@@ -607,7 +756,19 @@ const HTML = `<!DOCTYPE html>
       table.appendChild(tbody);
     
       tableContainer.innerHTML = "";
+      const pagerTop = buildPaginationControls(
+        totalRows,
+        pageSize,
+        currentPage
+      );
+      const pagerBottom = buildPaginationControls(
+        totalRows,
+        pageSize,
+        currentPage
+      );
+      tableContainer.appendChild(pagerTop);
       tableContainer.appendChild(table);
+      tableContainer.appendChild(pagerBottom);
     }
 
 
