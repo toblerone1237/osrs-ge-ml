@@ -1450,6 +1450,16 @@ function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
     return { history, added: false, latestIso: null };
   }
 
+  const highVol = entry.highPriceVolume;
+  const lowVol = entry.lowPriceVolume;
+  let volume = 0;
+  if (typeof highVol === "number" && Number.isFinite(highVol) && highVol > 0) {
+    volume += highVol;
+  }
+  if (typeof lowVol === "number" && Number.isFinite(lowVol) && lowVol > 0) {
+    volume += lowVol;
+  }
+
   const tsMs = Math.floor(tsSec * 1000);
   const iso = new Date(tsMs).toISOString();
 
@@ -1467,7 +1477,13 @@ function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
     return { history, added: false, latestIso: iso };
   }
 
-  const newHistory = history.concat([{ timestamp_iso: iso, price: mid }]);
+  const newHistory = history.concat([
+    {
+      timestamp_iso: iso,
+      price: mid,
+      ...(volume > 0 ? { volume } : {})
+    }
+  ]);
   return { history: newHistory, added: true, latestIso: iso };
 }
 
