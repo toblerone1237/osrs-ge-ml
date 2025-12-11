@@ -192,6 +192,35 @@ const HTML = `<!DOCTYPE html>
       .card { padding: 0.85rem 0.9rem; }
       .chart-wrapper { height: 220px; }
     }
+    .tabs {
+      display: flex;
+      gap: 0.25rem;
+      margin: 0.75rem 0 1rem;
+      border-bottom: 1px solid #1f2937;
+    }
+    .tab-btn {
+      appearance: none;
+      border: 1px solid #1f2937;
+      border-bottom: none;
+      background: #020617;
+      color: #9ca3af;
+      padding: 0.5rem 0.9rem;
+      border-top-left-radius: 0.5rem;
+      border-top-right-radius: 0.5rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    .tab-btn.active {
+      color: #e5e7eb;
+      background: #0b1220;
+      border-color: #374151;
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
@@ -206,38 +235,64 @@ const HTML = `<!DOCTYPE html>
     </p>
   </header>
   <main>
-    <div class="card">
-      <div id="status">Loading signals &amp; daily snapshot...</div>
-      <div id="meta"></div>
+    <div class="tabs" role="tablist">
+      <button type="button" class="tab-btn active" data-tab="standard" role="tab" aria-selected="true">Standard Model</button>
+      <button type="button" class="tab-btn" data-tab="peaks" role="tab" aria-selected="false">Catching Peaks</button>
     </div>
 
-    <div class="card">
-      <h2>Ranked items by probability-adjusted profit × liquidity</h2>
-      <div class="small" style="margin-bottom:0.4rem;">
-        Click a row to see up to the last 14 days (or as far back as available) of mid prices:
-        5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
-        Click the ★ column to pin an item. Pins persist across refreshes.<br/>
-        Regime column: H = high-value (≥100k), M = mid-value (10k–100k), L = low-value (&lt;10k, noisier / experimental).
+    <div id="tab-standard" class="tab-content active" role="tabpanel" aria-hidden="false">
+      <div class="card">
+        <div id="status">Loading signals &amp; daily snapshot...</div>
+        <div id="meta"></div>
       </div>
-      <div id="tableContainer">Waiting for data...</div>
+
+      <div class="card">
+        <h2>Ranked items by probability-adjusted profit × liquidity</h2>
+        <div class="small" style="margin-bottom:0.4rem;">
+          Click a row to see up to the last 14 days (or as far back as available) of mid prices:
+          5-minute buckets for the last 24 hours, then ~30-minute buckets further back, plus a 5–120 minute forecast.<br/>
+          Click the ★ column to pin an item. Pins persist across refreshes.<br/>
+          Regime column: H = high-value (≥100k), M = mid-value (10k–100k), L = low-value (&lt;10k, noisier / experimental).
+        </div>
+        <div id="tableContainer">Waiting for data...</div>
+      </div>
+
+      <div class="card">
+        <h2>Search &amp; watchlist</h2>
+        <div class="search-row">
+          <input id="searchInput" type="text" placeholder="Search by item name..." />
+          <button id="searchButton" type="button">Search</button>
+        </div>
+        <div id="searchStatus" class="small"></div>
+        <div id="searchResults" style="margin-top:0.4rem;"></div>
+        <div class="pinned-list">
+          <div class="small" style="margin-bottom:0.25rem;">Pinned items (watchlist)</div>
+          <div id="pinnedList" class="small">No pinned items yet.</div>
+        </div>
+      </div>
+
+      <div id="standardChartMount"></div>
     </div>
 
+    <div id="tab-peaks" class="tab-content" role="tabpanel" aria-hidden="true">
+      <div class="card">
+        <div id="peaksStatus">Loading catching‑peaks metrics...</div>
+        <div id="peaksMeta" class="small"></div>
+      </div>
 
-    <div class="card">
-      <h2>Search &amp; watchlist</h2>
-      <div class="search-row">
-        <input id="searchInput" type="text" placeholder="Search by item name..." />
-        <button id="searchButton" type="button">Search</button>
+      <div class="card">
+        <h2>Catching Peaks leaderboard</h2>
+        <div class="small" style="margin-bottom:0.4rem;">
+          Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
+          Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+        </div>
+        <div id="peaksTableContainer">Waiting for data...</div>
       </div>
-      <div id="searchStatus" class="small"></div>
-      <div id="searchResults" style="margin-top:0.4rem;"></div>
-      <div class="pinned-list">
-        <div class="small" style="margin-bottom:0.25rem;">Pinned items (watchlist)</div>
-        <div id="pinnedList" class="small">No pinned items yet.</div>
-      </div>
+
+      <div id="peaksChartMount"></div>
     </div>
 
-    <div class="card">
+    <div id="priceCard" class="card">
       <h2>Price history &amp; forecast</h2>
       <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
       <div class="small" style="margin-bottom:0.4rem;">
@@ -272,11 +327,23 @@ const HTML = `<!DOCTYPE html>
     const searchResultsEl = document.getElementById("searchResults");
     const pinnedListEl = document.getElementById("pinnedList");
 
+    const peaksStatusEl = document.getElementById("peaksStatus");
+    const peaksMetaEl = document.getElementById("peaksMeta");
+    const peaksTableContainer = document.getElementById("peaksTableContainer");
+    const standardChartMount = document.getElementById("standardChartMount");
+    const peaksChartMount = document.getElementById("peaksChartMount");
+    const priceCardEl = document.getElementById("priceCard");
+    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
+    const tabStandardEl = document.getElementById("tab-standard");
+    const tabPeaksEl = document.getElementById("tab-peaks");
+
     const PIN_KEY = "osrs_ge_pins_v3";
+    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
 
     let overviewSignals = [];
     let dailySnapshot = null;
     let mappingList = [];
+    let mappingById = new Map();
     let MODEL_HORIZON = 60;
     let MODEL_TAX = 0.02;
     let priceChart = null;
@@ -284,8 +351,55 @@ const HTML = `<!DOCTYPE html>
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
     const RANKING_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
+    // Catching Peaks pagination
+    let peaksPageSize = 10;
+    let peaksCurrentPage = 1;
+    const PEAKS_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
+    let peaksItems = [];
+    let peaksLoaded = false;
     // Latest volume timeline for the active chart (aligned to labels)
     let latestVolumeTimeline = [];
+
+    function moveChartToTab(tabName) {
+      const mount =
+        tabName === "peaks" ? peaksChartMount : standardChartMount;
+      if (mount && priceCardEl && priceCardEl.parentElement !== mount) {
+        mount.appendChild(priceCardEl);
+      }
+    }
+
+    function setActiveTab(tabName) {
+      const active = tabName === "peaks" ? "peaks" : "standard";
+      tabButtons.forEach((btn) => {
+        const isActive = btn.dataset.tab === active;
+        btn.classList.toggle("active", isActive);
+        btn.setAttribute("aria-selected", isActive ? "true" : "false");
+      });
+      if (tabStandardEl) {
+        const showStandard = active === "standard";
+        tabStandardEl.classList.toggle("active", showStandard);
+        tabStandardEl.setAttribute("aria-hidden", showStandard ? "false" : "true");
+      }
+      if (tabPeaksEl) {
+        const showPeaks = active === "peaks";
+        tabPeaksEl.classList.toggle("active", showPeaks);
+        tabPeaksEl.setAttribute("aria-hidden", showPeaks ? "false" : "true");
+      }
+      moveChartToTab(active);
+      try {
+        window.localStorage.setItem(ACTIVE_TAB_KEY, active);
+      } catch (_) {}
+
+      if (active === "peaks" && !peaksLoaded) {
+        loadPeaksOverview();
+      }
+    }
+
+    tabButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        setActiveTab(btn.dataset.tab);
+      });
+    });
 
     function loadPinnedState() {
       try {
@@ -361,6 +475,7 @@ const HTML = `<!DOCTYPE html>
 
     function buildMappingFromDaily(dailyJson) {
       mappingList = [];
+      mappingById = new Map();
       if (!dailyJson) return;
 
       function dfs(obj) {
@@ -391,9 +506,20 @@ const HTML = `<!DOCTYPE html>
       if (!found) return;
 
       mappingList = found
-        .map((m) => ({ id: Number(m.id), name: m.name }))
+        .map((m) => ({
+          id: Number(m.id),
+          name: m.name,
+          limit:
+            m.limit != null && Number.isFinite(Number(m.limit))
+              ? Number(m.limit)
+              : null
+        }))
         .filter((m) => m.id && m.name);
       mappingList.sort((a, b) => a.name.localeCompare(b.name));
+      mappingById = new Map(mappingList.map((m) => [m.id, m]));
+      if (peaksLoaded) {
+        renderPeaksTable();
+      }
     }
 
     function renderPinnedList() {
@@ -772,6 +898,211 @@ const HTML = `<!DOCTYPE html>
       tableContainer.appendChild(pagerTop);
       tableContainer.appendChild(table);
       tableContainer.appendChild(pagerBottom);
+    }
+
+    function buildPeaksPaginationControls(totalRows, pageSize, currentPage) {
+      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
+      const clampedPage =
+        totalPages > 0 ? Math.min(Math.max(1, currentPage), totalPages) : 1;
+
+      if (clampedPage !== peaksCurrentPage) {
+        peaksCurrentPage = clampedPage;
+      }
+
+      const container = document.createElement("div");
+      container.className = "pagination-controls";
+
+      const startIndex =
+        totalRows === 0 ? 0 : (clampedPage - 1) * pageSize + 1;
+      const endIndex =
+        totalRows === 0
+          ? 0
+          : Math.min(totalRows, clampedPage * pageSize);
+
+      const left = document.createElement("div");
+      left.textContent =
+        totalRows === 0
+          ? "No items to display."
+          : "Showing items " +
+            startIndex +
+            "–" +
+            endIndex +
+            " of " +
+            totalRows +
+            ".";
+      container.appendChild(left);
+
+      const right = document.createElement("div");
+      right.style.display = "flex";
+      right.style.alignItems = "center";
+      right.style.gap = "0.5rem";
+
+      const perPageLabel = document.createElement("label");
+      perPageLabel.textContent = "Per page:";
+
+      const select = document.createElement("select");
+      PEAKS_PAGE_SIZE_OPTIONS.forEach((size) => {
+        const opt = document.createElement("option");
+        opt.value = String(size);
+        opt.textContent = String(size);
+        if (size === pageSize) {
+          opt.selected = true;
+        }
+        select.appendChild(opt);
+      });
+
+      select.addEventListener("change", (ev) => {
+        const value = Number(ev.target.value);
+        if (Number.isFinite(value) && value > 0) {
+          peaksPageSize = value;
+          peaksCurrentPage = 1;
+          renderPeaksTable();
+        }
+      });
+
+      perPageLabel.appendChild(select);
+      right.appendChild(perPageLabel);
+
+      const prevBtn = document.createElement("button");
+      prevBtn.type = "button";
+      prevBtn.textContent = "Previous";
+      prevBtn.disabled = clampedPage <= 1;
+      prevBtn.addEventListener("click", () => {
+        if (peaksCurrentPage > 1) {
+          peaksCurrentPage -= 1;
+          renderPeaksTable();
+        }
+      });
+      right.appendChild(prevBtn);
+
+      const nextBtn = document.createElement("button");
+      nextBtn.type = "button";
+      nextBtn.textContent = "Next";
+      nextBtn.disabled = clampedPage >= totalPages || totalRows === 0;
+      nextBtn.addEventListener("click", () => {
+        if (peaksCurrentPage < totalPages) {
+          peaksCurrentPage += 1;
+          renderPeaksTable();
+        }
+      });
+      right.appendChild(nextBtn);
+
+      const pageInfo = document.createElement("div");
+      pageInfo.textContent =
+        "Page " + clampedPage + " of " + (totalRows === 0 ? 1 : totalPages) + ".";
+      right.appendChild(pageInfo);
+
+      container.appendChild(right);
+
+      return container;
+    }
+
+    function renderPeaksTable() {
+      if (!peaksTableContainer) return;
+      if (!peaksItems.length) {
+        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
+        return;
+      }
+
+      const rows = peaksItems.slice();
+      rows.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+      const pageSize =
+        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
+      const totalRows = rows.length;
+      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
+      if (peaksCurrentPage < 1) {
+        peaksCurrentPage = 1;
+      } else if (peaksCurrentPage > totalPages) {
+        peaksCurrentPage = totalPages;
+      }
+      const currentPage = peaksCurrentPage;
+      const start = totalRows === 0 ? 0 : (currentPage - 1) * pageSize;
+      const end = totalRows === 0 ? 0 : Math.min(totalRows, start + pageSize);
+      const pageRows = rows.slice(start, end);
+
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const tbody = document.createElement("tbody");
+
+      const trHead = document.createElement("tr");
+      [
+        "Item",
+        "Low Average Price",
+        "Peak Average Price",
+        "% Difference",
+        "Last 24 Trading Volume",
+        "Trading Volume Cap"
+      ].forEach((h) => {
+        const th = document.createElement("th");
+        th.textContent = h;
+        trHead.appendChild(th);
+      });
+      thead.appendChild(trHead);
+
+      pageRows.forEach((row) => {
+        const tr = document.createElement("tr");
+        tr.className = "clickable";
+
+        const tdName = document.createElement("td");
+        tdName.textContent = row.name || ("Item " + row.item_id);
+        tr.appendChild(tdName);
+
+        const tdLow = document.createElement("td");
+        tdLow.textContent = formatProfitGp(row.low_avg_price);
+        tr.appendChild(tdLow);
+
+        const tdPeak = document.createElement("td");
+        tdPeak.textContent = formatProfitGp(row.peak_avg_price);
+        tr.appendChild(tdPeak);
+
+        const tdPct = document.createElement("td");
+        tdPct.textContent =
+          Number.isFinite(row.pct_difference)
+            ? row.pct_difference.toFixed(1) + "%"
+            : "-";
+        tr.appendChild(tdPct);
+
+        const tdVol = document.createElement("td");
+        tdVol.textContent =
+          Number.isFinite(row.volume_24h)
+            ? Math.round(row.volume_24h).toLocaleString("en-US")
+            : "-";
+        tr.appendChild(tdVol);
+
+        const mapEntry = mappingById.get(Number(row.item_id));
+        const limitVal =
+          mapEntry && Number.isFinite(mapEntry.limit)
+            ? mapEntry.limit.toLocaleString("en-US")
+            : "-";
+        const tdCap = document.createElement("td");
+        tdCap.textContent = limitVal;
+        tr.appendChild(tdCap);
+
+        tr.addEventListener("click", () => {
+          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id));
+        });
+
+        tbody.appendChild(tr);
+      });
+
+      table.appendChild(thead);
+      table.appendChild(tbody);
+
+      peaksTableContainer.innerHTML = "";
+      const pagerTop = buildPeaksPaginationControls(
+        totalRows,
+        pageSize,
+        currentPage
+      );
+      const pagerBottom = buildPeaksPaginationControls(
+        totalRows,
+        pageSize,
+        currentPage
+      );
+      peaksTableContainer.appendChild(pagerTop);
+      peaksTableContainer.appendChild(table);
+      peaksTableContainer.appendChild(pagerBottom);
     }
 
 
@@ -1305,7 +1636,43 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
+    async function loadPeaksOverview() {
+      if (!peaksStatusEl) return;
+      try {
+        peaksStatusEl.textContent = "Fetching /catching-peaks...";
+        const res = await fetch("/catching-peaks");
+        if (!res.ok) {
+          peaksStatusEl.textContent =
+            "Failed to load catching‑peaks (HTTP " + res.status + ").";
+          return;
+        }
+        const json = await res.json();
+        peaksItems = Array.isArray(json.items) ? json.items : [];
+        peaksLoaded = true;
+        peaksStatusEl.textContent = "";
+        if (peaksMetaEl) {
+          peaksMetaEl.textContent =
+            "Computed at " +
+            (json.generated_at_iso || "unknown time") +
+            " over ~" +
+            (json.window_days || "?") +
+            " days.";
+        }
+        renderPeaksTable();
+      } catch (err) {
+        console.error("Error loading catching-peaks overview:", err);
+        peaksStatusEl.textContent = "Error loading catching‑peaks overview.";
+      }
+    }
+
     loadOverview();
+    // Restore last active tab and move chart there.
+    let savedTab = "standard";
+    try {
+      const raw = window.localStorage.getItem(ACTIVE_TAB_KEY);
+      if (raw === "peaks") savedTab = "peaks";
+    } catch (_) {}
+    setActiveTab(savedTab);
   })();
   </script>
 </body>
@@ -1327,6 +1694,13 @@ const LATEST_5M_CACHE_TTL_MS = 2 * 60 * 1000; // refresh latest 5m snapshot ever
 let LAST_5M_SNAPSHOT = null;
 let LAST_5M_FETCHED_AT = 0;
 let LAST_5M_KEY = null;
+
+const PEAKS_CACHE_TTL_MS = 15 * 60 * 1000;
+let LAST_PEAKS_JSON = null;
+let LAST_PEAKS_FETCHED_AT = 0;
+const PEAKS_WINDOW_DAYS = 14;
+const PEAKS_MAX_ITEMS = 200;
+const PEAKS_BATCH_SIZE = 25;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1530,6 +1904,323 @@ function setCachedPriceSeries(cacheKey, payload) {
       PRICE_CACHE.delete(oldestKey);
     }
   }
+}
+
+function quantileSorted(arr, q) {
+  if (!arr.length) return NaN;
+  const pos = (arr.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const next = arr[base + 1];
+  if (next == null) return arr[base];
+  return arr[base] + rest * (next - arr[base]);
+}
+
+function meanOf(arr) {
+  if (!arr.length) return NaN;
+  let s = 0;
+  for (const v of arr) s += v;
+  return s / arr.length;
+}
+
+function varianceOf(arr, mu) {
+  if (!arr.length) return NaN;
+  let s = 0;
+  for (const v of arr) {
+    const d = v - mu;
+    s += d * d;
+  }
+  return s / arr.length;
+}
+
+function gaussianPdf(x, mu, sigma) {
+  const s = Math.max(sigma, 1e-6);
+  const z = (x - mu) / s;
+  return Math.exp(-0.5 * z * z) / (s * Math.sqrt(2 * Math.PI));
+}
+
+function fitTwoGaussianMixtureLog(prices, maxIter = 15) {
+  const xs = prices
+    .map((p) => (p > 0 && Number.isFinite(p) ? Math.log(p) : NaN))
+    .filter((v) => Number.isFinite(v));
+  if (xs.length < 10) return null;
+
+  const sorted = xs.slice().sort((a, b) => a - b);
+  const n = xs.length;
+
+  let mu1 = quantileSorted(sorted, 0.25);
+  let mu2 = quantileSorted(sorted, 0.9);
+  const globalMu = meanOf(sorted);
+  const globalSigma = Math.sqrt(Math.max(1e-8, varianceOf(sorted, globalMu)));
+  let sigma1 = Math.max(globalSigma, 1e-4);
+  let sigma2 = Math.max(globalSigma * 2, 1e-4);
+  let w1 = 0.9;
+  let w2 = 0.1;
+
+  const gamma2 = new Array(n);
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    let sum1 = 0;
+    let sum2 = 0;
+    let sum1x = 0;
+    let sum2x = 0;
+    let sum1x2 = 0;
+    let sum2x2 = 0;
+
+    for (let i = 0; i < n; i++) {
+      const x = xs[i];
+      const p1 = w1 * gaussianPdf(x, mu1, sigma1);
+      const p2 = w2 * gaussianPdf(x, mu2, sigma2);
+      const denom = p1 + p2;
+      const g2 = denom > 0 ? p2 / denom : 0;
+      const g1 = 1 - g2;
+      gamma2[i] = g2;
+
+      sum1 += g1;
+      sum2 += g2;
+      sum1x += g1 * x;
+      sum2x += g2 * x;
+      sum1x2 += g1 * x * x;
+      sum2x2 += g2 * x * x;
+    }
+
+    if (sum1 < 1e-6 || sum2 < 1e-6) break;
+
+    const newMu1 = sum1x / sum1;
+    const newMu2 = sum2x / sum2;
+    const newSigma1 = Math.sqrt(
+      Math.max(1e-8, sum1x2 / sum1 - newMu1 * newMu1)
+    );
+    const newSigma2 = Math.sqrt(
+      Math.max(1e-8, sum2x2 / sum2 - newMu2 * newMu2)
+    );
+    const newW1 = sum1 / n;
+    const newW2 = sum2 / n;
+
+    const delta = Math.abs(newMu1 - mu1) + Math.abs(newMu2 - mu2);
+    mu1 = newMu1;
+    mu2 = newMu2;
+    sigma1 = Math.max(newSigma1, 1e-4);
+    sigma2 = Math.max(newSigma2, 1e-4);
+    w1 = newW1;
+    w2 = newW2;
+
+    if (delta < 1e-4) break;
+  }
+
+  // Ensure mu1 < mu2; if swapped, flip responsibilities.
+  if (mu1 > mu2) {
+    [mu1, mu2] = [mu2, mu1];
+    [sigma1, sigma2] = [sigma2, sigma1];
+    [w1, w2] = [w2, w1];
+    for (let i = 0; i < gamma2.length; i++) {
+      gamma2[i] = 1 - gamma2[i];
+    }
+  }
+
+  return { mu1, mu2, sigma1, sigma2, w1, w2, gamma2 };
+}
+
+function computeCatchingPeaksMetric(history, windowDays = PEAKS_WINDOW_DAYS) {
+  if (!Array.isArray(history) || history.length < 30) return null;
+
+  const nowMs = Date.now();
+  const cutoffMs = nowMs - windowDays * 86400 * 1000;
+  const cutoff24hMs = nowMs - 24 * 3600 * 1000;
+
+  const pts = history
+    .map((pt) => {
+      const iso = pt.timestamp_iso || pt.timestamp || null;
+      const ts = iso ? Date.parse(iso) : NaN;
+      const price =
+        typeof pt.price === "number" && Number.isFinite(pt.price)
+          ? pt.price
+          : NaN;
+      const volume =
+        typeof pt.volume === "number" && Number.isFinite(pt.volume)
+          ? pt.volume
+          : 0;
+      return { ts, price, volume };
+    })
+    .filter(
+      (pt) =>
+        Number.isFinite(pt.ts) &&
+        pt.ts >= cutoffMs &&
+        Number.isFinite(pt.price) &&
+        pt.price > 0
+    )
+    .sort((a, b) => a.ts - b.ts);
+
+  if (pts.length < 30) return null;
+
+  const prices = pts.map((p) => p.price);
+  const fit = fitTwoGaussianMixtureLog(prices);
+  if (!fit) return null;
+
+  const baselinePrices = [];
+  const spikePrices = [];
+  let spikeRuns = [];
+  let currentRun = 0;
+  let spikeWeightSum = 0;
+
+  for (let i = 0; i < prices.length; i++) {
+    const g2 = fit.gamma2[i];
+    spikeWeightSum += g2;
+    const isSpike = g2 > 0.5;
+    if (isSpike) {
+      spikePrices.push(prices[i]);
+      currentRun += 1;
+    } else {
+      baselinePrices.push(prices[i]);
+      if (currentRun > 0) {
+        spikeRuns.push(currentRun);
+        currentRun = 0;
+      }
+    }
+  }
+  if (currentRun > 0) spikeRuns.push(currentRun);
+
+  const lowAvg =
+    baselinePrices.length > 0
+      ? meanOf(baselinePrices)
+      : Math.exp(fit.mu1);
+  const peakAvg =
+    spikePrices.length > 0 ? meanOf(spikePrices) : Math.exp(fit.mu2);
+
+  if (!Number.isFinite(lowAvg) || lowAvg <= 0 || !Number.isFinite(peakAvg)) {
+    return null;
+  }
+
+  const separation = peakAvg / lowAvg;
+  const pctDiff = (separation - 1) * 100;
+
+  const w2 = spikeWeightSum / prices.length;
+
+  let baselineCv = 1;
+  if (baselinePrices.length >= 3) {
+    const bStd = Math.sqrt(
+      Math.max(0, varianceOf(baselinePrices, lowAvg))
+    );
+    baselineCv =
+      Number.isFinite(bStd) && lowAvg > 0 ? bStd / lowAvg : 1;
+  }
+
+  const avgSpikeLen = spikeRuns.length
+    ? spikeRuns.reduce((a, b) => a + b, 0) / spikeRuns.length
+    : 0;
+
+  const baselineStability = Number.isFinite(baselineCv)
+    ? 1 / (1 + baselineCv * 5)
+    : 0;
+  const rareWeight = Number.isFinite(w2) ? Math.exp(-w2 * 8) : 0;
+  const spikeShortness = 1 / (1 + avgSpikeLen / 3);
+  const separationDelta = Math.max(0, separation - 1);
+
+  let score =
+    separationDelta * rareWeight * baselineStability * spikeShortness;
+  if (!Number.isFinite(score)) score = 0;
+
+  const volume24h = pts
+    .filter((p) => p.ts >= cutoff24hMs)
+    .reduce((s, p) => s + (Number.isFinite(p.volume) ? p.volume : 0), 0);
+
+  return {
+    lowAvg,
+    peakAvg,
+    pctDiff,
+    volume24h,
+    score
+  };
+}
+
+async function handleCatchingPeaks(env) {
+  const now = Date.now();
+  if (LAST_PEAKS_JSON && now - LAST_PEAKS_FETCHED_AT < PEAKS_CACHE_TTL_MS) {
+    return new Response(LAST_PEAKS_JSON, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const { json: sigJson } = await loadSignalsWithCache(env);
+  const signals = sigJson && Array.isArray(sigJson.signals) ? sigJson.signals : [];
+  if (!signals.length) {
+    return new Response(JSON.stringify({ error: "No signals to seed peaks scan" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const candidates = signals
+    .filter((s) => s && Number.isFinite(Number(s.item_id)))
+    .sort(
+      (a, b) =>
+        (Number(b.volume_window) || 0) - (Number(a.volume_window) || 0)
+    )
+    .slice(0, PEAKS_MAX_ITEMS)
+    .map((s) => ({
+      item_id: Number(s.item_id),
+      name: s.name || ("Item " + s.item_id)
+    }));
+
+  const latest5m = await loadLatestFiveMinuteSnapshot(env);
+  const latestSnap = latest5m && latest5m.snapshot ? latest5m.snapshot : null;
+
+  const results = [];
+
+  for (let i = 0; i < candidates.length; i += PEAKS_BATCH_SIZE) {
+    const batch = candidates.slice(i, i + PEAKS_BATCH_SIZE);
+    const batchRes = await Promise.all(
+      batch.map(async (c) => {
+        const { history: baseHistory, found } = await loadPrecomputedHistory(
+          env,
+          c.item_id
+        );
+        if (!found || !baseHistory.length) return null;
+
+        let history = baseHistory;
+        if (latestSnap) {
+          history = maybeAppendLatestFiveMinute(
+            history,
+            latestSnap,
+            c.item_id
+          ).history;
+        }
+
+        const metric = computeCatchingPeaksMetric(history, PEAKS_WINDOW_DAYS);
+        if (!metric) return null;
+
+        return {
+          item_id: c.item_id,
+          name: c.name,
+          low_avg_price: metric.lowAvg,
+          peak_avg_price: metric.peakAvg,
+          pct_difference: metric.pctDiff,
+          volume_24h: metric.volume24h,
+          score: metric.score
+        };
+      })
+    );
+    for (const r of batchRes) {
+      if (r) results.push(r);
+    }
+  }
+
+  results.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+  const body = JSON.stringify({
+    generated_at_iso: new Date().toISOString(),
+    window_days: PEAKS_WINDOW_DAYS,
+    items: results
+  });
+
+  LAST_PEAKS_JSON = body;
+  LAST_PEAKS_FETCHED_AT = Date.now();
+
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "application/json" }
+  });
 }
 
 async function handleSignals(env) {
@@ -1780,6 +2471,10 @@ export default {
         });
       }
       return handlePriceSeries(env, itemId);
+    }
+
+    if (url.pathname === "/catching-peaks") {
+      return handleCatchingPeaks(env);
     }
 
     return new Response("Not found", { status: 404 });
