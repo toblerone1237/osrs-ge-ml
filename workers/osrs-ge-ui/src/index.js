@@ -432,7 +432,13 @@ const HTML = `<!DOCTYPE html>
         .map((s) => {
           const id = s.item_id;
           const name = s.name || ("Item " + id);
-    
+
+          const recommendedNotional =
+            typeof s.recommended_notional === "number" &&
+            Number.isFinite(s.recommended_notional)
+              ? s.recommended_notional
+              : 0;
+
           const winProb =
             typeof s.prob_profit === "number" ? s.prob_profit : 0;
           const profit =
@@ -482,11 +488,17 @@ const HTML = `<!DOCTYPE html>
               typeof s.hold_minutes === "number" ? s.hold_minutes : null,
             regime,
             regimePenalty,
+            recommendedNotional,
             combinedScore: Number.isFinite(score) ? score : 0,
             pinned: pins.has(String(id))
           };
         })
-        .filter((row) => Number.isFinite(row.combinedScore));
+        // Only surface items the sizing policy would actually trade
+        .filter(
+          (row) =>
+            Number.isFinite(row.combinedScore) &&
+            row.recommendedNotional > 0
+        );
     
       rows.sort((a, b) => b.combinedScore - a.combinedScore);
     
@@ -501,6 +513,7 @@ const HTML = `<!DOCTYPE html>
         "★",
         "Item",
         "Regime",
+        "Rec size",
         "Win %",
         "Exp. profit (gp)",
         "GP/hr @limit",
@@ -551,7 +564,11 @@ const HTML = `<!DOCTYPE html>
           tdRegime.title = "No regime info";
         }
         tr.appendChild(tdRegime);
-    
+
+        const tdSize = document.createElement("td");
+        tdSize.textContent = row.recommendedNotional.toFixed(2);
+        tr.appendChild(tdSize);
+
         const tdWin = document.createElement("td");
         tdWin.textContent = formatPercent(row.winProb);
         tr.appendChild(tdWin);
