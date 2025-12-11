@@ -1698,9 +1698,8 @@ let LAST_5M_KEY = null;
 const PEAKS_CACHE_TTL_MS = 15 * 60 * 1000;
 let LAST_PEAKS_JSON = null;
 let LAST_PEAKS_FETCHED_AT = 0;
-const PEAKS_WINDOW_DAYS = 14;
-const PEAKS_MAX_ITEMS = 200;
-const PEAKS_BATCH_SIZE = 25;
+// Catching-peaks signals are precomputed by the Python agent and stored in R2
+// at signals/peaks/latest.json.
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1906,233 +1905,6 @@ function setCachedPriceSeries(cacheKey, payload) {
   }
 }
 
-function quantileSorted(arr, q) {
-  if (!arr.length) return NaN;
-  const pos = (arr.length - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  const next = arr[base + 1];
-  if (next == null) return arr[base];
-  return arr[base] + rest * (next - arr[base]);
-}
-
-function meanOf(arr) {
-  if (!arr.length) return NaN;
-  let s = 0;
-  for (const v of arr) s += v;
-  return s / arr.length;
-}
-
-function varianceOf(arr, mu) {
-  if (!arr.length) return NaN;
-  let s = 0;
-  for (const v of arr) {
-    const d = v - mu;
-    s += d * d;
-  }
-  return s / arr.length;
-}
-
-function gaussianPdf(x, mu, sigma) {
-  const s = Math.max(sigma, 1e-6);
-  const z = (x - mu) / s;
-  return Math.exp(-0.5 * z * z) / (s * Math.sqrt(2 * Math.PI));
-}
-
-function fitTwoGaussianMixtureLog(prices, maxIter = 15) {
-  const xs = prices
-    .map((p) => (p > 0 && Number.isFinite(p) ? Math.log(p) : NaN))
-    .filter((v) => Number.isFinite(v));
-  if (xs.length < 10) return null;
-
-  const sorted = xs.slice().sort((a, b) => a - b);
-  const n = xs.length;
-
-  let mu1 = quantileSorted(sorted, 0.25);
-  let mu2 = quantileSorted(sorted, 0.9);
-  const globalMu = meanOf(sorted);
-  const globalSigma = Math.sqrt(Math.max(1e-8, varianceOf(sorted, globalMu)));
-  let sigma1 = Math.max(globalSigma, 1e-4);
-  let sigma2 = Math.max(globalSigma * 2, 1e-4);
-  let w1 = 0.9;
-  let w2 = 0.1;
-
-  const gamma2 = new Array(n);
-
-  for (let iter = 0; iter < maxIter; iter++) {
-    let sum1 = 0;
-    let sum2 = 0;
-    let sum1x = 0;
-    let sum2x = 0;
-    let sum1x2 = 0;
-    let sum2x2 = 0;
-
-    for (let i = 0; i < n; i++) {
-      const x = xs[i];
-      const p1 = w1 * gaussianPdf(x, mu1, sigma1);
-      const p2 = w2 * gaussianPdf(x, mu2, sigma2);
-      const denom = p1 + p2;
-      const g2 = denom > 0 ? p2 / denom : 0;
-      const g1 = 1 - g2;
-      gamma2[i] = g2;
-
-      sum1 += g1;
-      sum2 += g2;
-      sum1x += g1 * x;
-      sum2x += g2 * x;
-      sum1x2 += g1 * x * x;
-      sum2x2 += g2 * x * x;
-    }
-
-    if (sum1 < 1e-6 || sum2 < 1e-6) break;
-
-    const newMu1 = sum1x / sum1;
-    const newMu2 = sum2x / sum2;
-    const newSigma1 = Math.sqrt(
-      Math.max(1e-8, sum1x2 / sum1 - newMu1 * newMu1)
-    );
-    const newSigma2 = Math.sqrt(
-      Math.max(1e-8, sum2x2 / sum2 - newMu2 * newMu2)
-    );
-    const newW1 = sum1 / n;
-    const newW2 = sum2 / n;
-
-    const delta = Math.abs(newMu1 - mu1) + Math.abs(newMu2 - mu2);
-    mu1 = newMu1;
-    mu2 = newMu2;
-    sigma1 = Math.max(newSigma1, 1e-4);
-    sigma2 = Math.max(newSigma2, 1e-4);
-    w1 = newW1;
-    w2 = newW2;
-
-    if (delta < 1e-4) break;
-  }
-
-  // Ensure mu1 < mu2; if swapped, flip responsibilities.
-  if (mu1 > mu2) {
-    [mu1, mu2] = [mu2, mu1];
-    [sigma1, sigma2] = [sigma2, sigma1];
-    [w1, w2] = [w2, w1];
-    for (let i = 0; i < gamma2.length; i++) {
-      gamma2[i] = 1 - gamma2[i];
-    }
-  }
-
-  return { mu1, mu2, sigma1, sigma2, w1, w2, gamma2 };
-}
-
-function computeCatchingPeaksMetric(history, windowDays = PEAKS_WINDOW_DAYS) {
-  if (!Array.isArray(history) || history.length < 30) return null;
-
-  const nowMs = Date.now();
-  const cutoffMs = nowMs - windowDays * 86400 * 1000;
-  const cutoff24hMs = nowMs - 24 * 3600 * 1000;
-
-  const pts = history
-    .map((pt) => {
-      const iso = pt.timestamp_iso || pt.timestamp || null;
-      const ts = iso ? Date.parse(iso) : NaN;
-      const price =
-        typeof pt.price === "number" && Number.isFinite(pt.price)
-          ? pt.price
-          : NaN;
-      const volume =
-        typeof pt.volume === "number" && Number.isFinite(pt.volume)
-          ? pt.volume
-          : 0;
-      return { ts, price, volume };
-    })
-    .filter(
-      (pt) =>
-        Number.isFinite(pt.ts) &&
-        pt.ts >= cutoffMs &&
-        Number.isFinite(pt.price) &&
-        pt.price > 0
-    )
-    .sort((a, b) => a.ts - b.ts);
-
-  if (pts.length < 30) return null;
-
-  const prices = pts.map((p) => p.price);
-  const fit = fitTwoGaussianMixtureLog(prices);
-  if (!fit) return null;
-
-  const baselinePrices = [];
-  const spikePrices = [];
-  let spikeRuns = [];
-  let currentRun = 0;
-  let spikeWeightSum = 0;
-
-  for (let i = 0; i < prices.length; i++) {
-    const g2 = fit.gamma2[i];
-    spikeWeightSum += g2;
-    const isSpike = g2 > 0.5;
-    if (isSpike) {
-      spikePrices.push(prices[i]);
-      currentRun += 1;
-    } else {
-      baselinePrices.push(prices[i]);
-      if (currentRun > 0) {
-        spikeRuns.push(currentRun);
-        currentRun = 0;
-      }
-    }
-  }
-  if (currentRun > 0) spikeRuns.push(currentRun);
-
-  const lowAvg =
-    baselinePrices.length > 0
-      ? meanOf(baselinePrices)
-      : Math.exp(fit.mu1);
-  const peakAvg =
-    spikePrices.length > 0 ? meanOf(spikePrices) : Math.exp(fit.mu2);
-
-  if (!Number.isFinite(lowAvg) || lowAvg <= 0 || !Number.isFinite(peakAvg)) {
-    return null;
-  }
-
-  const separation = peakAvg / lowAvg;
-  const pctDiff = (separation - 1) * 100;
-
-  const w2 = spikeWeightSum / prices.length;
-
-  let baselineCv = 1;
-  if (baselinePrices.length >= 3) {
-    const bStd = Math.sqrt(
-      Math.max(0, varianceOf(baselinePrices, lowAvg))
-    );
-    baselineCv =
-      Number.isFinite(bStd) && lowAvg > 0 ? bStd / lowAvg : 1;
-  }
-
-  const avgSpikeLen = spikeRuns.length
-    ? spikeRuns.reduce((a, b) => a + b, 0) / spikeRuns.length
-    : 0;
-
-  const baselineStability = Number.isFinite(baselineCv)
-    ? 1 / (1 + baselineCv * 5)
-    : 0;
-  const rareWeight = Number.isFinite(w2) ? Math.exp(-w2 * 8) : 0;
-  const spikeShortness = 1 / (1 + avgSpikeLen / 3);
-  const separationDelta = Math.max(0, separation - 1);
-
-  let score =
-    separationDelta * rareWeight * baselineStability * spikeShortness;
-  if (!Number.isFinite(score)) score = 0;
-
-  const volume24h = pts
-    .filter((p) => p.ts >= cutoff24hMs)
-    .reduce((s, p) => s + (Number.isFinite(p.volume) ? p.volume : 0), 0);
-
-  return {
-    lowAvg,
-    peakAvg,
-    pctDiff,
-    volume24h,
-    score
-  };
-}
-
 async function handleCatchingPeaks(env) {
   const now = Date.now();
   if (LAST_PEAKS_JSON && now - LAST_PEAKS_FETCHED_AT < PEAKS_CACHE_TTL_MS) {
@@ -2142,82 +1914,22 @@ async function handleCatchingPeaks(env) {
     });
   }
 
-  const { json: sigJson } = await loadSignalsWithCache(env);
-  const signals = sigJson && Array.isArray(sigJson.signals) ? sigJson.signals : [];
-  if (!signals.length) {
-    return new Response(JSON.stringify({ error: "No signals to seed peaks scan" }), {
-      status: 503,
+  const obj = await bucketGetWithRetry(env, "signals/peaks/latest.json", {
+    attempts: 2,
+    baseDelayMs: 150
+  });
+  if (!obj) {
+    return new Response(JSON.stringify({ error: "No catching-peaks signals found" }), {
+      status: 404,
       headers: { "Content-Type": "application/json" }
     });
   }
 
-  const candidates = signals
-    .filter((s) => s && Number.isFinite(Number(s.item_id)))
-    .sort(
-      (a, b) =>
-        (Number(b.volume_window) || 0) - (Number(a.volume_window) || 0)
-    )
-    .slice(0, PEAKS_MAX_ITEMS)
-    .map((s) => ({
-      item_id: Number(s.item_id),
-      name: s.name || ("Item " + s.item_id)
-    }));
-
-  const latest5m = await loadLatestFiveMinuteSnapshot(env);
-  const latestSnap = latest5m && latest5m.snapshot ? latest5m.snapshot : null;
-
-  const results = [];
-
-  for (let i = 0; i < candidates.length; i += PEAKS_BATCH_SIZE) {
-    const batch = candidates.slice(i, i + PEAKS_BATCH_SIZE);
-    const batchRes = await Promise.all(
-      batch.map(async (c) => {
-        const { history: baseHistory, found } = await loadPrecomputedHistory(
-          env,
-          c.item_id
-        );
-        if (!found || !baseHistory.length) return null;
-
-        let history = baseHistory;
-        if (latestSnap) {
-          history = maybeAppendLatestFiveMinute(
-            history,
-            latestSnap,
-            c.item_id
-          ).history;
-        }
-
-        const metric = computeCatchingPeaksMetric(history, PEAKS_WINDOW_DAYS);
-        if (!metric) return null;
-
-        return {
-          item_id: c.item_id,
-          name: c.name,
-          low_avg_price: metric.lowAvg,
-          peak_avg_price: metric.peakAvg,
-          pct_difference: metric.pctDiff,
-          volume_24h: metric.volume24h,
-          score: metric.score
-        };
-      })
-    );
-    for (const r of batchRes) {
-      if (r) results.push(r);
-    }
-  }
-
-  results.sort((a, b) => (b.score || 0) - (a.score || 0));
-
-  const body = JSON.stringify({
-    generated_at_iso: new Date().toISOString(),
-    window_days: PEAKS_WINDOW_DAYS,
-    items: results
-  });
-
-  LAST_PEAKS_JSON = body;
+  const text = await obj.text();
+  LAST_PEAKS_JSON = text;
   LAST_PEAKS_FETCHED_AT = Date.now();
 
-  return new Response(body, {
+  return new Response(text, {
     status: 200,
     headers: { "Content-Type": "application/json" }
   });

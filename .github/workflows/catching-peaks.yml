@@ -1,0 +1,35 @@
+name: Score Catching Peaks metric
+
+on:
+  workflow_dispatch:
+  # Optional daily refresh after histories are updated
+  schedule:
+    - cron: "30 3 * * *"
+
+jobs:
+  catching-peaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: ./ml
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Score catching peaks for all items
+        working-directory: ./ml
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python score_catching_peaks.py
+
