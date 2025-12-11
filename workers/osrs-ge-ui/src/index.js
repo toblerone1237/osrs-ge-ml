@@ -280,9 +280,12 @@ const HTML = `<!DOCTYPE html>
     let MODEL_HORIZON = 60;
     let MODEL_TAX = 0.02;
     let priceChart = null;
+    // Ranking pagination
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
     const RANKING_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
+    // Latest volume timeline for the active chart (aligned to labels)
+    let latestVolumeTimeline = [];
 
     function loadPinnedState() {
       try {
@@ -827,6 +830,7 @@ const HTML = `<!DOCTYPE html>
     function buildTimeline(history, forecast, starInfo) {
       const tsSet = new Set();
       const histMap = new Map();
+      const volMap = new Map();
       const fcMap = new Map();
       const oldFcMap = new Map();
 
@@ -843,6 +847,9 @@ const HTML = `<!DOCTYPE html>
         if (ts == null) return;
         tsSet.add(ts);
         histMap.set(ts, pt.price);
+        if (pt.volume != null && Number.isFinite(pt.volume)) {
+          volMap.set(ts, pt.volume);
+        }
       });
 
       forecast.forEach((pt) => {
@@ -917,6 +924,7 @@ const HTML = `<!DOCTYPE html>
       });
 
       const histData = [];
+      const volumeData = [];
       const fcData = [];
       const oldFcData = [];
       const starMarkerData = [];
@@ -924,6 +932,7 @@ const HTML = `<!DOCTYPE html>
 
       tsList.forEach(function (ts) {
         histData.push(histMap.has(ts) ? histMap.get(ts) : null);
+        volumeData.push(volMap.has(ts) ? volMap.get(ts) : null);
 
         const isFutureOrNow = nowTs == null || ts >= nowTs;
         fcData.push(isFutureOrNow && fcMap.has(ts) ? fcMap.get(ts) : null);
@@ -944,6 +953,7 @@ const HTML = `<!DOCTYPE html>
       return {
         labels,
         histData,
+        volumeData,
         fcData,
         oldFcData,
         starMarkerData,
@@ -993,10 +1003,13 @@ const HTML = `<!DOCTYPE html>
         const tl = buildTimeline(history, forecast, starInfo);
         const labels = tl.labels;
         const histData = tl.histData;
+        const volumeData = tl.volumeData;
         const fcData = tl.fcData;
         const oldFcData = tl.oldFcData;
         const starMarkerData = tl.starMarkerData;
         const nowMarkerData = tl.nowMarkerData;
+
+        latestVolumeTimeline = Array.isArray(volumeData) ? volumeData.slice() : [];
 
         const allPrices = []
           .concat(histData, fcData)
@@ -1099,6 +1112,11 @@ const HTML = `<!DOCTYPE html>
             responsive: true,
             maintainAspectRatio: false,
             animation: false,
+            interaction: {
+              mode: "index",
+              intersect: false,
+              axis: "x"
+            },
             scales: {
               x: {
                 type: "time",
@@ -1132,6 +1150,37 @@ const HTML = `<!DOCTYPE html>
             plugins: {
               legend: {
                 position: "bottom"
+              },
+              tooltip: {
+                callbacks: {
+                  label: function (context) {
+                    const dsLabel = context.dataset && context.dataset.label ? context.dataset.label : "";
+                    const value = context.parsed && typeof context.parsed.y === "number"
+                      ? context.parsed.y
+                      : null;
+                    const idx = context.dataIndex;
+                    const vol =
+                      Array.isArray(latestVolumeTimeline) &&
+                      idx != null &&
+                      idx >= 0 &&
+                      idx < latestVolumeTimeline.length
+                        ? latestVolumeTimeline[idx]
+                        : null;
+
+                    let base =
+                      dsLabel && value != null
+                        ? dsLabel + ": " + value.toLocaleString("en-US")
+                        : value != null
+                        ? value.toLocaleString("en-US")
+                        : dsLabel || "";
+
+                    if (vol != null && Number.isFinite(vol) && vol > 0) {
+                      base += " (volume " + Math.round(vol).toLocaleString("en-US") + ")";
+                    }
+
+                    return base;
+                  }
+                }
               },
               zoom: {
                 zoom: {
@@ -1511,7 +1560,7 @@ async function handleDaily(env) {
 
 // Load precomputed per-item history from R2: history/{itemId}.json
 async function loadPrecomputedHistory(env, itemId) {
-  const key = "history/" + itemId + ".json";
+    const key = "history/" + itemId + ".json";
   const obj = await bucketGetWithRetry(env, key, { attempts: 2, baseDelayMs: 150 });
   if (!obj) {
     return { history: [], found: false };
@@ -1531,7 +1580,11 @@ async function loadPrecomputedHistory(env, itemId) {
           typeof pt.price === "number" && Number.isFinite(pt.price)
             ? pt.price
             : NaN;
-        return { ts, iso, price };
+        const volume =
+          typeof pt.volume === "number" && Number.isFinite(pt.volume)
+            ? pt.volume
+            : null;
+        return { ts, iso, price, volume };
       })
       .filter(
         (pt) =>
@@ -1544,7 +1597,8 @@ async function loadPrecomputedHistory(env, itemId) {
       .sort((a, b) => a.ts - b.ts)
       .map((pt) => ({
         timestamp_iso: new Date(pt.ts).toISOString(),
-        price: pt.price
+        price: pt.price,
+        volume: pt.volume
       }));
 
     return { history: cleaned, found: cleaned.length > 0 };
