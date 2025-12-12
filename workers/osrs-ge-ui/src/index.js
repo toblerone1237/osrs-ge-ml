@@ -186,21 +186,19 @@ const HTML = `<!DOCTYPE html>
 	      opacity: 0.5;
 	      cursor: default;
 	    }
-	    .peaks-layout {
+	    .peaks-tab-layout {
 	      display: flex;
 	      gap: 1rem;
 	      align-items: flex-start;
 	    }
-	    .peaks-table {
+	    .peaks-tab-main {
 	      flex: 1;
 	      min-width: 0;
 	    }
-	    .peaks-sort-pane {
+	    .peaks-tab-side {
 	      width: 260px;
-	      border-left: 1px solid #1f2937;
-	      padding-left: 1rem;
 	    }
-	    .peaks-sort-pane h3 {
+	    .peaks-sort-card h3 {
 	      margin: 0 0 0.6rem 0;
 	      font-size: 0.95rem;
 	      color: #e5e7eb;
@@ -241,15 +239,11 @@ const HTML = `<!DOCTYPE html>
 	      .chart-wrapper { height: 220px; }
 	    }
 	    @media (max-width: 900px) {
-	      .peaks-layout {
+	      .peaks-tab-layout {
 	        flex-direction: column;
 	      }
-	      .peaks-sort-pane {
+	      .peaks-tab-side {
 	        width: 100%;
-	        border-left: none;
-	        border-top: 1px solid #1f2937;
-	        padding-left: 0;
-	        padding-top: 0.75rem;
 	      }
 	    }
 	    .tabs {
@@ -334,28 +328,33 @@ const HTML = `<!DOCTYPE html>
       <div id="standardChartMount"></div>
     </div>
 
-    <div id="tab-peaks" class="tab-content" role="tabpanel" aria-hidden="true">
-      <div class="card">
-        <div id="peaksStatus">Loading catching‑peaks metrics...</div>
-        <div id="peaksMeta" class="small"></div>
-      </div>
+	    <div id="tab-peaks" class="tab-content" role="tabpanel" aria-hidden="true">
+	      <div class="peaks-tab-layout">
+	        <div class="peaks-tab-main">
+	          <div class="card">
+	            <div id="peaksStatus">Loading catching‑peaks metrics...</div>
+	            <div id="peaksMeta" class="small"></div>
+	          </div>
 
-      <div class="card">
-        <h2>Catching Peaks leaderboard</h2>
-	      <div class="small" style="margin-bottom:0.4rem;">
-	          Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
-	          Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
-	      </div>
-	        <div class="peaks-layout">
-	          <div id="peaksTableContainer" class="peaks-table">Waiting for data...</div>
-	          <div class="peaks-sort-pane">
+	          <div class="card">
+	            <h2>Catching Peaks leaderboard</h2>
+	            <div class="small" style="margin-bottom:0.4rem;">
+	              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
+	              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+	            </div>
+	            <div id="peaksTableContainer">Waiting for data...</div>
+	          </div>
+
+	          <div id="peaksChartMount"></div>
+	        </div>
+
+	        <div class="peaks-tab-side">
+	          <div class="card peaks-sort-card">
 	            <h3>Weighted sort</h3>
 	            <div id="peaksSortPane"></div>
 	          </div>
 	        </div>
 	      </div>
-
-	      <div id="peaksChartMount"></div>
 	    </div>
 
     <div id="priceCard" class="card">
