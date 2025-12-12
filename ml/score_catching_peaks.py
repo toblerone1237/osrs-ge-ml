@@ -192,22 +192,56 @@ def compute_catching_peaks_metric(
     avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
 
     # Count peaks by merging spike runs unless there is at least 4h of
-    # non-spike time between their bases (end -> next start).
+    # non-spike time between their bases (end -> next start). A merged
+    # peak is only counted if its max price exceeds the baseline average
+    # by at least 50%.
     peak_gap_ms = 4 * 3600 * 1000.0
+    min_peak_price = low_avg * 1.5
     peaks_count = 0
-    last_peak_end_ts: Optional[float] = None
+    current_peak_end_ts: Optional[float] = None
+    current_peak_max_price: Optional[float] = None
     for start_idx, end_idx in spike_run_slices:
         if end_idx < start_idx:
             continue
+        run_prices = prices[start_idx : end_idx + 1]
+        if run_prices.size == 0:
+            continue
+        run_max_price = float(np.max(run_prices))
         try:
             start_ts = float(pts[start_idx][0])
             end_ts = float(pts[end_idx][0])
         except Exception:
             continue
-        if last_peak_end_ts is None or (start_ts - last_peak_end_ts) >= peak_gap_ms:
-            peaks_count += 1
-        if last_peak_end_ts is None or end_ts > last_peak_end_ts:
-            last_peak_end_ts = end_ts
+
+        if current_peak_end_ts is None:
+            current_peak_end_ts = end_ts
+            current_peak_max_price = run_max_price
+            continue
+
+        gap_ms = start_ts - current_peak_end_ts
+        if gap_ms >= peak_gap_ms:
+            if (
+                current_peak_max_price is not None
+                and current_peak_max_price >= min_peak_price
+            ):
+                peaks_count += 1
+            current_peak_end_ts = end_ts
+            current_peak_max_price = run_max_price
+        else:
+            if end_ts > current_peak_end_ts:
+                current_peak_end_ts = end_ts
+            if (
+                current_peak_max_price is None
+                or run_max_price > current_peak_max_price
+            ):
+                current_peak_max_price = run_max_price
+
+    if (
+        current_peak_end_ts is not None
+        and current_peak_max_price is not None
+        and current_peak_max_price >= min_peak_price
+    ):
+        peaks_count += 1
 
     baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
     rare_weight = exp(-w2 * 8.0)

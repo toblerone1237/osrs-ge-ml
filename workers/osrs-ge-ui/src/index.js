@@ -1031,6 +1031,7 @@ const HTML = `<!DOCTYPE html>
         "Low Average Price",
         "Peak Average Price",
         "% Difference",
+        "Sharpness",
         "Peaks Count",
         "Last 24 Trading Volume",
         "Trading Volume Cap"
@@ -1063,6 +1064,11 @@ const HTML = `<!DOCTYPE html>
             ? row.pct_difference.toFixed(1) + "%"
             : "-";
         tr.appendChild(tdPct);
+
+        const tdSharpness = document.createElement("td");
+        tdSharpness.textContent =
+          Number.isFinite(row.score) ? row.score.toFixed(4) : "-";
+        tr.appendChild(tdSharpness);
 
         const tdPeaksCount = document.createElement("td");
         tdPeaksCount.textContent =
