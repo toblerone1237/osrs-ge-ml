@@ -1389,10 +1389,12 @@ const HTML = `<!DOCTYPE html>
 	        return peaksSortDir === "asc" ? cmp : -cmp;
 	      });
 
-	      const trHead = document.createElement("tr");
-	      const headerDefs = [{ key: "item", header: "Item" }].concat(
-	        allColumns.map((c) => ({ key: c.key, header: c.header }))
-	      );
+		      const displayColumns = baseColumns;
+
+		      const trHead = document.createElement("tr");
+		      const headerDefs = [{ key: "item", header: "Item" }].concat(
+		        displayColumns.map((c) => ({ key: c.key, header: c.header }))
+		      );
 	      headerDefs.forEach((h) => {
 	        const th = document.createElement("th");
 	        const isActive = peaksSortKey === h.key;
@@ -1434,11 +1436,11 @@ const HTML = `<!DOCTYPE html>
         tdName.textContent = row.name || ("Item " + row.item_id);
         tr.appendChild(tdName);
 
-        allColumns.forEach((col) => {
-          const td = document.createElement("td");
-          const val = col.value(row);
-          td.textContent = col.format ? col.format(val) : val;
-          tr.appendChild(td);
+	        displayColumns.forEach((col) => {
+	          const td = document.createElement("td");
+	          const val = col.value(row);
+	          td.textContent = col.format ? col.format(val) : val;
+	          tr.appendChild(td);
         });
 
         tr.addEventListener("click", () => {
