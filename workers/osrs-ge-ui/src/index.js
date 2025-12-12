@@ -182,21 +182,81 @@ const HTML = `<!DOCTYPE html>
     .pagination-controls button:hover:not(:disabled) {
       background: #1f2937;
     }
-    .pagination-controls button:disabled {
-      opacity: 0.5;
-      cursor: default;
-    }
-    @media (max-width: 750px) {
-      table { font-size: 0.78rem; }
-      header h1 { font-size: 1.2rem; }
-      .card { padding: 0.85rem 0.9rem; }
-      .chart-wrapper { height: 220px; }
-    }
-    .tabs {
-      display: flex;
-      gap: 0.25rem;
-      margin: 0.75rem 0 1rem;
-      border-bottom: 1px solid #1f2937;
+	    .pagination-controls button:disabled {
+	      opacity: 0.5;
+	      cursor: default;
+	    }
+	    .peaks-layout {
+	      display: flex;
+	      gap: 1rem;
+	      align-items: flex-start;
+	    }
+	    .peaks-table {
+	      flex: 1;
+	      min-width: 0;
+	    }
+	    .peaks-sort-pane {
+	      width: 260px;
+	      border-left: 1px solid #1f2937;
+	      padding-left: 1rem;
+	    }
+	    .peaks-sort-pane h3 {
+	      margin: 0 0 0.6rem 0;
+	      font-size: 0.95rem;
+	      color: #e5e7eb;
+	    }
+	    .peaks-weight-row {
+	      display: flex;
+	      flex-direction: column;
+	      gap: 0.25rem;
+	      margin-bottom: 0.7rem;
+	    }
+	    .peaks-weight-label {
+	      display: flex;
+	      justify-content: space-between;
+	      font-size: 0.8rem;
+	      color: #9ca3af;
+	    }
+	    .peaks-weight-row input[type="range"] {
+	      width: 100%;
+	    }
+	    .peaks-apply-btn {
+	      width: 100%;
+	      margin-top: 0.25rem;
+	      padding: 0.35rem 0.6rem;
+	      border-radius: 0.35rem;
+	      border: 1px solid #4b5563;
+	      background: #111827;
+	      color: #e5e7eb;
+	      cursor: pointer;
+	      font-size: 0.85rem;
+	    }
+	    .peaks-apply-btn:hover {
+	      background: #1f2937;
+	    }
+	    @media (max-width: 750px) {
+	      table { font-size: 0.78rem; }
+	      header h1 { font-size: 1.2rem; }
+	      .card { padding: 0.85rem 0.9rem; }
+	      .chart-wrapper { height: 220px; }
+	    }
+	    @media (max-width: 900px) {
+	      .peaks-layout {
+	        flex-direction: column;
+	      }
+	      .peaks-sort-pane {
+	        width: 100%;
+	        border-left: none;
+	        border-top: 1px solid #1f2937;
+	        padding-left: 0;
+	        padding-top: 0.75rem;
+	      }
+	    }
+	    .tabs {
+	      display: flex;
+	      gap: 0.25rem;
+	      margin: 0.75rem 0 1rem;
+	      border-bottom: 1px solid #1f2937;
     }
     .tab-btn {
       appearance: none;
@@ -282,15 +342,21 @@ const HTML = `<!DOCTYPE html>
 
       <div class="card">
         <h2>Catching Peaks leaderboard</h2>
-        <div class="small" style="margin-bottom:0.4rem;">
-          Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
-          Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
-        </div>
-        <div id="peaksTableContainer">Waiting for data...</div>
-      </div>
+	      <div class="small" style="margin-bottom:0.4rem;">
+	          Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
+	          Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+	      </div>
+	        <div class="peaks-layout">
+	          <div id="peaksTableContainer" class="peaks-table">Waiting for data...</div>
+	          <div class="peaks-sort-pane">
+	            <h3>Weighted sort</h3>
+	            <div id="peaksSortPane"></div>
+	          </div>
+	        </div>
+	      </div>
 
-      <div id="peaksChartMount"></div>
-    </div>
+	      <div id="peaksChartMount"></div>
+	    </div>
 
     <div id="priceCard" class="card">
       <h2>Price history &amp; forecast</h2>
@@ -327,13 +393,14 @@ const HTML = `<!DOCTYPE html>
     const searchResultsEl = document.getElementById("searchResults");
     const pinnedListEl = document.getElementById("pinnedList");
 
-    const peaksStatusEl = document.getElementById("peaksStatus");
-    const peaksMetaEl = document.getElementById("peaksMeta");
-    const peaksTableContainer = document.getElementById("peaksTableContainer");
-    const standardChartMount = document.getElementById("standardChartMount");
-    const peaksChartMount = document.getElementById("peaksChartMount");
-    const priceCardEl = document.getElementById("priceCard");
-    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
+	    const peaksStatusEl = document.getElementById("peaksStatus");
+	    const peaksMetaEl = document.getElementById("peaksMeta");
+	    const peaksTableContainer = document.getElementById("peaksTableContainer");
+	    const peaksSortPaneEl = document.getElementById("peaksSortPane");
+	    const standardChartMount = document.getElementById("standardChartMount");
+	    const peaksChartMount = document.getElementById("peaksChartMount");
+	    const priceCardEl = document.getElementById("priceCard");
+	    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
     const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
 
@@ -355,12 +422,15 @@ const HTML = `<!DOCTYPE html>
 	    let peaksPageSize = 10;
 	    let peaksCurrentPage = 1;
 	    const PEAKS_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
-	    let peaksItems = [];
-	    let peaksLoaded = false;
-	    let peaksSortKey = "sharpness";
-	    let peaksSortDir = "desc";
-	    // Latest volume timeline for the active chart (aligned to labels)
-	    let latestVolumeTimeline = [];
+		    let peaksItems = [];
+		    let peaksLoaded = false;
+		    let peaksSortKey = "sharpness";
+		    let peaksSortDir = "desc";
+		    const DEFAULT_PEAK_WEIGHT = 100;
+		    let peaksPercentWeights = {};
+		    let peaksSortPaneKeys = [];
+		    // Latest volume timeline for the active chart (aligned to labels)
+		    let latestVolumeTimeline = [];
 
     function moveChartToTab(tabName) {
       const mount =
@@ -902,7 +972,7 @@ const HTML = `<!DOCTYPE html>
       tableContainer.appendChild(pagerBottom);
     }
 
-    function buildPeaksPaginationControls(totalRows, pageSize, currentPage) {
+	    function buildPeaksPaginationControls(totalRows, pageSize, currentPage) {
       const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
       const clampedPage =
         totalPages > 0 ? Math.min(Math.max(1, currentPage), totalPages) : 1;
@@ -997,13 +1067,77 @@ const HTML = `<!DOCTYPE html>
       container.appendChild(right);
 
       return container;
-    }
+	    }
 
-    function renderPeaksTable() {
-      if (!peaksTableContainer) return;
-      if (!peaksItems.length) {
-        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
-        return;
+	    function renderPeaksSortPane(percentColumns) {
+	      if (!peaksSortPaneEl || !Array.isArray(percentColumns)) return;
+
+	      const keys = percentColumns.map((c) => c.key);
+	      const sameKeys =
+	        keys.length === peaksSortPaneKeys.length &&
+	        keys.every((k, i) => k === peaksSortPaneKeys[i]);
+	      if (sameKeys && peaksSortPaneEl.childElementCount > 0) {
+	        return;
+	      }
+	      peaksSortPaneKeys = keys;
+
+	      peaksSortPaneEl.innerHTML = "";
+	      percentColumns.forEach((col, idx) => {
+	        const weightExisting = peaksPercentWeights[col.key];
+	        const weightVal = Number.isFinite(weightExisting)
+	          ? weightExisting
+	          : DEFAULT_PEAK_WEIGHT;
+	        peaksPercentWeights[col.key] = weightVal;
+
+	        const rowEl = document.createElement("div");
+	        rowEl.className = "peaks-weight-row";
+
+	        const labelEl = document.createElement("div");
+	        labelEl.className = "peaks-weight-label";
+	        const nameSpan = document.createElement("span");
+	        nameSpan.textContent = col.header;
+	        const valueSpan = document.createElement("span");
+	        valueSpan.textContent = String(weightVal);
+	        labelEl.appendChild(nameSpan);
+	        labelEl.appendChild(valueSpan);
+
+	        const slider = document.createElement("input");
+	        slider.type = "range";
+	        slider.min = "0";
+	        slider.max = "100";
+	        slider.step = "1";
+	        slider.value = String(weightVal);
+	        slider.setAttribute("aria-label", col.header + " weight");
+	        slider.id = "peaks-weight-" + idx;
+	        slider.addEventListener("input", (ev) => {
+	          const v = Number(ev.target.value);
+	          peaksPercentWeights[col.key] = Number.isFinite(v) ? v : 0;
+	          valueSpan.textContent = String(peaksPercentWeights[col.key]);
+	        });
+
+	        rowEl.appendChild(labelEl);
+	        rowEl.appendChild(slider);
+	        peaksSortPaneEl.appendChild(rowEl);
+	      });
+
+	      const applyBtn = document.createElement("button");
+	      applyBtn.type = "button";
+	      applyBtn.className = "peaks-apply-btn";
+	      applyBtn.textContent = "Apply weights";
+	      applyBtn.addEventListener("click", () => {
+	        peaksSortKey = "__weighted_avg";
+	        peaksSortDir = "desc";
+	        peaksCurrentPage = 1;
+	        renderPeaksTable();
+	      });
+	      peaksSortPaneEl.appendChild(applyBtn);
+	    }
+
+	    function renderPeaksTable() {
+	      if (!peaksTableContainer) return;
+	      if (!peaksItems.length) {
+	        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
+	        return;
       }
 
 	      const rows = peaksItems.slice();
@@ -1172,10 +1306,10 @@ const HTML = `<!DOCTYPE html>
 	        "avg_time_between_peaks_days"
 	      ]);
 
-	      const percentColumns = baseColumns.map((col) => ({
-	        key: col.key + "_norm_pct",
-	        header: col.header + " %",
-	        value: (row) => {
+		      const percentColumns = baseColumns.map((col) => ({
+		        key: col.key + "_norm_pct",
+		        header: col.header + " %",
+		        value: (row) => {
 	          const stats = statsByKey.get(col.key);
 	          const v = col.value(row);
 	          if (
@@ -1199,16 +1333,38 @@ const HTML = `<!DOCTYPE html>
 	          }
 	          return pct;
 	        },
-	        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
-	      }));
+		        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
+		      }));
 
-	      const allColumns = baseColumns.concat(percentColumns);
+		      renderPeaksSortPane(percentColumns);
 
-	      function getSortValue(row) {
-	        if (peaksSortKey === "item") {
-	          return (row && row.name) || ("Item " + row.item_id);
-	        }
-	        const col = allColumns.find((c) => c.key === peaksSortKey);
+		      const allColumns = baseColumns.concat(percentColumns);
+
+		      function getWeightedAverage(row) {
+		        let numerator = 0;
+		        let denom = 0;
+		        percentColumns.forEach((col) => {
+		          const wRaw = peaksPercentWeights[col.key];
+		          const w = Number.isFinite(wRaw) ? wRaw : DEFAULT_PEAK_WEIGHT;
+		          if (w <= 0) return;
+		          denom += w;
+		          const v = col.value(row);
+		          if (Number.isFinite(v)) {
+		            numerator += w * v;
+		          }
+		        });
+		        if (denom <= 0) return null;
+		        return numerator / denom;
+		      }
+
+		      function getSortValue(row) {
+		        if (peaksSortKey === "__weighted_avg") {
+		          return getWeightedAverage(row);
+		        }
+		        if (peaksSortKey === "item") {
+		          return (row && row.name) || ("Item " + row.item_id);
+		        }
+		        const col = allColumns.find((c) => c.key === peaksSortKey);
 	        if (!col) return null;
 	        return col.value(row);
 	      }
