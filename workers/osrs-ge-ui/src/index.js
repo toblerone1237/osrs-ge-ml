@@ -1025,17 +1025,135 @@ const HTML = `<!DOCTYPE html>
       const thead = document.createElement("thead");
       const tbody = document.createElement("tbody");
 
+      function getPriceDifference(row) {
+        const low = row && row.low_avg_price;
+        const peak = row && row.peak_avg_price;
+        if (!Number.isFinite(low) || !Number.isFinite(peak)) return null;
+        return peak - low;
+      }
+
+      function getTradingCap(row) {
+        const mapEntry = mappingById.get(Number(row && row.item_id));
+        return mapEntry && Number.isFinite(mapEntry.limit) ? mapEntry.limit : null;
+      }
+
+      function formatCount(v) {
+        return Number.isFinite(v) ? Math.round(v).toLocaleString("en-US") : "-";
+      }
+
+      const baseColumns = [
+        {
+          key: "low_avg_price",
+          header: "Low Average Price",
+          value: (row) => row.low_avg_price,
+          format: formatProfitGp
+        },
+        {
+          key: "peak_avg_price",
+          header: "Peak Average Price",
+          value: (row) => row.peak_avg_price,
+          format: formatProfitGp
+        },
+        {
+          key: "price_difference",
+          header: "Price Difference",
+          value: (row) => getPriceDifference(row),
+          format: formatProfitGp
+        },
+        {
+          key: "pct_difference",
+          header: "% Difference",
+          value: (row) => row.pct_difference,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
+        },
+        {
+          key: "sharpness",
+          header: "Sharpness",
+          value: (row) => row.score,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(4) : "-")
+        },
+        {
+          key: "peaks_count",
+          header: "Peaks Count",
+          value: (row) => row.peaks_count,
+          format: formatCount
+        },
+        {
+          key: "profit_24h",
+          header: "24 Trading Profit",
+          value: (row) => {
+            const diff = getPriceDifference(row);
+            const vol = row.volume_24h;
+            return Number.isFinite(diff) && Number.isFinite(vol) ? diff * vol : null;
+          },
+          format: formatProfitGp
+        },
+        {
+          key: "volume_24h",
+          header: "Last 24 Trading Volume",
+          value: (row) => row.volume_24h,
+          format: formatCount
+        },
+        {
+          key: "profit_cap",
+          header: "Cap Trading Profit",
+          value: (row) => {
+            const diff = getPriceDifference(row);
+            const cap = getTradingCap(row);
+            return Number.isFinite(diff) && Number.isFinite(cap) ? diff * cap : null;
+          },
+          format: formatProfitGp
+        },
+        {
+          key: "trading_cap",
+          header: "Trading Volume Cap",
+          value: (row) => getTradingCap(row),
+          format: formatCount
+        }
+      ];
+
+      function computeRangeStats(valueFn) {
+        let min = Infinity;
+        let max = -Infinity;
+        rows.forEach((r) => {
+          const v = valueFn(r);
+          if (!Number.isFinite(v)) return;
+          if (v < min) min = v;
+          if (v > max) max = v;
+        });
+        if (min === Infinity || max === -Infinity) {
+          return { min: null, max: null, range: null };
+        }
+        const range = max - min;
+        return {
+          min,
+          max,
+          range: Number.isFinite(range) && range !== 0 ? range : null
+        };
+      }
+
+      const statsByKey = new Map();
+      baseColumns.forEach((col) => {
+        statsByKey.set(col.key, computeRangeStats(col.value));
+      });
+
+      const percentColumns = baseColumns.map((col) => ({
+        key: col.key + "_norm_pct",
+        header: col.header + " %",
+        value: (row) => {
+          const stats = statsByKey.get(col.key);
+          const v = col.value(row);
+          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.range)) return "-";
+          const pct = ((v - stats.min) / stats.range) * 100;
+          return pct.toFixed(2) + "%";
+        },
+        format: (v) => v
+      }));
+
+      const allColumns = baseColumns.concat(percentColumns);
+
       const trHead = document.createElement("tr");
-      [
-        "Item",
-        "Low Average Price",
-        "Peak Average Price",
-        "% Difference",
-        "Sharpness",
-        "Peaks Count",
-        "Last 24 Trading Volume",
-        "Trading Volume Cap"
-      ].forEach((h) => {
+      ["Item"].concat(allColumns.map((c) => c.header)).forEach((h) => {
         const th = document.createElement("th");
         th.textContent = h;
         trHead.appendChild(th);
@@ -1050,48 +1168,12 @@ const HTML = `<!DOCTYPE html>
         tdName.textContent = row.name || ("Item " + row.item_id);
         tr.appendChild(tdName);
 
-        const tdLow = document.createElement("td");
-        tdLow.textContent = formatProfitGp(row.low_avg_price);
-        tr.appendChild(tdLow);
-
-        const tdPeak = document.createElement("td");
-        tdPeak.textContent = formatProfitGp(row.peak_avg_price);
-        tr.appendChild(tdPeak);
-
-        const tdPct = document.createElement("td");
-        tdPct.textContent =
-          Number.isFinite(row.pct_difference)
-            ? row.pct_difference.toFixed(1) + "%"
-            : "-";
-        tr.appendChild(tdPct);
-
-        const tdSharpness = document.createElement("td");
-        tdSharpness.textContent =
-          Number.isFinite(row.score) ? row.score.toFixed(4) : "-";
-        tr.appendChild(tdSharpness);
-
-        const tdPeaksCount = document.createElement("td");
-        tdPeaksCount.textContent =
-          Number.isFinite(row.peaks_count)
-            ? Math.round(row.peaks_count).toLocaleString("en-US")
-            : "-";
-        tr.appendChild(tdPeaksCount);
-
-        const tdVol = document.createElement("td");
-        tdVol.textContent =
-          Number.isFinite(row.volume_24h)
-            ? Math.round(row.volume_24h).toLocaleString("en-US")
-            : "-";
-        tr.appendChild(tdVol);
-
-        const mapEntry = mappingById.get(Number(row.item_id));
-        const limitVal =
-          mapEntry && Number.isFinite(mapEntry.limit)
-            ? mapEntry.limit.toLocaleString("en-US")
-            : "-";
-        const tdCap = document.createElement("td");
-        tdCap.textContent = limitVal;
-        tr.appendChild(tdCap);
+        allColumns.forEach((col) => {
+          const td = document.createElement("td");
+          const val = col.value(row);
+          td.textContent = col.format ? col.format(val) : val;
+          tr.appendChild(td);
+        });
 
         tr.addEventListener("click", () => {
           loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id));
