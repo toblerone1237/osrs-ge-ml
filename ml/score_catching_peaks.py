@@ -146,20 +146,57 @@ def compute_catching_peaks_metric(
         return None
 
     gamma2 = fit["gamma2"]
-    is_spike = gamma2 > 0.5
+    w1 = float(fit["w1"])
+    w2 = float(fit["w2"])
 
-    baseline_prices = prices[~is_spike]
-    spike_prices = prices[is_spike]
+    # By default, treat the lower-mean component as baseline and the higher-mean
+    # component as spikes. If the higher-mean component dominates the mass,
+    # we likely have "reverse peaks" (rare dips) and should treat the dominant
+    # cluster as the baseline instead.
+    baseline_is_comp2 = w2 > w1
 
-    low_avg = float(baseline_prices.mean()) if baseline_prices.size else exp(fit["mu1"])
-    peak_avg = float(spike_prices.mean()) if spike_prices.size else exp(fit["mu2"])
+    def robust_trimmed_mean(x: np.ndarray) -> Optional[float]:
+        if x.size == 0:
+            return None
+        if x.size < 10:
+            return float(np.median(x))
+        lo = float(np.quantile(x, 0.05))
+        hi = float(np.quantile(x, 0.95))
+        trimmed = x[(x >= lo) & (x <= hi)]
+        if trimmed.size == 0:
+            trimmed = x
+        return float(trimmed.mean())
+
+    if baseline_is_comp2:
+        baseline_mask = gamma2 > 0.5
+        is_spike = ~baseline_mask
+        mu_baseline = float(fit["mu2"])
+        mu_spike = float(fit["mu1"])
+        spike_weight = w1
+    else:
+        baseline_mask = gamma2 <= 0.5
+        is_spike = ~baseline_mask
+        mu_baseline = float(fit["mu1"])
+        mu_spike = float(fit["mu2"])
+        spike_weight = w2
+
+    baseline_prices = prices[baseline_mask]
+    spike_prices = prices[~baseline_mask]
+
+    low_avg = robust_trimmed_mean(baseline_prices)
+    if low_avg is None or not np.isfinite(low_avg) or low_avg <= 0:
+        low_avg = exp(mu_baseline)
+
+    peak_avg = robust_trimmed_mean(spike_prices)
+    if peak_avg is None or not np.isfinite(peak_avg) or peak_avg <= 0:
+        peak_avg = exp(mu_spike)
 
     if not np.isfinite(low_avg) or low_avg <= 0 or not np.isfinite(peak_avg):
         return None
 
     separation = peak_avg / low_avg
     pct_diff = (separation - 1.0) * 100.0
-    w2 = float(gamma2.mean())
+    w2 = float(spike_weight)
 
     baseline_cv = 1.0
     if baseline_prices.size >= 3:

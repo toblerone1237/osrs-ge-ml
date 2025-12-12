@@ -351,14 +351,16 @@ const HTML = `<!DOCTYPE html>
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
     const RANKING_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
-    // Catching Peaks pagination
-    let peaksPageSize = 10;
-    let peaksCurrentPage = 1;
-    const PEAKS_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
-    let peaksItems = [];
-    let peaksLoaded = false;
-    // Latest volume timeline for the active chart (aligned to labels)
-    let latestVolumeTimeline = [];
+	    // Catching Peaks pagination
+	    let peaksPageSize = 10;
+	    let peaksCurrentPage = 1;
+	    const PEAKS_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
+	    let peaksItems = [];
+	    let peaksLoaded = false;
+	    let peaksSortKey = "sharpness";
+	    let peaksSortDir = "desc";
+	    // Latest volume timeline for the active chart (aligned to labels)
+	    let latestVolumeTimeline = [];
 
     function moveChartToTab(tabName) {
       const mount =
@@ -1004,26 +1006,14 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
-      const rows = peaksItems.slice();
-      rows.sort((a, b) => (b.score || 0) - (a.score || 0));
+	      const rows = peaksItems.slice();
 
-      const pageSize =
-        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
-      const totalRows = rows.length;
-      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
-      if (peaksCurrentPage < 1) {
-        peaksCurrentPage = 1;
-      } else if (peaksCurrentPage > totalPages) {
-        peaksCurrentPage = totalPages;
-      }
-      const currentPage = peaksCurrentPage;
-      const start = totalRows === 0 ? 0 : (currentPage - 1) * pageSize;
-      const end = totalRows === 0 ? 0 : Math.min(totalRows, start + pageSize);
-      const pageRows = rows.slice(start, end);
+	      const pageSize =
+	        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
 
-      const table = document.createElement("table");
-      const thead = document.createElement("thead");
-      const tbody = document.createElement("tbody");
+	      const table = document.createElement("table");
+	      const thead = document.createElement("thead");
+	      const tbody = document.createElement("tbody");
 
       function getPriceDifference(row) {
         const low = row && row.low_avg_price;
@@ -1137,32 +1127,89 @@ const HTML = `<!DOCTYPE html>
         statsByKey.set(col.key, computeRangeStats(col.value));
       });
 
-      const percentColumns = baseColumns.map((col) => ({
-        key: col.key + "_norm_pct",
-        header: col.header + " %",
-        value: (row) => {
-          const stats = statsByKey.get(col.key);
-          const v = col.value(row);
-          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.range)) return "-";
-          const pct = ((v - stats.min) / stats.range) * 100;
-          return pct.toFixed(2) + "%";
-        },
-        format: (v) => v
-      }));
+	      const percentColumns = baseColumns.map((col) => ({
+	        key: col.key + "_norm_pct",
+	        header: col.header + " %",
+	        value: (row) => {
+	          const stats = statsByKey.get(col.key);
+	          const v = col.value(row);
+	          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.range)) return null;
+	          return ((v - stats.min) / stats.range) * 100;
+	        },
+	        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
+	      }));
 
-      const allColumns = baseColumns.concat(percentColumns);
+	      const allColumns = baseColumns.concat(percentColumns);
 
-      const trHead = document.createElement("tr");
-      ["Item"].concat(allColumns.map((c) => c.header)).forEach((h) => {
-        const th = document.createElement("th");
-        th.textContent = h;
-        trHead.appendChild(th);
-      });
-      thead.appendChild(trHead);
+	      function getSortValue(row) {
+	        if (peaksSortKey === "item") {
+	          return (row && row.name) || ("Item " + row.item_id);
+	        }
+	        const col = allColumns.find((c) => c.key === peaksSortKey);
+	        if (!col) return null;
+	        return col.value(row);
+	      }
 
-      pageRows.forEach((row) => {
-        const tr = document.createElement("tr");
-        tr.className = "clickable";
+	      function compareValues(aVal, bVal) {
+	        const aNum = Number.isFinite(aVal) ? aVal : null;
+	        const bNum = Number.isFinite(bVal) ? bVal : null;
+	        if (aNum != null || bNum != null) {
+	          const av = aNum != null ? aNum : -Infinity;
+	          const bv = bNum != null ? bNum : -Infinity;
+	          return av - bv;
+	        }
+	        const aStr = aVal == null ? "" : String(aVal).toLowerCase();
+	        const bStr = bVal == null ? "" : String(bVal).toLowerCase();
+	        if (aStr < bStr) return -1;
+	        if (aStr > bStr) return 1;
+	        return 0;
+	      }
+
+	      rows.sort((a, b) => {
+	        const cmp = compareValues(getSortValue(a), getSortValue(b));
+	        return peaksSortDir === "asc" ? cmp : -cmp;
+	      });
+
+	      const trHead = document.createElement("tr");
+	      const headerDefs = [{ key: "item", header: "Item" }].concat(
+	        allColumns.map((c) => ({ key: c.key, header: c.header }))
+	      );
+	      headerDefs.forEach((h) => {
+	        const th = document.createElement("th");
+	        const isActive = peaksSortKey === h.key;
+	        const arrow = isActive ? (peaksSortDir === "asc" ? " ▲" : " ▼") : "";
+	        th.textContent = h.header + arrow;
+	        th.style.cursor = "pointer";
+	        th.addEventListener("click", (ev) => {
+	          ev.stopPropagation();
+	          if (peaksSortKey === h.key) {
+	            peaksSortDir = peaksSortDir === "asc" ? "desc" : "asc";
+	          } else {
+	            peaksSortKey = h.key;
+	            peaksSortDir = h.key === "item" ? "asc" : "desc";
+	          }
+	          peaksCurrentPage = 1;
+	          renderPeaksTable();
+	        });
+	        trHead.appendChild(th);
+	      });
+	      thead.appendChild(trHead);
+
+	      const totalRows = rows.length;
+	      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
+	      if (peaksCurrentPage < 1) {
+	        peaksCurrentPage = 1;
+	      } else if (peaksCurrentPage > totalPages) {
+	        peaksCurrentPage = totalPages;
+	      }
+	      const currentPage = peaksCurrentPage;
+	      const start = totalRows === 0 ? 0 : (currentPage - 1) * pageSize;
+	      const end = totalRows === 0 ? 0 : Math.min(totalRows, start + pageSize);
+	      const pageRows = rows.slice(start, end);
+
+	      pageRows.forEach((row) => {
+	        const tr = document.createElement("tr");
+	        tr.className = "clickable";
 
         const tdName = document.createElement("td");
         tdName.textContent = row.name || ("Item " + row.item_id);
