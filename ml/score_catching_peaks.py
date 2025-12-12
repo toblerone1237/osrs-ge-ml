@@ -191,28 +191,23 @@ def compute_catching_peaks_metric(
 
     avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
 
-    # Count peaks using per-run maxima, merging peaks closer than 4h apart.
+    # Count peaks by merging spike runs unless there is at least 4h of
+    # non-spike time between their bases (end -> next start).
     peak_gap_ms = 4 * 3600 * 1000.0
-    peak_times_ms: List[float] = []
+    peaks_count = 0
+    last_peak_end_ts: Optional[float] = None
     for start_idx, end_idx in spike_run_slices:
         if end_idx < start_idx:
             continue
-        slice_prices = prices[start_idx : end_idx + 1]
-        if slice_prices.size == 0:
-            continue
-        rel_max = int(np.argmax(slice_prices))
-        peak_idx = start_idx + rel_max
         try:
-            peak_times_ms.append(float(pts[peak_idx][0]))
+            start_ts = float(pts[start_idx][0])
+            end_ts = float(pts[end_idx][0])
         except Exception:
             continue
-    peak_times_ms.sort()
-    peaks_count = 0
-    last_peak_ts: Optional[float] = None
-    for peak_ts in peak_times_ms:
-        if last_peak_ts is None or (peak_ts - last_peak_ts) >= peak_gap_ms:
+        if last_peak_end_ts is None or (start_ts - last_peak_end_ts) >= peak_gap_ms:
             peaks_count += 1
-        last_peak_ts = peak_ts
+        if last_peak_end_ts is None or end_ts > last_peak_end_ts:
+            last_peak_end_ts = end_ts
 
     baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
     rare_weight = exp(-w2 * 8.0)
