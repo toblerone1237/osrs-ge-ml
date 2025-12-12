@@ -1031,6 +1031,7 @@ const HTML = `<!DOCTYPE html>
         "Low Average Price",
         "Peak Average Price",
         "% Difference",
+        "Peaks Count",
         "Last 24 Trading Volume",
         "Trading Volume Cap"
       ].forEach((h) => {
@@ -1062,6 +1063,13 @@ const HTML = `<!DOCTYPE html>
             ? row.pct_difference.toFixed(1) + "%"
             : "-";
         tr.appendChild(tdPct);
+
+        const tdPeaksCount = document.createElement("td");
+        tdPeaksCount.textContent =
+          Number.isFinite(row.peaks_count)
+            ? Math.round(row.peaks_count).toLocaleString("en-US")
+            : "-";
+        tr.appendChild(tdPeaksCount);
 
         const tdVol = document.createElement("td");
         tdVol.textContent =

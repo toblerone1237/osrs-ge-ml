@@ -181,6 +181,7 @@ def compute_catching_peaks_metric(
         spike_runs.append(current_run)
 
     avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
+    peaks_count = int(len(spike_runs))
 
     baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
     rare_weight = exp(-w2 * 8.0)
@@ -201,6 +202,7 @@ def compute_catching_peaks_metric(
         "peak_avg_price": peak_avg,
         "pct_difference": pct_diff,
         "volume_24h": volume24h,
+        "peaks_count": peaks_count,
         "score": float(score),
     }
 
@@ -303,4 +305,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
