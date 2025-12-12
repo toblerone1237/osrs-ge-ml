@@ -367,11 +367,52 @@ def load_latest_mapping(s3, bucket) -> Dict[int, str]:
     return {}
 
 
+def load_latest_daily_volumes(s3, bucket) -> Dict[int, float]:
+    now = datetime.now(timezone.utc)
+    for delta in range(7):
+        d = now - timedelta(days=delta)
+        prefix = f"daily/{d.year}/{d.month:02d}/{d.day:02d}"
+        keys = list_keys_with_prefix(s3, bucket, prefix)
+        if not keys:
+            continue
+        keys.sort()
+        latest_key = keys[-1]
+        obj = s3.get_object(Bucket=bucket, Key=latest_key)
+        data = json.loads(obj["Body"].read())
+
+        volumes = data.get("volumes_24h")
+        if isinstance(volumes, dict):
+            volumes_data = volumes.get("data")
+        else:
+            volumes_data = None
+
+        if isinstance(volumes_data, dict):
+            out: Dict[int, float] = {}
+            for item_id_raw, v in volumes_data.items():
+                try:
+                    item_id = int(item_id_raw)
+                except Exception:
+                    continue
+                if not item_id:
+                    continue
+                try:
+                    vol_f = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(vol_f):
+                    out[item_id] = vol_f
+            if out:
+                print("Loaded volumes from", latest_key, "(", len(out), "items )")
+            return out
+    return {}
+
+
 def main():
     s3 = get_r2_client()
     bucket = os.environ["R2_BUCKET"]
 
     mapping = load_latest_mapping(s3, bucket)
+    volumes24h_by_id = load_latest_daily_volumes(s3, bucket)
 
     keys = list_keys_with_prefix(s3, bucket, "history/")
     keys = [
@@ -396,6 +437,10 @@ def main():
             base = key.rsplit("/", 1)[-1].split(".", 1)[0]
             item_id = int(base)
             name = mapping.get(item_id) or data.get("name") or f"Item {item_id}"
+
+            daily_vol = volumes24h_by_id.get(item_id)
+            if daily_vol is not None and np.isfinite(daily_vol):
+                metric["volume_24h"] = float(daily_vol)
 
             metric["item_id"] = item_id
             metric["name"] = name

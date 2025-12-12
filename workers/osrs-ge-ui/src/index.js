@@ -406,13 +406,14 @@ const HTML = `<!DOCTYPE html>
     const PIN_KEY = "osrs_ge_pins_v3";
     const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
 
-    let overviewSignals = [];
-    let dailySnapshot = null;
-    let mappingList = [];
-    let mappingById = new Map();
-    let MODEL_HORIZON = 60;
-    let MODEL_TAX = 0.02;
-    let priceChart = null;
+	    let overviewSignals = [];
+	    let dailySnapshot = null;
+	    let mappingList = [];
+	    let mappingById = new Map();
+	    let volumes24hById = new Map();
+	    let MODEL_HORIZON = 60;
+	    let MODEL_TAX = 0.02;
+	    let priceChart = null;
     // Ranking pagination
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
@@ -586,16 +587,48 @@ const HTML = `<!DOCTYPE html>
               : null
         }))
         .filter((m) => m.id && m.name);
-      mappingList.sort((a, b) => a.name.localeCompare(b.name));
-      mappingById = new Map(mappingList.map((m) => [m.id, m]));
-      if (peaksLoaded) {
-        renderPeaksTable();
-      }
-    }
+	      mappingList.sort((a, b) => a.name.localeCompare(b.name));
+	      mappingById = new Map(mappingList.map((m) => [m.id, m]));
+	      if (peaksLoaded) {
+	        renderPeaksTable();
+	      }
+	    }
 
-    function renderPinnedList() {
-      const state = loadPinnedState();
-      const entries = Object.entries(state)
+	    function buildVolumesFromDaily(dailyJson) {
+	      volumes24hById = new Map();
+	      if (!dailyJson) return;
+
+	      const candidate =
+	        dailyJson &&
+	        dailyJson.volumes_24h &&
+	        dailyJson.volumes_24h.data &&
+	        typeof dailyJson.volumes_24h.data === "object"
+	          ? dailyJson.volumes_24h.data
+	          : dailyJson && dailyJson.data && typeof dailyJson.data === "object"
+	            ? dailyJson.data
+	            : dailyJson &&
+	                dailyJson.volumes_24h &&
+	                typeof dailyJson.volumes_24h === "object"
+	              ? dailyJson.volumes_24h
+	              : null;
+
+	      if (!candidate || typeof candidate !== "object") return;
+
+	      for (const [idRaw, volRaw] of Object.entries(candidate)) {
+	        const id = Number(idRaw);
+	        const vol = Number(volRaw);
+	        if (!Number.isFinite(id) || !Number.isFinite(vol)) continue;
+	        volumes24hById.set(id, vol);
+	      }
+
+	      if (peaksLoaded) {
+	        renderPeaksTable();
+	      }
+	    }
+
+	    function renderPinnedList() {
+	      const state = loadPinnedState();
+	      const entries = Object.entries(state)
         .filter(([, v]) => v && v.pinned)
         .map(([idStr, v]) => ({
           item_id: Number(idStr),
@@ -1160,6 +1193,16 @@ const HTML = `<!DOCTYPE html>
         return mapEntry && Number.isFinite(mapEntry.limit) ? mapEntry.limit : null;
       }
 
+      function getVolume24h(row) {
+        const itemId = Number(row && row.item_id);
+        if (Number.isFinite(itemId)) {
+          const dailyVol = volumes24hById.get(itemId);
+          if (Number.isFinite(dailyVol)) return dailyVol;
+        }
+        const v = row && row.volume_24h;
+        return Number.isFinite(v) ? v : null;
+      }
+
 	      function formatCount(v) {
 	        return Number.isFinite(v) ? Math.round(v).toLocaleString("en-US") : "-";
 	      }
@@ -1205,22 +1248,22 @@ const HTML = `<!DOCTYPE html>
           value: (row) => row.peaks_count,
           format: formatCount
         },
-        {
-          key: "profit_24h",
-          header: "24 Trading Profit",
-          value: (row) => {
-            const diff = getPriceDifference(row);
-            const vol = row.volume_24h;
-            return Number.isFinite(diff) && Number.isFinite(vol) ? diff * vol : null;
-          },
-          format: formatProfitGp
-        },
-        {
-          key: "volume_24h",
-          header: "Last 24 Trading Volume",
-          value: (row) => row.volume_24h,
-          format: formatCount
-        },
+	        {
+	          key: "profit_24h",
+	          header: "24 Trading Profit",
+	          value: (row) => {
+	            const diff = getPriceDifference(row);
+	            const vol = getVolume24h(row);
+	            return Number.isFinite(diff) && Number.isFinite(vol) ? diff * vol : null;
+	          },
+	          format: formatProfitGp
+	        },
+	        {
+	          key: "volume_24h",
+	          header: "Last 24 Trading Volume",
+	          value: (row) => getVolume24h(row),
+	          format: formatCount
+	        },
         {
           key: "profit_cap",
           header: "Cap Trading Profit",
@@ -1973,13 +2016,15 @@ const HTML = `<!DOCTYPE html>
         MODEL_TAX =
           typeof sigJson.tax_rate === "number" ? sigJson.tax_rate : 0.02;
 
-        if (dailyRes.ok) {
-          dailySnapshot = await dailyRes.json();
-          buildMappingFromDaily(dailySnapshot);
-        } else {
-          dailySnapshot = null;
-          mappingList = [];
-        }
+	        if (dailyRes.ok) {
+	          dailySnapshot = await dailyRes.json();
+	          buildMappingFromDaily(dailySnapshot);
+	          buildVolumesFromDaily(dailySnapshot);
+	        } else {
+	          dailySnapshot = null;
+	          mappingList = [];
+	          volumes24hById = new Map();
+	        }
 
         statusEl.textContent = "";
         metaEl.textContent =
