@@ -1162,6 +1162,12 @@ const HTML = `<!DOCTYPE html>
 	        statsByKey.set(col.key, computeNormalizationStats(col.value));
 	      });
 
+	      const invertPercentKeys = new Set([
+	        "low_avg_price",
+	        "time_since_last_peak_days",
+	        "avg_time_between_peaks_days"
+	      ]);
+
 	      const percentColumns = baseColumns.map((col) => ({
 	        key: col.key + "_norm_pct",
 	        header: col.header + " %",
@@ -1180,7 +1186,14 @@ const HTML = `<!DOCTYPE html>
 	            return null;
 	          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) return 100;
 	          if (!Number.isFinite(stats.range)) return null;
-	          return ((v - stats.min) / stats.range) * 100;
+	          let pct = ((v - stats.min) / stats.range) * 100;
+	          if (invertPercentKeys.has(col.key) && Number.isFinite(pct)) {
+	            pct = 100 - pct;
+	          }
+	          if (Number.isFinite(pct)) {
+	            pct = Math.max(0, Math.min(100, pct));
+	          }
+	          return pct;
 	        },
 	        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
 	      }));
