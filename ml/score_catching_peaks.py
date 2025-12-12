@@ -167,21 +167,41 @@ def compute_catching_peaks_metric(
         if np.isfinite(b_std) and low_avg > 0:
             baseline_cv = b_std / low_avg
 
-    # Average length of spike runs (posterior > 0.5)
+    # Average length of raw spike runs (posterior > 0.5), plus run time bounds.
     spike_runs: List[int] = []
+    spike_run_bounds: List[Tuple[float, float]] = []
     current_run = 0
-    for flag in is_spike.tolist():
+    run_start_ts: Optional[float] = None
+    last_spike_ts: Optional[float] = None
+    for (ts, _, _), flag in zip(pts, is_spike.tolist()):
         if flag:
+            if current_run == 0:
+                run_start_ts = ts
             current_run += 1
+            last_spike_ts = ts
         else:
             if current_run:
                 spike_runs.append(current_run)
+                if run_start_ts is not None and last_spike_ts is not None:
+                    spike_run_bounds.append((run_start_ts, last_spike_ts))
                 current_run = 0
+                run_start_ts = None
+                last_spike_ts = None
     if current_run:
         spike_runs.append(current_run)
+        if run_start_ts is not None and last_spike_ts is not None:
+            spike_run_bounds.append((run_start_ts, last_spike_ts))
 
     avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
-    peaks_count = int(len(spike_runs))
+
+    # Count peaks, merging runs that are too close in time.
+    peak_gap_ms = 4 * 3600 * 1000.0
+    peaks_count = 0
+    last_end_ts: Optional[float] = None
+    for start_ts, end_ts in spike_run_bounds:
+        if last_end_ts is None or (start_ts - last_end_ts) >= peak_gap_ms:
+            peaks_count += 1
+        last_end_ts = end_ts
 
     baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
     rare_weight = exp(-w2 * 8.0)
