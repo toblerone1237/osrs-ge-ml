@@ -234,17 +234,21 @@ def compute_catching_peaks_metric(
     # by at least 50%.
     peak_gap_ms = 4 * 3600 * 1000.0
     min_peak_price = low_avg * 1.5
-    peaks_count = 0
+    peak_ts_list: List[float] = []
     current_peak_end_ts: Optional[float] = None
     current_peak_max_price: Optional[float] = None
+    current_peak_max_ts: Optional[float] = None
     for start_idx, end_idx in spike_run_slices:
         if end_idx < start_idx:
             continue
         run_prices = prices[start_idx : end_idx + 1]
         if run_prices.size == 0:
             continue
-        run_max_price = float(np.max(run_prices))
+        run_max_offset = int(np.argmax(run_prices))
+        run_max_price = float(run_prices[run_max_offset])
+        run_max_idx = start_idx + run_max_offset
         try:
+            run_max_ts = float(pts[run_max_idx][0])
             start_ts = float(pts[start_idx][0])
             end_ts = float(pts[end_idx][0])
         except Exception:
@@ -253,6 +257,7 @@ def compute_catching_peaks_metric(
         if current_peak_end_ts is None:
             current_peak_end_ts = end_ts
             current_peak_max_price = run_max_price
+            current_peak_max_ts = run_max_ts
             continue
 
         gap_ms = start_ts - current_peak_end_ts
@@ -261,9 +266,14 @@ def compute_catching_peaks_metric(
                 current_peak_max_price is not None
                 and current_peak_max_price >= min_peak_price
             ):
-                peaks_count += 1
+                peak_ts_list.append(
+                    current_peak_max_ts
+                    if current_peak_max_ts is not None
+                    else current_peak_end_ts
+                )
             current_peak_end_ts = end_ts
             current_peak_max_price = run_max_price
+            current_peak_max_ts = run_max_ts
         else:
             if end_ts > current_peak_end_ts:
                 current_peak_end_ts = end_ts
@@ -272,13 +282,35 @@ def compute_catching_peaks_metric(
                 or run_max_price > current_peak_max_price
             ):
                 current_peak_max_price = run_max_price
+                current_peak_max_ts = run_max_ts
 
     if (
         current_peak_end_ts is not None
         and current_peak_max_price is not None
         and current_peak_max_price >= min_peak_price
     ):
-        peaks_count += 1
+        peak_ts_list.append(
+            current_peak_max_ts
+            if current_peak_max_ts is not None
+            else current_peak_end_ts
+        )
+
+    peaks_count = len(peak_ts_list)
+
+    ms_per_day = 86400 * 1000.0
+    time_since_last_peak_days: Optional[float] = None
+    avg_time_between_peaks_days: Optional[float] = None
+    if peak_ts_list:
+        last_peak_ts = peak_ts_list[-1]
+        time_since_last_peak_days = (now_ms - last_peak_ts) / ms_per_day
+        if peaks_count >= 2:
+            gaps = (
+                np.diff(np.array(peak_ts_list, dtype="float64")) / ms_per_day
+            )
+            if gaps.size:
+                avg_time_between_peaks_days = float(np.mean(gaps))
+        elif peaks_count == 1:
+            avg_time_between_peaks_days = 1000.0
 
     baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
     rare_weight = exp(-w2 * 8.0)
@@ -300,6 +332,8 @@ def compute_catching_peaks_metric(
         "pct_difference": pct_diff,
         "volume_24h": volume24h,
         "peaks_count": peaks_count,
+        "time_since_last_peak_days": time_since_last_peak_days,
+        "avg_time_between_peaks_days": avg_time_between_peaks_days,
         "score": float(score),
     }
 

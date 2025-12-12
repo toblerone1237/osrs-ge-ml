@@ -1027,9 +1027,13 @@ const HTML = `<!DOCTYPE html>
         return mapEntry && Number.isFinite(mapEntry.limit) ? mapEntry.limit : null;
       }
 
-      function formatCount(v) {
-        return Number.isFinite(v) ? Math.round(v).toLocaleString("en-US") : "-";
-      }
+	      function formatCount(v) {
+	        return Number.isFinite(v) ? Math.round(v).toLocaleString("en-US") : "-";
+	      }
+
+	      function formatDays(v) {
+	        return Number.isFinite(v) ? v.toFixed(1) : "-";
+	      }
 
       const baseColumns = [
         {
@@ -1094,13 +1098,25 @@ const HTML = `<!DOCTYPE html>
           },
           format: formatProfitGp
         },
-        {
-          key: "trading_cap",
-          header: "Trading Volume Cap",
-          value: (row) => getTradingCap(row),
-          format: formatCount
-        }
-      ];
+	        {
+	          key: "trading_cap",
+	          header: "Trading Volume Cap",
+	          value: (row) => getTradingCap(row),
+	          format: formatCount
+	        },
+	        {
+	          key: "time_since_last_peak_days",
+	          header: "Time Since Last Peak",
+	          value: (row) => row.time_since_last_peak_days,
+	          format: formatDays
+	        },
+	        {
+	          key: "avg_time_between_peaks_days",
+	          header: "Average Time Between Peaks",
+	          value: (row) => row.avg_time_between_peaks_days,
+	          format: formatDays
+	        }
+	      ];
 
 	      function isBigGap(curr, next) {
 	        if (!Number.isFinite(curr) || !Number.isFinite(next)) return false;
@@ -1152,6 +1168,14 @@ const HTML = `<!DOCTYPE html>
 	        value: (row) => {
 	          const stats = statsByKey.get(col.key);
 	          const v = col.value(row);
+	          if (
+	            col.key === "avg_time_between_peaks_days" &&
+	            row &&
+	            Number.isFinite(row.peaks_count) &&
+	            Math.round(row.peaks_count) === 1
+	          ) {
+	            return 100;
+	          }
 	          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.maxForNorm))
 	            return null;
 	          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) return 100;
