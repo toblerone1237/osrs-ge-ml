@@ -167,41 +167,52 @@ def compute_catching_peaks_metric(
         if np.isfinite(b_std) and low_avg > 0:
             baseline_cv = b_std / low_avg
 
-    # Average length of raw spike runs (posterior > 0.5), plus run time bounds.
+    # Identify raw spike runs (posterior > 0.5) so we can measure their
+    # average length and locate per-run peak timestamps.
     spike_runs: List[int] = []
-    spike_run_bounds: List[Tuple[float, float]] = []
+    spike_run_slices: List[Tuple[int, int]] = []
     current_run = 0
-    run_start_ts: Optional[float] = None
-    last_spike_ts: Optional[float] = None
-    for (ts, _, _), flag in zip(pts, is_spike.tolist()):
+    run_start_idx: Optional[int] = None
+    spike_flags = is_spike.tolist()
+    for idx, ((_, _, _), flag) in enumerate(zip(pts, spike_flags)):
         if flag:
             if current_run == 0:
-                run_start_ts = ts
+                run_start_idx = idx
             current_run += 1
-            last_spike_ts = ts
         else:
-            if current_run:
+            if current_run and run_start_idx is not None:
                 spike_runs.append(current_run)
-                if run_start_ts is not None and last_spike_ts is not None:
-                    spike_run_bounds.append((run_start_ts, last_spike_ts))
+                spike_run_slices.append((run_start_idx, idx - 1))
                 current_run = 0
-                run_start_ts = None
-                last_spike_ts = None
-    if current_run:
+                run_start_idx = None
+    if current_run and run_start_idx is not None:
         spike_runs.append(current_run)
-        if run_start_ts is not None and last_spike_ts is not None:
-            spike_run_bounds.append((run_start_ts, last_spike_ts))
+        spike_run_slices.append((run_start_idx, len(pts) - 1))
 
     avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
 
-    # Count peaks, merging runs that are too close in time.
+    # Count peaks using per-run maxima, merging peaks closer than 4h apart.
     peak_gap_ms = 4 * 3600 * 1000.0
+    peak_times_ms: List[float] = []
+    for start_idx, end_idx in spike_run_slices:
+        if end_idx < start_idx:
+            continue
+        slice_prices = prices[start_idx : end_idx + 1]
+        if slice_prices.size == 0:
+            continue
+        rel_max = int(np.argmax(slice_prices))
+        peak_idx = start_idx + rel_max
+        try:
+            peak_times_ms.append(float(pts[peak_idx][0]))
+        except Exception:
+            continue
+    peak_times_ms.sort()
     peaks_count = 0
-    last_end_ts: Optional[float] = None
-    for start_ts, end_ts in spike_run_bounds:
-        if last_end_ts is None or (start_ts - last_end_ts) >= peak_gap_ms:
+    last_peak_ts: Optional[float] = None
+    for peak_ts in peak_times_ms:
+        if last_peak_ts is None or (peak_ts - last_peak_ts) >= peak_gap_ms:
             peaks_count += 1
-        last_end_ts = end_ts
+        last_peak_ts = peak_ts
 
     baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
     rare_weight = exp(-w2 * 8.0)
