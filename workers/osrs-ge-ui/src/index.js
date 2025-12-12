@@ -1102,30 +1102,49 @@ const HTML = `<!DOCTYPE html>
         }
       ];
 
-      function computeRangeStats(valueFn) {
-        let min = Infinity;
-        let max = -Infinity;
-        rows.forEach((r) => {
-          const v = valueFn(r);
-          if (!Number.isFinite(v)) return;
-          if (v < min) min = v;
-          if (v > max) max = v;
-        });
-        if (min === Infinity || max === -Infinity) {
-          return { min: null, max: null, range: null };
-        }
-        const range = max - min;
-        return {
-          min,
-          max,
-          range: Number.isFinite(range) && range !== 0 ? range : null
-        };
-      }
+	      function isBigGap(curr, next) {
+	        if (!Number.isFinite(curr) || !Number.isFinite(next)) return false;
+	        if (next === 0) return curr !== 0;
+	        return (curr - next) / Math.abs(next) > 0.10;
+	      }
 
-      const statsByKey = new Map();
-      baseColumns.forEach((col) => {
-        statsByKey.set(col.key, computeRangeStats(col.value));
-      });
+	      function computeNormalizationStats(valueFn) {
+	        const vals = [];
+	        rows.forEach((r) => {
+	          const v = valueFn(r);
+	          if (Number.isFinite(v)) vals.push(v);
+	        });
+	        if (!vals.length) {
+	          return { min: null, maxForNorm: null, range: null, hasExcluded: false };
+	        }
+	        vals.sort((a, b) => b - a);
+	        let excludeCount = 0;
+	        while (
+	          excludeCount + 1 < vals.length &&
+	          isBigGap(vals[excludeCount], vals[excludeCount + 1])
+	        ) {
+	          excludeCount += 1;
+	        }
+	        const remaining = vals.slice(excludeCount);
+	        const maxForNorm = remaining[0];
+	        const min = remaining[remaining.length - 1];
+	        const rawRange =
+	          Number.isFinite(maxForNorm) && Number.isFinite(min)
+	            ? maxForNorm - min
+	            : NaN;
+	        return {
+	          min,
+	          maxForNorm,
+	          range:
+	            Number.isFinite(rawRange) && rawRange !== 0 ? rawRange : null,
+	          hasExcluded: excludeCount > 0
+	        };
+	      }
+
+	      const statsByKey = new Map();
+	      baseColumns.forEach((col) => {
+	        statsByKey.set(col.key, computeNormalizationStats(col.value));
+	      });
 
 	      const percentColumns = baseColumns.map((col) => ({
 	        key: col.key + "_norm_pct",
@@ -1133,7 +1152,10 @@ const HTML = `<!DOCTYPE html>
 	        value: (row) => {
 	          const stats = statsByKey.get(col.key);
 	          const v = col.value(row);
-	          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.range)) return null;
+	          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.maxForNorm))
+	            return null;
+	          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) return 100;
+	          if (!Number.isFinite(stats.range)) return null;
 	          return ((v - stats.min) / stats.range) * 100;
 	        },
 	        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
