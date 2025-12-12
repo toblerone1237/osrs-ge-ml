@@ -1120,8 +1120,12 @@ const HTML = `<!DOCTYPE html>
 
 	      function isBigGap(curr, next) {
 	        if (!Number.isFinite(curr) || !Number.isFinite(next)) return false;
-	        if (next === 0) return curr !== 0;
-	        return (curr - next) / Math.abs(next) > 0.10;
+	        // Only apply outlier peeling on positive-valued columns. If the
+	        // sequence crosses zero/negative, stop peeling to avoid nonsense gaps.
+	        if (curr <= 0) return false;
+	        if (next < 0) return false;
+	        if (next === 0) return curr > 0;
+	        return (curr - next) / next > 0.10;
 	      }
 
 	      function computeNormalizationStats(valueFn) {
