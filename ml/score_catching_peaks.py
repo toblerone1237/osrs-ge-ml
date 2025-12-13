@@ -205,95 +205,52 @@ def compute_catching_peaks_metric(
             baseline_cv = b_std / low_avg
 
     # Identify raw spike runs (posterior > 0.5) so we can measure their
-    # average length and locate per-run peak timestamps.
+    # average length for the "short-lived spikes" penalty.
     spike_runs: List[int] = []
-    spike_run_slices: List[Tuple[int, int]] = []
     current_run = 0
-    run_start_idx: Optional[int] = None
-    spike_flags = is_spike.tolist()
-    for idx, ((_, _, _), flag) in enumerate(zip(pts, spike_flags)):
+    for flag in is_spike.tolist():
         if flag:
-            if current_run == 0:
-                run_start_idx = idx
             current_run += 1
-        else:
-            if current_run and run_start_idx is not None:
-                spike_runs.append(current_run)
-                spike_run_slices.append((run_start_idx, idx - 1))
-                current_run = 0
-                run_start_idx = None
-    if current_run and run_start_idx is not None:
+        elif current_run:
+            spike_runs.append(current_run)
+            current_run = 0
+    if current_run:
         spike_runs.append(current_run)
-        spike_run_slices.append((run_start_idx, len(pts) - 1))
 
     avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
 
-    # Count peaks by merging spike runs unless there is at least 4h of
-    # non-spike time between their bases (end -> next start). A merged
-    # peak is only counted if its max price exceeds the baseline average
-    # by at least 50%.
-    peak_gap_ms = 4 * 3600 * 1000.0
+    # Count peaks using a hysteresis band around the baseline average:
+    # - A peak is only valid if price reaches >= +50% above the baseline average.
+    # - Once "in a peak", it doesn't end until price returns to within +10% of baseline.
     min_peak_price = low_avg * 1.5
+    peak_end_price = low_avg * 1.1
+
     peak_ts_list: List[float] = []
-    current_peak_end_ts: Optional[float] = None
+    in_peak = False
     current_peak_max_price: Optional[float] = None
     current_peak_max_ts: Optional[float] = None
-    for start_idx, end_idx in spike_run_slices:
-        if end_idx < start_idx:
-            continue
-        run_prices = prices[start_idx : end_idx + 1]
-        if run_prices.size == 0:
-            continue
-        run_max_offset = int(np.argmax(run_prices))
-        run_max_price = float(run_prices[run_max_offset])
-        run_max_idx = start_idx + run_max_offset
-        try:
-            run_max_ts = float(pts[run_max_idx][0])
-            start_ts = float(pts[start_idx][0])
-            end_ts = float(pts[end_idx][0])
-        except Exception:
+
+    for ts, price, _ in pts:
+        if not in_peak:
+            if price >= min_peak_price:
+                in_peak = True
+                current_peak_max_price = price
+                current_peak_max_ts = ts
             continue
 
-        if current_peak_end_ts is None:
-            current_peak_end_ts = end_ts
-            current_peak_max_price = run_max_price
-            current_peak_max_ts = run_max_ts
-            continue
+        if current_peak_max_price is None or price > current_peak_max_price:
+            current_peak_max_price = price
+            current_peak_max_ts = ts
 
-        gap_ms = start_ts - current_peak_end_ts
-        if gap_ms >= peak_gap_ms:
-            if (
-                current_peak_max_price is not None
-                and current_peak_max_price >= min_peak_price
-            ):
-                peak_ts_list.append(
-                    current_peak_max_ts
-                    if current_peak_max_ts is not None
-                    else current_peak_end_ts
-                )
-            current_peak_end_ts = end_ts
-            current_peak_max_price = run_max_price
-            current_peak_max_ts = run_max_ts
-        else:
-            if end_ts > current_peak_end_ts:
-                current_peak_end_ts = end_ts
-            if (
-                current_peak_max_price is None
-                or run_max_price > current_peak_max_price
-            ):
-                current_peak_max_price = run_max_price
-                current_peak_max_ts = run_max_ts
+        if price <= peak_end_price:
+            if current_peak_max_ts is not None:
+                peak_ts_list.append(float(current_peak_max_ts))
+            in_peak = False
+            current_peak_max_price = None
+            current_peak_max_ts = None
 
-    if (
-        current_peak_end_ts is not None
-        and current_peak_max_price is not None
-        and current_peak_max_price >= min_peak_price
-    ):
-        peak_ts_list.append(
-            current_peak_max_ts
-            if current_peak_max_ts is not None
-            else current_peak_end_ts
-        )
+    if in_peak and current_peak_max_ts is not None:
+        peak_ts_list.append(float(current_peak_max_ts))
 
     peaks_count = len(peak_ts_list)
 
