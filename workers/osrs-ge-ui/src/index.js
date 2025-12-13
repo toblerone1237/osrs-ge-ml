@@ -241,13 +241,34 @@ const HTML = `<!DOCTYPE html>
 	      cursor: pointer;
 	      font-size: 0.85rem;
 	    }
-	    .peaks-apply-btn:hover {
-	      background: #1f2937;
-	    }
-	    @media (max-width: 750px) {
-	      table { font-size: 0.78rem; }
-	      header h1 { font-size: 1.2rem; }
-	      .card { padding: 0.85rem 0.9rem; }
+		    .peaks-apply-btn:hover {
+		      background: #1f2937;
+		    }
+		    .peaks-controls {
+		      display: flex;
+		      justify-content: flex-end;
+		      margin-bottom: 0.4rem;
+		    }
+		    .peaks-toggle-btn {
+		      padding: 0.3rem 0.6rem;
+		      border-radius: 0.35rem;
+		      border: 1px solid #4b5563;
+		      background: #111827;
+		      color: #e5e7eb;
+		      cursor: pointer;
+		      font-size: 0.8rem;
+		    }
+		    .peaks-toggle-btn:hover {
+		      background: #1f2937;
+		    }
+		    .peaks-toggle-btn.active {
+		      background: #1f2937;
+		      border-color: #6b7280;
+		    }
+		    @media (max-width: 750px) {
+		      table { font-size: 0.78rem; }
+		      header h1 { font-size: 1.2rem; }
+		      .card { padding: 0.85rem 0.9rem; }
 	      .chart-wrapper { height: 220px; }
 	    }
 	    @media (max-width: 900px) {
@@ -348,14 +369,17 @@ const HTML = `<!DOCTYPE html>
 	            <div id="peaksMeta" class="small"></div>
 	          </div>
 
-	          <div class="card">
-	            <h2>Catching Peaks leaderboard</h2>
-	            <div class="small" style="margin-bottom:0.4rem;">
-	              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
-	              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
-	            </div>
-	            <div id="peaksTableContainer">Waiting for data...</div>
-	          </div>
+		          <div class="card">
+		            <h2>Catching Peaks leaderboard</h2>
+		            <div class="small" style="margin-bottom:0.4rem;">
+		              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
+		              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+		            </div>
+		            <div class="peaks-controls">
+		              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show As %</button>
+		            </div>
+		            <div id="peaksTableContainer">Waiting for data...</div>
+		          </div>
 
 	          <div id="peaksChartMount"></div>
 	        </div>
@@ -404,20 +428,22 @@ const HTML = `<!DOCTYPE html>
     const searchResultsEl = document.getElementById("searchResults");
     const pinnedListEl = document.getElementById("pinnedList");
 
-	    const peaksStatusEl = document.getElementById("peaksStatus");
-	    const peaksMetaEl = document.getElementById("peaksMeta");
-	    const peaksTableContainer = document.getElementById("peaksTableContainer");
-	    const peaksSortPaneEl = document.getElementById("peaksSortPane");
-	    const standardChartMount = document.getElementById("standardChartMount");
-	    const peaksChartMount = document.getElementById("peaksChartMount");
-	    const priceCardEl = document.getElementById("priceCard");
+		    const peaksStatusEl = document.getElementById("peaksStatus");
+		    const peaksMetaEl = document.getElementById("peaksMeta");
+		    const peaksTableContainer = document.getElementById("peaksTableContainer");
+		    const peaksSortPaneEl = document.getElementById("peaksSortPane");
+		    const peaksShowAsPctBtn = document.getElementById("peaksShowAsPctBtn");
+		    const standardChartMount = document.getElementById("standardChartMount");
+		    const peaksChartMount = document.getElementById("peaksChartMount");
+		    const priceCardEl = document.getElementById("priceCard");
     const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
     const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
 
-    const PIN_KEY = "osrs_ge_pins_v3";
-    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
-    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
+	    const PIN_KEY = "osrs_ge_pins_v3";
+	    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
+	    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
+	    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -442,6 +468,7 @@ const HTML = `<!DOCTYPE html>
 		    const DEFAULT_PEAK_WEIGHT = 100;
 		    let peaksPercentWeights = {};
 		    let peaksSortPaneKeys = [];
+		    let peaksShowAsPercent = false;
 		    // Latest volume timeline for the active chart (aligned to labels)
 		    let latestVolumeTimeline = [];
 
@@ -535,7 +562,39 @@ const HTML = `<!DOCTYPE html>
 	      }
 	    }
 
-	    peaksPercentWeights = loadPeaksWeights();
+		    peaksPercentWeights = loadPeaksWeights();
+
+		    function loadPeaksShowAsPercent() {
+		      try {
+		        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
+		      } catch (_) {
+		        return false;
+		      }
+		    }
+
+		    function savePeaksShowAsPercent(v) {
+		      try {
+		        window.localStorage.setItem(PEAKS_SHOW_AS_PCT_KEY, v ? "1" : "0");
+		      } catch (_) {}
+		    }
+
+		    function updatePeaksShowAsPercentButton() {
+		      if (!peaksShowAsPctBtn) return;
+		      peaksShowAsPctBtn.classList.toggle("active", peaksShowAsPercent);
+		      peaksShowAsPctBtn.textContent = peaksShowAsPercent ? "Show Raw" : "Show As %";
+		    }
+
+		    peaksShowAsPercent = loadPeaksShowAsPercent();
+		    updatePeaksShowAsPercentButton();
+		    if (peaksShowAsPctBtn) {
+		      peaksShowAsPctBtn.addEventListener("click", () => {
+		        peaksShowAsPercent = !peaksShowAsPercent;
+		        savePeaksShowAsPercent(peaksShowAsPercent);
+		        updatePeaksShowAsPercentButton();
+		        peaksCurrentPage = 1;
+		        renderPeaksTable();
+		      });
+		    }
 
 	    function getPinnedSet() {
 	      const state = loadPinnedState();
@@ -1560,26 +1619,12 @@ const HTML = `<!DOCTYPE html>
 		      const headerDefs = [{ key: "item", header: "Item" }].concat(
 		        displayColumns.map((c) => ({ key: c.key, header: c.header }))
 		      );
-	      headerDefs.forEach((h) => {
-	        const th = document.createElement("th");
-	        const isActive = peaksSortKey === h.key;
-	        const arrow = isActive ? (peaksSortDir === "asc" ? " ▲" : " ▼") : "";
-	        th.textContent = h.header + arrow;
-	        th.style.cursor = "pointer";
-	        th.addEventListener("click", (ev) => {
-	          ev.stopPropagation();
-	          if (peaksSortKey === h.key) {
-	            peaksSortDir = peaksSortDir === "asc" ? "desc" : "asc";
-	          } else {
-	            peaksSortKey = h.key;
-	            peaksSortDir = h.key === "item" ? "asc" : "desc";
-	          }
-	          peaksCurrentPage = 1;
-	          renderPeaksTable();
-	        });
-	        trHead.appendChild(th);
-	      });
-	      thead.appendChild(trHead);
+		      headerDefs.forEach((h) => {
+		        const th = document.createElement("th");
+		        th.textContent = h.header;
+		        trHead.appendChild(th);
+		      });
+		      thead.appendChild(trHead);
 
 	      const totalRows = rows.length;
 	      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
@@ -1601,16 +1646,22 @@ const HTML = `<!DOCTYPE html>
         tdName.textContent = row.name || ("Item " + row.item_id);
         tr.appendChild(tdName);
 
-	        displayColumns.forEach((col) => {
-	          const td = document.createElement("td");
-	          const val = col.value(row);
-	          td.textContent = col.format ? col.format(val) : val;
-	          const pctValueFn = pctValueFnByBaseKey.get(col.key);
-	          if (pctValueFn) {
-	            applyDecileHeat(td, pctValueFn(row));
-	          }
-	          tr.appendChild(td);
-        });
+		        displayColumns.forEach((col) => {
+		          const td = document.createElement("td");
+		          const pctValueFn = pctValueFnByBaseKey.get(col.key);
+		          const pctValue = pctValueFn ? pctValueFn(row) : null;
+		          if (peaksShowAsPercent) {
+		            td.textContent = Number.isFinite(pctValue)
+		              ? pctValue.toFixed(2) + "%"
+		              : "-";
+		            applyDecileHeat(td, pctValue);
+		          } else {
+		            const val = col.value(row);
+		            td.textContent = col.format ? col.format(val) : val;
+		            applyDecileHeat(td, pctValue);
+		          }
+		          tr.appendChild(td);
+	        });
 
         tr.addEventListener("click", () => {
           loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id));
