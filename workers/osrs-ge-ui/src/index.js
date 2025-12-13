@@ -469,6 +469,7 @@ const HTML = `<!DOCTYPE html>
 		    let peaksPercentWeights = {};
 		    let peaksSortPaneKeys = [];
 		    let peaksShowAsPercent = false;
+		    let peaksTableRenderScheduled = false;
 		    // Latest volume timeline for the active chart (aligned to labels)
 		    let latestVolumeTimeline = [];
 
@@ -594,6 +595,20 @@ const HTML = `<!DOCTYPE html>
 		        peaksCurrentPage = 1;
 		        renderPeaksTable();
 		      });
+		    }
+
+		    function schedulePeaksTableRender() {
+		      if (peaksTableRenderScheduled) return;
+		      peaksTableRenderScheduled = true;
+		      const run = () => {
+		        peaksTableRenderScheduled = false;
+		        renderPeaksTable();
+		      };
+		      if (typeof requestAnimationFrame === "function") {
+		        requestAnimationFrame(run);
+		      } else {
+		        setTimeout(run, 0);
+		      }
 		    }
 
 	    function getPinnedSet() {
@@ -1309,15 +1324,19 @@ const HTML = `<!DOCTYPE html>
 	        slider.step = "1";
 	        slider.value = String(weightVal);
 	        slider.setAttribute("aria-label", col.header + " weight");
-	        slider.id = "peaks-weight-" + idx;
-	        slider.addEventListener("input", (ev) => {
-	          const v = Number(ev.target.value);
-	          peaksPercentWeights[col.key] = Number.isFinite(v) ? v : 0;
-	          valueSpan.textContent = String(peaksPercentWeights[col.key]);
-	        });
-	        slider.addEventListener("change", () => {
-	          savePeaksWeights(peaksPercentWeights);
-	        });
+		        slider.id = "peaks-weight-" + idx;
+		        slider.addEventListener("input", (ev) => {
+		          const v = Number(ev.target.value);
+		          peaksPercentWeights[col.key] = Number.isFinite(v) ? v : 0;
+		          valueSpan.textContent = String(peaksPercentWeights[col.key]);
+		          peaksSortKey = "__weighted_avg";
+		          peaksSortDir = "desc";
+		          peaksCurrentPage = 1;
+		          schedulePeaksTableRender();
+		        });
+		        slider.addEventListener("change", () => {
+		          savePeaksWeights(peaksPercentWeights);
+		        });
 
 	        rowEl.appendChild(labelEl);
 	        rowEl.appendChild(slider);
