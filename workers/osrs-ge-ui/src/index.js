@@ -32,7 +32,7 @@ const HTML = `<!DOCTYPE html>
       color: #9ca3af;
     }
     main {
-      max-width: 1550px;
+      max-width: 100%;
       margin: 1.5rem auto 3rem;
       padding: 0 1rem;
     }
