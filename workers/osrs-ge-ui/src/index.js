@@ -79,6 +79,11 @@ const HTML = `<!DOCTYPE html>
       text-align: right;
       white-space: nowrap;
     }
+    td.heat {
+      background-color: hsla(var(--heat-hue, 120), 65%, 28%, 0.22);
+      color: hsl(var(--heat-hue, 120), 75%, 82%);
+      transition: background-color 120ms ease, color 120ms ease;
+    }
     th:first-child, td:first-child {
       text-align: left;
     }
@@ -525,6 +530,46 @@ const HTML = `<!DOCTYPE html>
       return v.toFixed(0);
     }
 
+    function toDecileFromPercent(pct) {
+      if (!Number.isFinite(pct)) return null;
+      const decile = Math.floor(pct / 10);
+      return Math.max(0, Math.min(9, decile));
+    }
+
+    function applyDecileHeat(td, pct) {
+      const decile = toDecileFromPercent(pct);
+      if (decile == null) return;
+      const hue = (decile / 9) * 120;
+      td.classList.add("heat");
+      td.style.setProperty("--heat-hue", String(hue));
+    }
+
+    function computePercentRankById(rows, getValue, invert = false) {
+      const pairs = [];
+      rows.forEach((row) => {
+        const id = row && row.id;
+        const v = getValue(row);
+        if (!Number.isFinite(id) || !Number.isFinite(v)) return;
+        pairs.push({ id, v });
+      });
+      if (!pairs.length) return new Map();
+
+      pairs.sort((a, b) => a.v - b.v);
+      const out = new Map();
+      if (pairs.length === 1) {
+        out.set(pairs[0].id, 100);
+        return out;
+      }
+
+      const denom = pairs.length - 1;
+      pairs.forEach((p, idx) => {
+        let pct = (idx / denom) * 100;
+        if (invert) pct = 100 - pct;
+        out.set(p.id, pct);
+      });
+      return out;
+    }
+
     function probPill(p) {
       if (!Number.isFinite(p)) return '<span class="pill">–</span>';
       const pct = p * 100;
@@ -877,12 +922,26 @@ const HTML = `<!DOCTYPE html>
             row.recommendedNotional > 0
         );
     
-      rows.sort((a, b) => b.combinedScore - a.combinedScore);
+	      rows.sort((a, b) => b.combinedScore - a.combinedScore);
 
-      const pageSize =
-        rankingPageSize && Number.isFinite(rankingPageSize)
-          ? rankingPageSize
-          : 10;
+	      const pctRecSizeById = computePercentRankById(
+	        rows,
+	        (r) => r.recommendedNotional
+	      );
+	      const pctWinById = computePercentRankById(rows, (r) => r.winProb);
+	      const pctProfitById = computePercentRankById(rows, (r) => r.profit);
+	      const pctGpHrById = computePercentRankById(rows, (r) => r.gpPerHour);
+	      const pctVolById = computePercentRankById(rows, (r) => r.volWindow);
+	      const pctHoldById = computePercentRankById(
+	        rows,
+	        (r) => r.holdMinutes,
+	        true
+	      );
+
+	      const pageSize =
+	        rankingPageSize && Number.isFinite(rankingPageSize)
+	          ? rankingPageSize
+	          : 10;
       const totalRows = rows.length;
       const totalPages =
         totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
@@ -957,36 +1016,42 @@ const HTML = `<!DOCTYPE html>
         }
         tr.appendChild(tdRegime);
 
-        const tdSize = document.createElement("td");
-        tdSize.textContent = row.recommendedNotional.toFixed(2);
-        tr.appendChild(tdSize);
+	        const tdSize = document.createElement("td");
+	        tdSize.textContent = row.recommendedNotional.toFixed(2);
+	        applyDecileHeat(tdSize, pctRecSizeById.get(row.id));
+	        tr.appendChild(tdSize);
 
-        const tdWin = document.createElement("td");
-        tdWin.textContent = formatPercent(row.winProb);
-        tr.appendChild(tdWin);
-    
-        const tdProfit = document.createElement("td");
-        tdProfit.textContent = formatProfitGp(row.profit);
-        tr.appendChild(tdProfit);
-    
-        const tdHr = document.createElement("td");
-        tdHr.textContent =
-          row.gpPerHour != null && Number.isFinite(row.gpPerHour)
-            ? formatGpPerHour(row.gpPerHour)
-            : "-";
-        tr.appendChild(tdHr);
-    
-        const tdVol = document.createElement("td");
-        tdVol.textContent =
-          row.volWindow != null
-            ? row.volWindow.toLocaleString("en-US")
-            : "-";
-        tr.appendChild(tdVol);
-    
-        const tdHold = document.createElement("td");
-        tdHold.textContent =
-          row.holdMinutes != null ? row.holdMinutes + "m" : "-";
-        tr.appendChild(tdHold);
+	        const tdWin = document.createElement("td");
+	        tdWin.textContent = formatPercent(row.winProb);
+	        applyDecileHeat(tdWin, pctWinById.get(row.id));
+	        tr.appendChild(tdWin);
+	    
+	        const tdProfit = document.createElement("td");
+	        tdProfit.textContent = formatProfitGp(row.profit);
+	        applyDecileHeat(tdProfit, pctProfitById.get(row.id));
+	        tr.appendChild(tdProfit);
+	    
+	        const tdHr = document.createElement("td");
+	        tdHr.textContent =
+	          row.gpPerHour != null && Number.isFinite(row.gpPerHour)
+	            ? formatGpPerHour(row.gpPerHour)
+	            : "-";
+	        applyDecileHeat(tdHr, pctGpHrById.get(row.id));
+	        tr.appendChild(tdHr);
+	    
+	        const tdVol = document.createElement("td");
+	        tdVol.textContent =
+	          row.volWindow != null
+	            ? row.volWindow.toLocaleString("en-US")
+	            : "-";
+	        applyDecileHeat(tdVol, pctVolById.get(row.id));
+	        tr.appendChild(tdVol);
+	    
+	        const tdHold = document.createElement("td");
+	        tdHold.textContent =
+	          row.holdMinutes != null ? row.holdMinutes + "m" : "-";
+	        applyDecileHeat(tdHold, pctHoldById.get(row.id));
+	        tr.appendChild(tdHold);
     
         tr.addEventListener("click", () => {
           loadPriceSeries(row.id, row.name);
@@ -1361,12 +1426,12 @@ const HTML = `<!DOCTYPE html>
 	        "avg_time_between_peaks_days"
 	      ]);
 
-		      const percentColumns = baseColumns.map((col) => ({
-		        key: col.key + "_norm_pct",
-		        header: col.header + " %",
-		        value: (row) => {
-	          const stats = statsByKey.get(col.key);
-	          const v = col.value(row);
+			      const percentColumns = baseColumns.map((col) => ({
+			        key: col.key + "_norm_pct",
+			        header: col.header + " %",
+			        value: (row) => {
+		          const stats = statsByKey.get(col.key);
+		          const v = col.value(row);
 	          if (
 	            col.key === "avg_time_between_peaks_days" &&
 	            row &&
@@ -1387,11 +1452,20 @@ const HTML = `<!DOCTYPE html>
 	            pct = Math.max(0, Math.min(100, pct));
 	          }
 	          return pct;
-	        },
-		        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
-		      }));
+			        },
+			        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
+			      }));
 
-		      renderPeaksSortPane(percentColumns);
+			      const pctValueFnByBaseKey = new Map();
+			      percentColumns.forEach((col) => {
+			        const suffix = "_norm_pct";
+			        if (typeof col.key === "string" && col.key.endsWith(suffix)) {
+			          const baseKey = col.key.slice(0, -suffix.length);
+			          pctValueFnByBaseKey.set(baseKey, col.value);
+			        }
+			      });
+
+			      renderPeaksSortPane(percentColumns);
 
 		      const allColumns = baseColumns.concat(percentColumns);
 
@@ -1495,6 +1569,10 @@ const HTML = `<!DOCTYPE html>
 	          const td = document.createElement("td");
 	          const val = col.value(row);
 	          td.textContent = col.format ? col.format(val) : val;
+	          const pctValueFn = pctValueFnByBaseKey.get(col.key);
+	          if (pctValueFn) {
+	            applyDecileHeat(td, pctValueFn(row));
+	          }
 	          tr.appendChild(td);
         });
 
