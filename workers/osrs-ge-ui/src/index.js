@@ -411,12 +411,13 @@ const HTML = `<!DOCTYPE html>
 	    const standardChartMount = document.getElementById("standardChartMount");
 	    const peaksChartMount = document.getElementById("peaksChartMount");
 	    const priceCardEl = document.getElementById("priceCard");
-	    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
+    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
     const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
 
     const PIN_KEY = "osrs_ge_pins_v3";
     const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
+    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -485,30 +486,61 @@ const HTML = `<!DOCTYPE html>
       });
     });
 
-    function loadPinnedState() {
-      try {
-        const raw = window.localStorage.getItem(PIN_KEY);
-        if (!raw) return {};
-        const obj = JSON.parse(raw);
-        if (obj && typeof obj === "object") return obj;
-      } catch (err) {
-        console.warn("Failed to parse pin state:", err);
-      }
-      return {};
-    }
+	    function loadPinnedState() {
+	      try {
+	        const raw = window.localStorage.getItem(PIN_KEY);
+	        if (!raw) return {};
+	        const obj = JSON.parse(raw);
+	        if (obj && typeof obj === "object") return obj;
+	      } catch (err) {
+	        console.warn("Failed to parse pin state:", err);
+	      }
+	      return {};
+	    }
 
-    function savePinnedState(state) {
-      try {
-        window.localStorage.setItem(PIN_KEY, JSON.stringify(state));
-      } catch (err) {
-        console.warn("Failed to save pin state:", err);
-      }
-    }
+	    function savePinnedState(state) {
+	      try {
+	        window.localStorage.setItem(PIN_KEY, JSON.stringify(state));
+	      } catch (err) {
+	        console.warn("Failed to save pin state:", err);
+	      }
+	    }
 
-    function getPinnedSet() {
-      const state = loadPinnedState();
-      return new Set(Object.keys(state));
-    }
+	    function loadPeaksWeights() {
+	      try {
+	        const raw = window.localStorage.getItem(PEAKS_WEIGHTS_KEY);
+	        if (!raw) return {};
+	        const obj = JSON.parse(raw);
+	        if (!obj || typeof obj !== "object") return {};
+	        const out = {};
+	        Object.entries(obj).forEach(([k, v]) => {
+	          const n = Number(v);
+	          if (Number.isFinite(n)) out[k] = n;
+	        });
+	        return out;
+	      } catch (err) {
+	        console.warn("Failed to parse peaks weights:", err);
+	      }
+	      return {};
+	    }
+
+	    function savePeaksWeights(weights) {
+	      try {
+	        window.localStorage.setItem(
+	          PEAKS_WEIGHTS_KEY,
+	          JSON.stringify(weights || {})
+	        );
+	      } catch (err) {
+	        console.warn("Failed to save peaks weights:", err);
+	      }
+	    }
+
+	    peaksPercentWeights = loadPeaksWeights();
+
+	    function getPinnedSet() {
+	      const state = loadPinnedState();
+	      return new Set(Object.keys(state));
+	    }
 
     function formatProfitGp(p) {
       if (!Number.isFinite(p)) return "-";
@@ -1224,11 +1256,15 @@ const HTML = `<!DOCTYPE html>
 	          peaksPercentWeights[col.key] = Number.isFinite(v) ? v : 0;
 	          valueSpan.textContent = String(peaksPercentWeights[col.key]);
 	        });
+	        slider.addEventListener("change", () => {
+	          savePeaksWeights(peaksPercentWeights);
+	        });
 
 	        rowEl.appendChild(labelEl);
 	        rowEl.appendChild(slider);
 	        peaksSortPaneEl.appendChild(rowEl);
 	      });
+	      savePeaksWeights(peaksPercentWeights);
 
 	      const applyBtn = document.createElement("button");
 	      applyBtn.type = "button";
