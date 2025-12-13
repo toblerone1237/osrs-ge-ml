@@ -62,8 +62,14 @@ const HTML = `<!DOCTYPE html>
     #meta {
       margin-top: 0.15rem;
     }
+    .table-scroll {
+      overflow-x: auto;
+      max-width: 100%;
+      -webkit-overflow-scrolling: touch;
+    }
     table {
-      width: 100%;
+      width: max-content;
+      min-width: 100%;
       border-collapse: collapse;
       font-size: 0.85rem;
     }
@@ -71,6 +77,7 @@ const HTML = `<!DOCTYPE html>
       padding: 0.35rem 0.45rem;
       border-bottom: 1px solid #1f2937;
       text-align: right;
+      white-space: nowrap;
     }
     th:first-child, td:first-child {
       text-align: left;
@@ -686,8 +693,11 @@ const HTML = `<!DOCTYPE html>
 
       table.appendChild(thead);
       table.appendChild(tbody);
+      const scroll = document.createElement("div");
+      scroll.className = "table-scroll";
+      scroll.appendChild(table);
       pinnedListEl.innerHTML = "";
-      pinnedListEl.appendChild(table);
+      pinnedListEl.appendChild(scroll);
     }
 
     function buildPaginationControls(totalRows, pageSize, currentPage) {
@@ -1000,7 +1010,10 @@ const HTML = `<!DOCTYPE html>
         currentPage
       );
       tableContainer.appendChild(pagerTop);
-      tableContainer.appendChild(table);
+      const scroll = document.createElement("div");
+      scroll.className = "table-scroll";
+      scroll.appendChild(table);
+      tableContainer.appendChild(scroll);
       tableContainer.appendChild(pagerBottom);
     }
 
@@ -1507,7 +1520,10 @@ const HTML = `<!DOCTYPE html>
         currentPage
       );
       peaksTableContainer.appendChild(pagerTop);
-      peaksTableContainer.appendChild(table);
+      const scroll = document.createElement("div");
+      scroll.className = "table-scroll";
+      scroll.appendChild(table);
+      peaksTableContainer.appendChild(scroll);
       peaksTableContainer.appendChild(pagerBottom);
     }
 
