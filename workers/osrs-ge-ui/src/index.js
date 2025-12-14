@@ -1891,20 +1891,72 @@ const HTML = `<!DOCTYPE html>
         );
       });
 
-      return {
-        labels,
-        histData,
-        volumeData,
-        fcData,
-        oldFcData,
-        starMarkerData,
-        nowMarkerData
-      };
-    }
+	      return {
+	        labels,
+	        histData,
+	        volumeData,
+	        fcData,
+	        oldFcData,
+	        starMarkerData,
+	        nowMarkerData
+	      };
+	    }
 
-    async function loadPriceSeries(itemId, name) {
-      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
-      priceStatusEl.textContent = "Loading price series...";
+	    function computeBucketVolumeWindow(labels, volumeData, histData, windowMs) {
+	      if (!Array.isArray(labels) || !labels.length) return null;
+	      if (!Array.isArray(volumeData) || !volumeData.length) return null;
+
+	      function getLabelTs(label) {
+	        if (label instanceof Date) return label.getTime();
+	        const parsed = Date.parse(String(label));
+	        return Number.isFinite(parsed) ? parsed : null;
+	      }
+
+	      let endTs = null;
+	      if (Array.isArray(histData)) {
+	        for (let i = histData.length - 1; i >= 0; i--) {
+	          if (Number.isFinite(histData[i])) {
+	            endTs = getLabelTs(labels[i]);
+	            break;
+	          }
+	        }
+	      }
+	      if (endTs == null) {
+	        for (let i = volumeData.length - 1; i >= 0; i--) {
+	          if (Number.isFinite(volumeData[i])) {
+	            endTs = getLabelTs(labels[i]);
+	            break;
+	          }
+	        }
+	      }
+	      if (endTs == null) {
+	        endTs = getLabelTs(labels[labels.length - 1]);
+	      }
+	      if (endTs == null) return null;
+
+	      const startTs = endTs - windowMs;
+	      let sum = 0;
+	      let bucketsInWindow = 0;
+	      let bucketsWithVolume = 0;
+	      const n = Math.min(labels.length, volumeData.length);
+	      for (let i = 0; i < n; i++) {
+	        const ts = getLabelTs(labels[i]);
+	        if (ts == null) continue;
+	        if (ts < startTs || ts > endTs) continue;
+	        bucketsInWindow += 1;
+	        const v = volumeData[i];
+	        if (Number.isFinite(v)) {
+	          sum += v;
+	          bucketsWithVolume += 1;
+	        }
+	      }
+
+	      return { startTs, endTs, sum, bucketsInWindow, bucketsWithVolume };
+	    }
+
+	    async function loadPriceSeries(itemId, name) {
+	      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
+	      priceStatusEl.textContent = "Loading price series...";
 
       try {
         const res = await fetch("/price-series?item_id=" + encodeURIComponent(itemId));
@@ -1947,14 +1999,40 @@ const HTML = `<!DOCTYPE html>
         const volumeData = tl.volumeData;
         const fcData = tl.fcData;
         const oldFcData = tl.oldFcData;
-        const starMarkerData = tl.starMarkerData;
-        const nowMarkerData = tl.nowMarkerData;
+	        const starMarkerData = tl.starMarkerData;
+	        const nowMarkerData = tl.nowMarkerData;
 
-        latestVolumeTimeline = Array.isArray(volumeData) ? volumeData.slice() : [];
+	        latestVolumeTimeline = Array.isArray(volumeData) ? volumeData.slice() : [];
+	        const volWindow24h = computeBucketVolumeWindow(
+	          labels,
+	          volumeData,
+	          histData,
+	          24 * 60 * 60 * 1000
+	        );
+	        const dailyVol24h = volumes24hById.get(Number(itemId));
+	        let volumeInfoText = " Tooltip shows per-bucket volume (5m last 24h, 30m older).";
+	        if (
+	          volWindow24h &&
+	          Number.isFinite(volWindow24h.sum) &&
+	          volWindow24h.bucketsWithVolume > 0
+	        ) {
+	          volumeInfoText +=
+	            " Sum last 24h ≈ " +
+	            Math.round(volWindow24h.sum).toLocaleString("en-US") +
+	            " (" +
+	            volWindow24h.bucketsWithVolume +
+	            " buckets).";
+	        }
+	        if (Number.isFinite(dailyVol24h) && dailyVol24h > 0) {
+	          volumeInfoText +=
+	            " Daily 24h = " +
+	            Math.round(dailyVol24h).toLocaleString("en-US") +
+	            ".";
+	        }
 
-        const allPrices = []
-          .concat(histData, fcData)
-          .filter((v) => v != null && Number.isFinite(v));
+	        const allPrices = []
+	          .concat(histData, fcData)
+	          .filter((v) => v != null && Number.isFinite(v));
 
         let yMin = 0;
         let yMax = 1;
@@ -2115,9 +2193,10 @@ const HTML = `<!DOCTYPE html>
                         ? value.toLocaleString("en-US")
                         : dsLabel || "";
 
-                    if (vol != null && Number.isFinite(vol) && vol > 0) {
-                      base += " (volume " + Math.round(vol).toLocaleString("en-US") + ")";
-                    }
+	                    if (vol != null && Number.isFinite(vol) && vol > 0) {
+	                      base +=
+	                        " (bucket vol " + Math.round(vol).toLocaleString("en-US") + ")";
+	                    }
 
                     return base;
                   }
@@ -2171,22 +2250,25 @@ const HTML = `<!DOCTYPE html>
           ? " Last price timestamp: " + latest5mIso + "."
           : "";
 
-        if (!hasForecast) {
-          priceStatusEl.textContent =
-            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
-            historySourceText +
-            lastTimestampText;
-        } else if (starInfo) {
-          priceStatusEl.textContent =
-            historySourceText +
-            lastTimestampText +
-            " Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
-        } else {
-          priceStatusEl.textContent =
-            historySourceText +
-            lastTimestampText +
-            " Blue = history; green = current forecast (5–120 minute horizons).";
-        }
+	        if (!hasForecast) {
+	          priceStatusEl.textContent =
+	            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
+	            historySourceText +
+	            lastTimestampText +
+	            volumeInfoText;
+	        } else if (starInfo) {
+	          priceStatusEl.textContent =
+	            historySourceText +
+	            lastTimestampText +
+	            volumeInfoText +
+	            " Blue = history; green = current forecast; yellow dashed = forecast at pin time.";
+	        } else {
+	          priceStatusEl.textContent =
+	            historySourceText +
+	            lastTimestampText +
+	            volumeInfoText +
+	            " Blue = history; green = current forecast (5–120 minute horizons).";
+	        }
       } catch (err) {
         console.error("Error loading price series:", err);
         priceStatusEl.textContent = "Error loading price series.";
