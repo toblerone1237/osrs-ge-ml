@@ -1992,7 +1992,6 @@ const HTML = `<!DOCTYPE html>
 		      for (let i = 0; i < histData.length; i++) {
 		        const price = histData[i];
 		        if (!Number.isFinite(price)) {
-		          inPeak = false;
 		          continue;
 		        }
 		        if (!inPeak) {
@@ -2285,8 +2284,12 @@ const HTML = `<!DOCTYPE html>
 
 	        const highlightPeaks = Boolean(opts && opts.highlightPeaks);
 	        const peakBaselinePrice = opts ? Number(opts.peakBaselinePrice) : NaN;
+	        const peakRefPrice =
+	          avgPrice != null && Number.isFinite(avgPrice) && avgPrice > 0
+	            ? avgPrice
+	            : peakBaselinePrice;
 	        const peakMask = highlightPeaks
-	          ? computePeakMask(histData, peakBaselinePrice)
+	          ? computePeakMask(histData, peakRefPrice)
 	          : null;
 	        const hasPeakSegments =
 	          Array.isArray(peakMask) && peakMask.some((v) => v === true);
@@ -2525,7 +2528,9 @@ const HTML = `<!DOCTYPE html>
 			            lastTimestampText +
 			            volumeInfoText +
 			            " Forecast hidden on Catching Peaks view." +
-			            (hasPeakSegments ? " Green segments = peak windows." : "");
+			            (hasPeakSegments
+			              ? " Green segments = peak windows (>= +50% above avg; ends at +10%)."
+			              : "");
 			        } else if (!hasForecast) {
 			          priceStatusEl.textContent =
 			            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +

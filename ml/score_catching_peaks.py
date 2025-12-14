@@ -193,11 +193,14 @@ def compute_catching_peaks_metric(
     separation = peak_avg / low_avg
     pct_diff = (separation - 1.0) * 100.0
 
-    # Count peaks using a hysteresis band around the baseline average:
-    # - A peak is only valid if price reaches >= +50% above the baseline average.
-    # - Once "in a peak", it doesn't end until price returns to within +10% of baseline.
-    min_peak_price = low_avg * 1.5
-    peak_end_price = low_avg * 1.1
+    # Count peaks using a hysteresis band around the mean price:
+    # - A peak is only valid if price reaches >= +50% above the mean.
+    # - Once "in a peak", it doesn't end until price returns to within +10% of mean.
+    mean_price = float(prices.mean())
+    if not np.isfinite(mean_price) or mean_price <= 0:
+        mean_price = float(low_avg)
+    min_peak_price = mean_price * 1.5
+    peak_end_price = mean_price * 1.1
 
     peak_ts_list: List[float] = []
     peak_tip_price_list: List[float] = []
@@ -248,7 +251,6 @@ def compute_catching_peaks_metric(
         elif peaks_count == 1:
             avg_time_between_peaks_days = 1000.0
 
-    mean_price = float(prices.mean())
     tip_pct_list: List[float] = []
     if np.isfinite(mean_price) and mean_price > 0:
         for tip_price in peak_tip_price_list:
