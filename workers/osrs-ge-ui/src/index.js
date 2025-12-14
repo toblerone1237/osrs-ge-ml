@@ -1478,13 +1478,23 @@ const HTML = `<!DOCTYPE html>
 	          value: (row) => row.time_since_last_peak_days,
 	          format: formatDays
 	        },
-	        {
-	          key: "avg_time_between_peaks_days",
-	          header: "Average Time Between Peaks",
-	          value: (row) => row.avg_time_between_peaks_days,
-	          format: formatDays
-	        }
-	      ];
+		        {
+		          key: "avg_time_between_peaks_days",
+		          header: "Average Time Between Peaks",
+		          value: (row) => {
+		            if (!row) return null;
+		            const peaksCount = row.peaks_count;
+		            if (
+		              Number.isFinite(peaksCount) &&
+		              Math.round(peaksCount) <= 1
+		            ) {
+		              return null;
+		            }
+		            return row.avg_time_between_peaks_days;
+		          },
+		          format: formatDays
+		        }
+		      ];
 
 	      function isBigGap(curr, next) {
 	        if (!Number.isFinite(curr) || !Number.isFinite(next)) return false;
@@ -1540,27 +1550,21 @@ const HTML = `<!DOCTYPE html>
 	        "avg_time_between_peaks_days"
 	      ]);
 
-			      const percentColumns = baseColumns.map((col) => ({
-			        key: col.key + "_norm_pct",
-			        header: col.header + " %",
-			        value: (row) => {
-		          const stats = statsByKey.get(col.key);
-		          const v = col.value(row);
-	          if (
-	            col.key === "avg_time_between_peaks_days" &&
-	            row &&
-	            Number.isFinite(row.peaks_count) &&
-	            Math.round(row.peaks_count) === 1
-	          ) {
-	            return 100;
-	          }
-	          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.maxForNorm))
-	            return null;
-	          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) return 100;
-	          if (!Number.isFinite(stats.range)) return null;
-	          let pct = ((v - stats.min) / stats.range) * 100;
-	          if (invertPercentKeys.has(col.key) && Number.isFinite(pct)) {
-	            pct = 100 - pct;
+				      const percentColumns = baseColumns.map((col) => ({
+				        key: col.key + "_norm_pct",
+				        header: col.header + " %",
+				        value: (row) => {
+			          const stats = statsByKey.get(col.key);
+			          const v = col.value(row);
+		          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.maxForNorm))
+		            return null;
+		          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) {
+		            return invertPercentKeys.has(col.key) ? 0 : 100;
+		          }
+		          if (!Number.isFinite(stats.range)) return null;
+		          let pct = ((v - stats.min) / stats.range) * 100;
+		          if (invertPercentKeys.has(col.key) && Number.isFinite(pct)) {
+		            pct = 100 - pct;
 	          }
 	          if (Number.isFinite(pct)) {
 	            pct = Math.max(0, Math.min(100, pct));
