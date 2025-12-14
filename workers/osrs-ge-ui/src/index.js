@@ -385,6 +385,7 @@ const HTML = `<!DOCTYPE html>
 			            <div class="small" style="margin-bottom:0.4rem;">
 			              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
 			              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+			              Sharpness = average % above the mean at each peak tip.
 			            </div>
 			            <div class="peaks-controls">
 			              <div class="search-row peaks-search-row">
@@ -1543,12 +1544,12 @@ const HTML = `<!DOCTYPE html>
           value: (row) => row.pct_difference,
           format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
         },
-        {
-          key: "sharpness",
-          header: "Sharpness",
-          value: (row) => row.score,
-          format: (v) => (Number.isFinite(v) ? v.toFixed(4) : "-")
-        },
+	        {
+	          key: "sharpness",
+	          header: "Sharpness",
+	          value: (row) => row.score,
+	          format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
+	        },
         {
           key: "peaks_count",
           header: "Peaks Count",

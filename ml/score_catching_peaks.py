@@ -169,16 +169,12 @@ def compute_catching_peaks_metric(
 
     if baseline_is_comp2:
         baseline_mask = gamma2 > 0.5
-        is_spike = ~baseline_mask
         mu_baseline = float(fit["mu2"])
         mu_spike = float(fit["mu1"])
-        spike_weight = w1
     else:
         baseline_mask = gamma2 <= 0.5
-        is_spike = ~baseline_mask
         mu_baseline = float(fit["mu1"])
         mu_spike = float(fit["mu2"])
-        spike_weight = w2
 
     baseline_prices = prices[baseline_mask]
     spike_prices = prices[~baseline_mask]
@@ -196,28 +192,6 @@ def compute_catching_peaks_metric(
 
     separation = peak_avg / low_avg
     pct_diff = (separation - 1.0) * 100.0
-    w2 = float(spike_weight)
-
-    baseline_cv = 1.0
-    if baseline_prices.size >= 3:
-        b_std = float(baseline_prices.std())
-        if np.isfinite(b_std) and low_avg > 0:
-            baseline_cv = b_std / low_avg
-
-    # Identify raw spike runs (posterior > 0.5) so we can measure their
-    # average length for the "short-lived spikes" penalty.
-    spike_runs: List[int] = []
-    current_run = 0
-    for flag in is_spike.tolist():
-        if flag:
-            current_run += 1
-        elif current_run:
-            spike_runs.append(current_run)
-            current_run = 0
-    if current_run:
-        spike_runs.append(current_run)
-
-    avg_spike_len = float(np.mean(spike_runs)) if spike_runs else 0.0
 
     # Count peaks using a hysteresis band around the baseline average:
     # - A peak is only valid if price reaches >= +50% above the baseline average.
@@ -226,6 +200,7 @@ def compute_catching_peaks_metric(
     peak_end_price = low_avg * 1.1
 
     peak_ts_list: List[float] = []
+    peak_tip_price_list: List[float] = []
     in_peak = False
     current_peak_max_price: Optional[float] = None
     current_peak_max_ts: Optional[float] = None
@@ -245,12 +220,16 @@ def compute_catching_peaks_metric(
         if price <= peak_end_price:
             if current_peak_max_ts is not None:
                 peak_ts_list.append(float(current_peak_max_ts))
+                if current_peak_max_price is not None and np.isfinite(current_peak_max_price):
+                    peak_tip_price_list.append(float(current_peak_max_price))
             in_peak = False
             current_peak_max_price = None
             current_peak_max_ts = None
 
     if in_peak and current_peak_max_ts is not None:
         peak_ts_list.append(float(current_peak_max_ts))
+        if current_peak_max_price is not None and np.isfinite(current_peak_max_price):
+            peak_tip_price_list.append(float(current_peak_max_price))
 
     peaks_count = len(peak_ts_list)
 
@@ -269,14 +248,17 @@ def compute_catching_peaks_metric(
         elif peaks_count == 1:
             avg_time_between_peaks_days = 1000.0
 
-    baseline_stability = 1.0 / (1.0 + baseline_cv * 5.0)
-    rare_weight = exp(-w2 * 8.0)
-    spike_shortness = 1.0 / (1.0 + avg_spike_len / 3.0)
-    separation_delta = max(0.0, separation - 1.0)
+    mean_price = float(prices.mean())
+    tip_pct_list: List[float] = []
+    if np.isfinite(mean_price) and mean_price > 0:
+        for tip_price in peak_tip_price_list:
+            if not np.isfinite(tip_price) or tip_price <= 0:
+                continue
+            pct = (tip_price / mean_price - 1.0) * 100.0
+            if np.isfinite(pct):
+                tip_pct_list.append(max(0.0, float(pct)))
 
-    score = separation_delta * rare_weight * baseline_stability * spike_shortness
-    if not np.isfinite(score):
-        score = 0.0
+    score = float(np.mean(tip_pct_list)) if tip_pct_list else 0.0
 
     volume24h = 0.0
     for ts, _, vol in pts:
