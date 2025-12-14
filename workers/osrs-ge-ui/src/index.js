@@ -2010,6 +2010,105 @@ const HTML = `<!DOCTYPE html>
 		      return mask;
 		    }
 
+		    const avgLineOverlayPlugin = {
+		      id: "avgLineOverlay",
+		      beforeDatasetsDraw(chart, args, pluginOptions) {
+		        const value = pluginOptions ? pluginOptions.value : null;
+		        if (!Number.isFinite(value)) return;
+		        const chartArea = chart && chart.chartArea ? chart.chartArea : null;
+		        const yScale = chart && chart.scales ? chart.scales.y : null;
+		        if (!chartArea || !yScale) return;
+		        const y = yScale.getPixelForValue(value);
+		        if (!Number.isFinite(y)) return;
+		        if (y < chartArea.top || y > chartArea.bottom) return;
+
+		        const color =
+		          pluginOptions && typeof pluginOptions.color === "string"
+		            ? pluginOptions.color
+		            : "rgba(234,179,8,0.35)";
+		        const lineWidth =
+		          pluginOptions && Number.isFinite(pluginOptions.lineWidth)
+		            ? pluginOptions.lineWidth
+		            : 1.5;
+		        const dash =
+		          pluginOptions && Array.isArray(pluginOptions.dash)
+		            ? pluginOptions.dash
+		            : [6, 4];
+
+		        const ctx = chart.ctx;
+		        ctx.save();
+		        ctx.strokeStyle = color;
+		        ctx.lineWidth = lineWidth;
+		        ctx.setLineDash(dash);
+		        ctx.beginPath();
+		        ctx.moveTo(chartArea.left, y);
+		        ctx.lineTo(chartArea.right, y);
+		        ctx.stroke();
+		        ctx.restore();
+		      },
+		      afterDatasetsDraw(chart, args, pluginOptions) {
+		        const value = pluginOptions ? pluginOptions.value : null;
+		        if (!Number.isFinite(value)) return;
+		        const chartArea = chart && chart.chartArea ? chart.chartArea : null;
+		        const yScale = chart && chart.scales ? chart.scales.y : null;
+		        if (!chartArea || !yScale) return;
+		        let y = yScale.getPixelForValue(value);
+		        if (!Number.isFinite(y)) return;
+		        const ctx = chart.ctx;
+
+		        const text =
+		          pluginOptions && typeof pluginOptions.text === "string"
+		            ? pluginOptions.text
+		            : "";
+		        if (!text) return;
+
+		        const padding =
+		          pluginOptions && Number.isFinite(pluginOptions.padding)
+		            ? pluginOptions.padding
+		            : 3;
+		        const xPadding = padding;
+		        const yPadding = padding;
+		        const x = chartArea.right - 4;
+
+		        const fontSize =
+		          pluginOptions && Number.isFinite(pluginOptions.fontSize)
+		            ? pluginOptions.fontSize
+		            : 11;
+		        const font =
+		          pluginOptions && typeof pluginOptions.font === "string"
+		            ? pluginOptions.font
+		            : "600 " + fontSize + "px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+		        const textColor =
+		          pluginOptions && typeof pluginOptions.textColor === "string"
+		            ? pluginOptions.textColor
+		            : "rgba(234,179,8,0.9)";
+		        const bgColor =
+		          pluginOptions && typeof pluginOptions.backgroundColor === "string"
+		            ? pluginOptions.backgroundColor
+		            : "rgba(2,6,23,0.75)";
+
+		        const yMin = chartArea.top + fontSize / 2 + yPadding;
+		        const yMax = chartArea.bottom - fontSize / 2 - yPadding;
+		        y = Math.max(yMin, Math.min(yMax, y));
+
+		        ctx.save();
+		        ctx.font = font;
+		        ctx.textAlign = "right";
+		        ctx.textBaseline = "middle";
+		        const metrics = ctx.measureText(text);
+		        const textWidth = metrics && Number.isFinite(metrics.width) ? metrics.width : 0;
+		        const boxW = textWidth + xPadding * 2;
+		        const boxH = fontSize + yPadding * 2;
+		        const boxLeft = x - boxW;
+		        const boxTop = y - boxH / 2;
+		        ctx.fillStyle = bgColor;
+		        ctx.fillRect(boxLeft, boxTop, boxW, boxH);
+		        ctx.fillStyle = textColor;
+		        ctx.fillText(text, x - xPadding, y);
+		        ctx.restore();
+		      }
+		    };
+
 		    function computeBucketVolumeWindow(labels, volumeData, histData, windowMs) {
 		      if (!Array.isArray(labels) || !labels.length) return null;
 		      if (!Array.isArray(volumeData) || !volumeData.length) return null;
@@ -2102,12 +2201,12 @@ const HTML = `<!DOCTYPE html>
 	              }
             : null;
 
-        const tl = buildTimeline(history, forecast, starInfo);
-        const labels = tl.labels;
-        const histData = tl.histData;
-	        const volumeData = tl.volumeData;
-	        const fcData = tl.fcData;
-	        const oldFcData = tl.oldFcData;
+	        const tl = buildTimeline(history, forecast, starInfo);
+	        const labels = tl.labels;
+	        const histData = tl.histData;
+		        const volumeData = tl.volumeData;
+		        const fcData = tl.fcData;
+		        const oldFcData = tl.oldFcData;
 		        const starMarkerData = tl.starMarkerData;
 		        const nowMarkerData = tl.nowMarkerData;
 
@@ -2132,17 +2231,31 @@ const HTML = `<!DOCTYPE html>
 	            volWindow24h.bucketsWithVolume +
 	            " buckets).";
 	        }
-	        if (Number.isFinite(dailyVol24h) && dailyVol24h > 0) {
-	          volumeInfoText +=
-	            " Daily 24h = " +
-	            Math.round(dailyVol24h).toLocaleString("en-US") +
-	            ".";
-	        }
+		        if (Number.isFinite(dailyVol24h) && dailyVol24h > 0) {
+		          volumeInfoText +=
+		            " Daily 24h = " +
+		            Math.round(dailyVol24h).toLocaleString("en-US") +
+		            ".";
+		        }
 
-	        const allPrices = []
-	          .concat(histData)
-	          .concat(showForecast ? oldFcData : [])
-	          .concat(showForecast ? fcData : [])
+		        let avgPrice = null;
+		        {
+		          let sum = 0;
+		          let count = 0;
+		          histData.forEach((v) => {
+		            if (!Number.isFinite(v)) return;
+		            sum += v;
+		            count += 1;
+		          });
+		          if (count > 0 && Number.isFinite(sum)) {
+		            avgPrice = sum / count;
+		          }
+		        }
+
+		        const allPrices = []
+		          .concat(histData)
+		          .concat(showForecast ? oldFcData : [])
+		          .concat(showForecast ? fcData : [])
 	          .filter((v) => v != null && Number.isFinite(v));
 
         let yMin = 0;
@@ -2262,16 +2375,17 @@ const HTML = `<!DOCTYPE html>
           });
         }
 
-        priceChart = new Chart(ctx, {
-          type: "line",
-          data: {
-            labels: labels,
-            datasets: datasets
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false,
+	        priceChart = new Chart(ctx, {
+	          type: "line",
+	          data: {
+	            labels: labels,
+	            datasets: datasets
+	          },
+	          plugins: [avgLineOverlayPlugin],
+	          options: {
+	            responsive: true,
+	            maintainAspectRatio: false,
+	            animation: false,
             interaction: {
               mode: "index",
               intersect: false,
@@ -2307,10 +2421,24 @@ const HTML = `<!DOCTYPE html>
                 }
               }
             },
-            plugins: {
-              legend: {
-                position: "bottom"
-              },
+	            plugins: {
+	              avgLineOverlay: {
+	                value: avgPrice,
+	                text:
+	                  avgPrice != null && Number.isFinite(avgPrice)
+	                    ? "avg " + formatGpPerHour(avgPrice)
+	                    : "",
+	                color: "rgba(234,179,8,0.35)",
+	                dash: [6, 4],
+	                lineWidth: 1.5,
+	                padding: 3,
+	                fontSize: 11,
+	                textColor: "rgba(234,179,8,0.9)",
+	                backgroundColor: "rgba(2,6,23,0.75)"
+	              },
+	              legend: {
+	                position: "bottom"
+	              },
               tooltip: {
                 callbacks: {
                   label: function (context) {
