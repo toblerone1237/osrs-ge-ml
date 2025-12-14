@@ -1506,38 +1506,57 @@ const HTML = `<!DOCTYPE html>
 	        return (curr - next) / next > 0.10;
 	      }
 
-	      function computeNormalizationStats(valueFn) {
-	        const vals = [];
-	        rows.forEach((r) => {
-	          const v = valueFn(r);
-	          if (Number.isFinite(v)) vals.push(v);
-	        });
-	        if (!vals.length) {
-	          return { min: null, maxForNorm: null, range: null, hasExcluded: false };
-	        }
-	        vals.sort((a, b) => b - a);
-	        let excludeCount = 0;
-	        while (
-	          excludeCount + 1 < vals.length &&
-	          isBigGap(vals[excludeCount], vals[excludeCount + 1])
-	        ) {
-	          excludeCount += 1;
-	        }
-	        const remaining = vals.slice(excludeCount);
-	        const maxForNorm = remaining[0];
-	        const min = remaining[remaining.length - 1];
-	        const rawRange =
-	          Number.isFinite(maxForNorm) && Number.isFinite(min)
-	            ? maxForNorm - min
-	            : NaN;
-	        return {
-	          min,
-	          maxForNorm,
-	          range:
-	            Number.isFinite(rawRange) && rawRange !== 0 ? rawRange : null,
-	          hasExcluded: excludeCount > 0
-	        };
-	      }
+		      function computeNormalizationStats(valueFn) {
+		        const vals = [];
+		        rows.forEach((r) => {
+		          const v = valueFn(r);
+		          if (Number.isFinite(v)) vals.push(v);
+		        });
+		        if (!vals.length) {
+		          return {
+		            min: null,
+		            maxForNorm: null,
+		            range: null,
+		            hasExcluded: false,
+		            hasExcludedTop: false,
+		            hasExcludedBottom: false
+		          };
+		        }
+		        vals.sort((a, b) => b - a);
+		        let excludeTopCount = 0;
+		        while (
+		          excludeTopCount + 1 < vals.length &&
+		          isBigGap(vals[excludeTopCount], vals[excludeTopCount + 1])
+		        ) {
+		          excludeTopCount += 1;
+		        }
+		        let excludeBottomCount = 0;
+		        while (
+		          vals.length - excludeBottomCount - 2 >= excludeTopCount &&
+		          isBigGap(
+		            vals[vals.length - excludeBottomCount - 2],
+		            vals[vals.length - excludeBottomCount - 1]
+		          )
+		        ) {
+		          excludeBottomCount += 1;
+		        }
+		        const remaining = vals.slice(excludeTopCount, vals.length - excludeBottomCount);
+		        const maxForNorm = remaining[0];
+		        const min = remaining[remaining.length - 1];
+		        const rawRange =
+		          Number.isFinite(maxForNorm) && Number.isFinite(min)
+		            ? maxForNorm - min
+		            : NaN;
+		        return {
+		          min,
+		          maxForNorm,
+		          range:
+		            Number.isFinite(rawRange) && rawRange !== 0 ? rawRange : null,
+		          hasExcluded: excludeTopCount > 0 || excludeBottomCount > 0,
+		          hasExcludedTop: excludeTopCount > 0,
+		          hasExcludedBottom: excludeBottomCount > 0
+		        };
+		      }
 
 	      const statsByKey = new Map();
 	      baseColumns.forEach((col) => {
@@ -1554,17 +1573,25 @@ const HTML = `<!DOCTYPE html>
 				        key: col.key + "_norm_pct",
 				        header: col.header + " %",
 				        value: (row) => {
-			          const stats = statsByKey.get(col.key);
-			          const v = col.value(row);
-		          if (!Number.isFinite(v) || !stats || !Number.isFinite(stats.maxForNorm))
-		            return null;
-		          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) {
-		            return invertPercentKeys.has(col.key) ? 0 : 100;
-		          }
-		          if (!Number.isFinite(stats.range)) return null;
-		          let pct = ((v - stats.min) / stats.range) * 100;
-		          if (invertPercentKeys.has(col.key) && Number.isFinite(pct)) {
-		            pct = 100 - pct;
+				          const stats = statsByKey.get(col.key);
+				          const v = col.value(row);
+			          if (
+			            !Number.isFinite(v) ||
+			            !stats ||
+			            !Number.isFinite(stats.maxForNorm) ||
+			            !Number.isFinite(stats.min)
+			          )
+			            return null;
+			          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) {
+			            return invertPercentKeys.has(col.key) ? 0 : 100;
+			          }
+			          if (stats.hasExcluded && v < stats.min - 1e-9) {
+			            return invertPercentKeys.has(col.key) ? 100 : 0;
+			          }
+			          if (!Number.isFinite(stats.range)) return null;
+			          let pct = ((v - stats.min) / stats.range) * 100;
+			          if (invertPercentKeys.has(col.key) && Number.isFinite(pct)) {
+			            pct = 100 - pct;
 	          }
 	          if (Number.isFinite(pct)) {
 	            pct = Math.max(0, Math.min(100, pct));
