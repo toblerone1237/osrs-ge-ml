@@ -642,23 +642,23 @@ const HTML = `<!DOCTYPE html>
       return Math.max(0, Math.min(9, decile));
     }
 
-    function applyDecileHeat(td, pct) {
-      const decile = toDecileFromPercent(pct);
-      if (decile == null) return;
-      const hue = (decile / 9) * 120;
-      td.classList.add("heat");
-      td.style.setProperty("--heat-hue", String(hue));
-    }
+	    function applyDecileHeat(td, pct) {
+	      const decile = toDecileFromPercent(pct);
+	      if (decile == null) return;
+	      const hue = (decile / 9) * 120;
+	      td.classList.add("heat");
+	      td.style.setProperty("--heat-hue", String(hue));
+	    }
 
-    function computePercentRankById(rows, getValue, invert = false) {
-      const pairs = [];
-      rows.forEach((row) => {
-        const id = row && row.id;
-        const v = getValue(row);
-        if (!Number.isFinite(id) || !Number.isFinite(v)) return;
-        pairs.push({ id, v });
-      });
-      if (!pairs.length) return new Map();
+	    function computePercentRank(rows, getId, getValue, invert = false) {
+	      const pairs = [];
+	      rows.forEach((row) => {
+	        const id = getId(row);
+	        const v = getValue(row);
+	        if (!Number.isFinite(id) || !Number.isFinite(v)) return;
+	        pairs.push({ id, v });
+	      });
+	      if (!pairs.length) return new Map();
 
       pairs.sort((a, b) => a.v - b.v);
       const out = new Map();
@@ -673,13 +673,26 @@ const HTML = `<!DOCTYPE html>
         if (invert) pct = 100 - pct;
         out.set(p.id, pct);
       });
-      return out;
-    }
+	      return out;
+	    }
 
-    function probPill(p) {
-      if (!Number.isFinite(p)) return '<span class="pill">–</span>';
-      const pct = p * 100;
-      const cls = pct >= 60 ? "pill good" : pct >= 50 ? "pill" : "pill bad";
+	    function computePercentRankById(rows, getValue, invert = false) {
+	      return computePercentRank(rows, (row) => row && row.id, getValue, invert);
+	    }
+
+	    function computePercentRankByItemId(rows, getValue, invert = false) {
+	      return computePercentRank(
+	        rows,
+	        (row) => Number(row && row.item_id),
+	        getValue,
+	        invert
+	      );
+	    }
+
+	    function probPill(p) {
+	      if (!Number.isFinite(p)) return '<span class="pill">–</span>';
+	      const pct = p * 100;
+	      const cls = pct >= 60 ? "pill good" : pct >= 50 ? "pill" : "pill bad";
       return '<span class="' + cls + '">' + pct.toFixed(1) + "%</span>";
     }
 
@@ -1403,10 +1416,10 @@ const HTML = `<!DOCTYPE html>
 	        return Number.isFinite(v) ? v.toFixed(1) : "-";
 	      }
 
-      const baseColumns = [
-        {
-          key: "low_avg_price",
-          header: "Low Average Price",
+		      const baseColumns = [
+		        {
+		          key: "low_avg_price",
+		          header: "Low Average Price",
           value: (row) => row.low_avg_price,
           format: formatProfitGp
         },
@@ -1492,114 +1505,41 @@ const HTML = `<!DOCTYPE html>
 		            }
 		            return row.avg_time_between_peaks_days;
 		          },
-		          format: formatDays
-		        }
-		      ];
+			          format: formatDays
+			        }
+			      ];
 
-	      function isBigGap(curr, next) {
-	        if (!Number.isFinite(curr) || !Number.isFinite(next)) return false;
-	        // Only apply outlier peeling on positive-valued columns. If the
-	        // sequence crosses zero/negative, stop peeling to avoid nonsense gaps.
-	        if (curr <= 0) return false;
-	        if (next < 0) return false;
-	        if (next === 0) return curr > 0;
-	        return (curr - next) / next > 0.10;
-	      }
+		      const invertPercentKeys = new Set([
+		        "low_avg_price",
+		        "time_since_last_peak_days",
+		        "avg_time_between_peaks_days"
+		      ]);
 
-		      function computeNormalizationStats(valueFn) {
-		        const vals = [];
-		        rows.forEach((r) => {
-		          const v = valueFn(r);
-		          if (Number.isFinite(v)) vals.push(v);
-		        });
-		        if (!vals.length) {
-		          return {
-		            min: null,
-		            maxForNorm: null,
-		            range: null,
-		            hasExcluded: false,
-		            hasExcludedTop: false,
-		            hasExcludedBottom: false
-		          };
-		        }
-		        vals.sort((a, b) => b - a);
-		        let excludeTopCount = 0;
-		        while (
-		          excludeTopCount + 1 < vals.length &&
-		          isBigGap(vals[excludeTopCount], vals[excludeTopCount + 1])
-		        ) {
-		          excludeTopCount += 1;
-		        }
-		        let excludeBottomCount = 0;
-		        while (
-		          vals.length - excludeBottomCount - 2 >= excludeTopCount &&
-		          isBigGap(
-		            vals[vals.length - excludeBottomCount - 2],
-		            vals[vals.length - excludeBottomCount - 1]
+		      const pctByItemIdByKey = new Map();
+		      baseColumns.forEach((col) => {
+		        pctByItemIdByKey.set(
+		          col.key,
+		          computePercentRankByItemId(
+		            rows,
+		            col.value,
+		            invertPercentKeys.has(col.key)
 		          )
-		        ) {
-		          excludeBottomCount += 1;
-		        }
-		        const remaining = vals.slice(excludeTopCount, vals.length - excludeBottomCount);
-		        const maxForNorm = remaining[0];
-		        const min = remaining[remaining.length - 1];
-		        const rawRange =
-		          Number.isFinite(maxForNorm) && Number.isFinite(min)
-		            ? maxForNorm - min
-		            : NaN;
-		        return {
-		          min,
-		          maxForNorm,
-		          range:
-		            Number.isFinite(rawRange) && rawRange !== 0 ? rawRange : null,
-		          hasExcluded: excludeTopCount > 0 || excludeBottomCount > 0,
-		          hasExcludedTop: excludeTopCount > 0,
-		          hasExcludedBottom: excludeBottomCount > 0
-		        };
-		      }
+		        );
+		      });
 
-	      const statsByKey = new Map();
-	      baseColumns.forEach((col) => {
-	        statsByKey.set(col.key, computeNormalizationStats(col.value));
-	      });
-
-	      const invertPercentKeys = new Set([
-	        "low_avg_price",
-	        "time_since_last_peak_days",
-	        "avg_time_between_peaks_days"
-	      ]);
-
-				      const percentColumns = baseColumns.map((col) => ({
-				        key: col.key + "_norm_pct",
-				        header: col.header + " %",
-				        value: (row) => {
-				          const stats = statsByKey.get(col.key);
-				          const v = col.value(row);
-			          if (
-			            !Number.isFinite(v) ||
-			            !stats ||
-			            !Number.isFinite(stats.maxForNorm) ||
-			            !Number.isFinite(stats.min)
-			          )
-			            return null;
-			          if (stats.hasExcluded && v > stats.maxForNorm + 1e-9) {
-			            return invertPercentKeys.has(col.key) ? 0 : 100;
-			          }
-			          if (stats.hasExcluded && v < stats.min - 1e-9) {
-			            return invertPercentKeys.has(col.key) ? 100 : 0;
-			          }
-			          if (!Number.isFinite(stats.range)) return null;
-			          let pct = ((v - stats.min) / stats.range) * 100;
-			          if (invertPercentKeys.has(col.key) && Number.isFinite(pct)) {
-			            pct = 100 - pct;
-	          }
-	          if (Number.isFinite(pct)) {
-	            pct = Math.max(0, Math.min(100, pct));
-	          }
-	          return pct;
-			        },
-			        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
-			      }));
+					      const percentColumns = baseColumns.map((col) => ({
+					        key: col.key + "_norm_pct",
+					        header: col.header + " %",
+					        value: (row) => {
+					          const itemId = Number(row && row.item_id);
+					          if (!Number.isFinite(itemId)) return null;
+					          const byId = pctByItemIdByKey.get(col.key);
+					          if (!byId) return null;
+					          const pct = byId.get(itemId);
+					          return Number.isFinite(pct) ? pct : null;
+						        },
+						        format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
+						      }));
 
 			      const pctValueFnByBaseKey = new Map();
 			      percentColumns.forEach((col) => {
