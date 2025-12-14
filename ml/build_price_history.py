@@ -188,6 +188,28 @@ def apply_new_snapshots(
 
     print(f"Processing {len(keys)} new 5m snapshots with up to {SNAPSHOT_FETCH_WORKERS} workers.")
 
+    def parse_price(v):
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        if not math.isfinite(f) or f <= 0:
+            return None
+        return f
+
+    def parse_volume(v):
+        if v is None:
+            return 0.0
+        try:
+            f = float(v)
+        except Exception:
+            return 0.0
+        if not math.isfinite(f) or f < 0:
+            return 0.0
+        return f
+
     with ThreadPoolExecutor(max_workers=SNAPSHOT_FETCH_WORKERS) as pool:
         future_map = {key: pool.submit(fetch_snapshot, s3, bucket, key) for key in keys}
         processed = 0
@@ -200,24 +222,25 @@ def apply_new_snapshots(
             data = five.get("data") or {}
             if ts_unix >= cutoff_recent_unix:
                 for item_id_str, st in data.items():
-                    ah = st.get("avgHighPrice")
-                    al = st.get("avgLowPrice")
-                    if ah is None or al is None:
+                    high_vol_f = parse_volume(st.get("highPriceVolume"))
+                    low_vol_f = parse_volume(st.get("lowPriceVolume"))
+                    total_vol = float(high_vol_f + low_vol_f)
+
+                    ah_f = parse_price(st.get("avgHighPrice"))
+                    al_f = parse_price(st.get("avgLowPrice"))
+                    if ah_f is None and al_f is None:
                         continue
-                    mid = (ah + al) / 2.0
+                    if ah_f is not None and al_f is not None:
+                        if high_vol_f <= 0 and low_vol_f > 0:
+                            mid = al_f
+                        elif low_vol_f <= 0 and high_vol_f > 0:
+                            mid = ah_f
+                        else:
+                            mid = (ah_f + al_f) / 2.0
+                    else:
+                        mid = ah_f if ah_f is not None else al_f
                     if mid is None or mid <= 0 or not math.isfinite(mid):
                         continue
-                    high_vol = st.get("highPriceVolume")
-                    low_vol = st.get("lowPriceVolume")
-                    try:
-                        high_vol_f = float(high_vol) if high_vol is not None else 0.0
-                    except Exception:
-                        high_vol_f = 0.0
-                    try:
-                        low_vol_f = float(low_vol) if low_vol is not None else 0.0
-                    except Exception:
-                        low_vol_f = 0.0
-                    total_vol = float(high_vol_f + low_vol_f)
                     try:
                         item_id = int(item_id_str)
                     except ValueError:
@@ -226,24 +249,25 @@ def apply_new_snapshots(
             else:
                 bucket_sec = (ts_unix // (OLDER_INTERVAL_MIN * 60)) * (OLDER_INTERVAL_MIN * 60)
                 for item_id_str, st in data.items():
-                    ah = st.get("avgHighPrice")
-                    al = st.get("avgLowPrice")
-                    if ah is None or al is None:
+                    high_vol_f = parse_volume(st.get("highPriceVolume"))
+                    low_vol_f = parse_volume(st.get("lowPriceVolume"))
+                    total_vol = float(high_vol_f + low_vol_f)
+
+                    ah_f = parse_price(st.get("avgHighPrice"))
+                    al_f = parse_price(st.get("avgLowPrice"))
+                    if ah_f is None and al_f is None:
                         continue
-                    mid = (ah + al) / 2.0
+                    if ah_f is not None and al_f is not None:
+                        if high_vol_f <= 0 and low_vol_f > 0:
+                            mid = al_f
+                        elif low_vol_f <= 0 and high_vol_f > 0:
+                            mid = ah_f
+                        else:
+                            mid = (ah_f + al_f) / 2.0
+                    else:
+                        mid = ah_f if ah_f is not None else al_f
                     if mid is None or mid <= 0 or not math.isfinite(mid):
                         continue
-                    high_vol = st.get("highPriceVolume")
-                    low_vol = st.get("lowPriceVolume")
-                    try:
-                        high_vol_f = float(high_vol) if high_vol is not None else 0.0
-                    except Exception:
-                        high_vol_f = 0.0
-                    try:
-                        low_vol_f = float(low_vol) if low_vol is not None else 0.0
-                    except Exception:
-                        low_vol_f = 0.0
-                    total_vol = float(high_vol_f + low_vol_f)
                     try:
                         item_id = int(item_id_str)
                     except ValueError:
@@ -386,10 +410,15 @@ def main():
     all_keys.sort()
     print("Found", len(all_keys), "5m snapshots in the last", MAX_HISTORY_DAYS, "days.")
 
-    if meta:
-        last_key = meta.get("last_processed_key")
-    else:
-        last_key = None
+    force_full_rebuild = os.environ.get("FORCE_FULL_REBUILD", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if force_full_rebuild:
+        print("FORCE_FULL_REBUILD enabled; doing full rebuild from raw 5m snapshots.")
+
+    last_key = meta.get("last_processed_key") if meta and not force_full_rebuild else None
 
     new_keys = all_keys
     seed_from_existing = False

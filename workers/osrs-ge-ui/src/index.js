@@ -2506,25 +2506,40 @@ function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
     return { history, added: false, latestIso: null };
   }
 
-  const ah = entry.avgHighPrice;
-  const al = entry.avgLowPrice;
-  if (typeof ah !== "number" || typeof al !== "number") {
-    return { history, added: false, latestIso: null };
+  function asPositiveNumber(v) {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
   }
 
-  const mid = (ah + al) / 2;
+  function asNonNegativeNumber(v) {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  }
+
+  const highVol = asNonNegativeNumber(entry.highPriceVolume) || 0;
+  const lowVol = asNonNegativeNumber(entry.lowPriceVolume) || 0;
+  const volume = highVol + lowVol;
+
+  const ah = asPositiveNumber(entry.avgHighPrice);
+  const al = asPositiveNumber(entry.avgLowPrice);
+
+  let mid = null;
+  if (ah != null && al != null) {
+    if (highVol <= 0 && lowVol > 0) {
+      mid = al;
+    } else if (lowVol <= 0 && highVol > 0) {
+      mid = ah;
+    } else {
+      mid = (ah + al) / 2;
+    }
+  } else if (ah != null) {
+    mid = ah;
+  } else if (al != null) {
+    mid = al;
+  }
+
   if (!Number.isFinite(mid) || mid <= 0) {
     return { history, added: false, latestIso: null };
-  }
-
-  const highVol = entry.highPriceVolume;
-  const lowVol = entry.lowPriceVolume;
-  let volume = 0;
-  if (typeof highVol === "number" && Number.isFinite(highVol) && highVol > 0) {
-    volume += highVol;
-  }
-  if (typeof lowVol === "number" && Number.isFinite(lowVol) && lowVol > 0) {
-    volume += lowVol;
   }
 
   const tsMs = Math.floor(tsSec * 1000);
@@ -2548,7 +2563,7 @@ function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
     {
       timestamp_iso: iso,
       price: mid,
-      ...(volume > 0 ? { volume } : {})
+      volume: volume
     }
   ]);
   return { history: newHistory, added: true, latestIso: iso };
