@@ -244,15 +244,26 @@ const HTML = `<!DOCTYPE html>
 		    .peaks-apply-btn:hover {
 		      background: #1f2937;
 		    }
-		    .peaks-controls {
-		      display: flex;
-		      justify-content: flex-end;
-		      margin-bottom: 0.4rem;
-		    }
-		    .peaks-toggle-btn {
-		      padding: 0.3rem 0.6rem;
-		      border-radius: 0.35rem;
-		      border: 1px solid #4b5563;
+			    .peaks-controls {
+			      display: flex;
+			      align-items: center;
+			      justify-content: space-between;
+			      gap: 0.5rem;
+			      flex-wrap: wrap;
+			      margin-bottom: 0.4rem;
+			    }
+			    .peaks-search-row {
+			      margin-bottom: 0;
+			      flex: 1;
+			      min-width: 180px;
+			    }
+			    .peaks-search-row input {
+			      min-width: 140px;
+			    }
+			    .peaks-toggle-btn {
+			      padding: 0.3rem 0.6rem;
+			      border-radius: 0.35rem;
+			      border: 1px solid #4b5563;
 		      background: #111827;
 		      color: #e5e7eb;
 		      cursor: pointer;
@@ -369,17 +380,22 @@ const HTML = `<!DOCTYPE html>
 	            <div id="peaksMeta" class="small"></div>
 	          </div>
 
-		          <div class="card">
-		            <h2>Catching Peaks leaderboard</h2>
-		            <div class="small" style="margin-bottom:0.4rem;">
-		              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
-		              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
-		            </div>
-		            <div class="peaks-controls">
-		              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show As %</button>
-		            </div>
-		            <div id="peaksTableContainer">Waiting for data...</div>
-		          </div>
+			          <div class="card">
+			            <h2>Catching Peaks leaderboard</h2>
+			            <div class="small" style="margin-bottom:0.4rem;">
+			              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
+			              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+			            </div>
+			            <div class="peaks-controls">
+			              <div class="search-row peaks-search-row">
+			                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
+			                <button id="peaksSearchClearBtn" type="button">Clear</button>
+			              </div>
+			              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show As %</button>
+			            </div>
+			            <div id="peaksSearchStatus" class="small"></div>
+			            <div id="peaksTableContainer">Waiting for data...</div>
+			          </div>
 
 	          <div id="peaksChartMount"></div>
 	        </div>
@@ -428,14 +444,17 @@ const HTML = `<!DOCTYPE html>
     const searchResultsEl = document.getElementById("searchResults");
     const pinnedListEl = document.getElementById("pinnedList");
 
-		    const peaksStatusEl = document.getElementById("peaksStatus");
-		    const peaksMetaEl = document.getElementById("peaksMeta");
-		    const peaksTableContainer = document.getElementById("peaksTableContainer");
-		    const peaksSortPaneEl = document.getElementById("peaksSortPane");
-		    const peaksShowAsPctBtn = document.getElementById("peaksShowAsPctBtn");
-		    const standardChartMount = document.getElementById("standardChartMount");
-		    const peaksChartMount = document.getElementById("peaksChartMount");
-		    const priceCardEl = document.getElementById("priceCard");
+			    const peaksStatusEl = document.getElementById("peaksStatus");
+			    const peaksMetaEl = document.getElementById("peaksMeta");
+			    const peaksTableContainer = document.getElementById("peaksTableContainer");
+			    const peaksSortPaneEl = document.getElementById("peaksSortPane");
+			    const peaksSearchInput = document.getElementById("peaksSearchInput");
+			    const peaksSearchClearBtn = document.getElementById("peaksSearchClearBtn");
+			    const peaksSearchStatusEl = document.getElementById("peaksSearchStatus");
+			    const peaksShowAsPctBtn = document.getElementById("peaksShowAsPctBtn");
+			    const standardChartMount = document.getElementById("standardChartMount");
+			    const peaksChartMount = document.getElementById("peaksChartMount");
+			    const priceCardEl = document.getElementById("priceCard");
     const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
     const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
@@ -467,24 +486,48 @@ const HTML = `<!DOCTYPE html>
 		    let peaksSortDir = "desc";
 		    const DEFAULT_PEAK_WEIGHT = 100;
 		    let peaksPercentWeights = {};
-		    let peaksSortPaneKeys = [];
-		    let peaksShowAsPercent = false;
-		    let peaksTableRenderScheduled = false;
-		    // Latest volume timeline for the active chart (aligned to labels)
-		    let latestVolumeTimeline = [];
+			    let peaksSortPaneKeys = [];
+			    let peaksShowAsPercent = false;
+			    let peaksSearchQuery = "";
+			    let peaksTableRenderScheduled = false;
+			    // Latest volume timeline for the active chart (aligned to labels)
+			    let latestVolumeTimeline = [];
 
-    function moveChartToTab(tabName) {
-      const mount =
-        tabName === "peaks" ? peaksChartMount : standardChartMount;
-      if (mount && priceCardEl && priceCardEl.parentElement !== mount) {
-        mount.appendChild(priceCardEl);
-      }
-    }
+	    function moveChartToTab(tabName) {
+	      const mount =
+	        tabName === "peaks" ? peaksChartMount : standardChartMount;
+	      if (mount && priceCardEl && priceCardEl.parentElement !== mount) {
+	        mount.appendChild(priceCardEl);
+	      }
+	    }
 
-    function setActiveTab(tabName) {
-      const active = tabName === "peaks" ? "peaks" : "standard";
-      tabButtons.forEach((btn) => {
-        const isActive = btn.dataset.tab === active;
+	    function syncForecastVisibilityForTab(tabName) {
+	      if (!priceChart || !priceChart.data) return;
+	      const hideForecast = tabName === "peaks";
+	      const datasets = Array.isArray(priceChart.data.datasets)
+	        ? priceChart.data.datasets
+	        : [];
+	      let changed = false;
+	      datasets.forEach((ds) => {
+	        if (!ds || typeof ds.label !== "string") return;
+	        const isForecast = ds.label.startsWith("Forecast");
+	        if (!isForecast) return;
+	        if (Boolean(ds.hidden) !== hideForecast) {
+	          ds.hidden = hideForecast;
+	          changed = true;
+	        }
+	      });
+	      if (changed) {
+	        try {
+	          priceChart.update("none");
+	        } catch (_) {}
+	      }
+	    }
+
+	    function setActiveTab(tabName) {
+	      const active = tabName === "peaks" ? "peaks" : "standard";
+	      tabButtons.forEach((btn) => {
+	        const isActive = btn.dataset.tab === active;
         btn.classList.toggle("active", isActive);
         btn.setAttribute("aria-selected", isActive ? "true" : "false");
       });
@@ -497,11 +540,12 @@ const HTML = `<!DOCTYPE html>
         const showPeaks = active === "peaks";
         tabPeaksEl.classList.toggle("active", showPeaks);
         tabPeaksEl.setAttribute("aria-hidden", showPeaks ? "false" : "true");
-      }
-      moveChartToTab(active);
-      try {
-        window.localStorage.setItem(ACTIVE_TAB_KEY, active);
-      } catch (_) {}
+	      }
+	      moveChartToTab(active);
+	      syncForecastVisibilityForTab(active);
+	      try {
+	        window.localStorage.setItem(ACTIVE_TAB_KEY, active);
+	      } catch (_) {}
 
       if (active === "peaks" && !peaksLoaded) {
         loadPeaksOverview();
@@ -587,20 +631,51 @@ const HTML = `<!DOCTYPE html>
 
 		    peaksShowAsPercent = loadPeaksShowAsPercent();
 		    updatePeaksShowAsPercentButton();
-		    if (peaksShowAsPctBtn) {
-		      peaksShowAsPctBtn.addEventListener("click", () => {
-		        peaksShowAsPercent = !peaksShowAsPercent;
-		        savePeaksShowAsPercent(peaksShowAsPercent);
-		        updatePeaksShowAsPercentButton();
-		        peaksCurrentPage = 1;
-		        renderPeaksTable();
-		      });
-		    }
+			    if (peaksShowAsPctBtn) {
+			      peaksShowAsPctBtn.addEventListener("click", () => {
+			        peaksShowAsPercent = !peaksShowAsPercent;
+			        savePeaksShowAsPercent(peaksShowAsPercent);
+			        updatePeaksShowAsPercentButton();
+			        peaksCurrentPage = 1;
+			        renderPeaksTable();
+			      });
+			    }
 
-		    function schedulePeaksTableRender() {
-		      if (peaksTableRenderScheduled) return;
-		      peaksTableRenderScheduled = true;
-		      const run = () => {
+			    function normalizePeaksSearchQuery(q) {
+			      return (q || "").trim().toLowerCase();
+			    }
+
+			    function setPeaksSearchQuery(q) {
+			      peaksSearchQuery = normalizePeaksSearchQuery(q);
+			      peaksCurrentPage = 1;
+			      schedulePeaksTableRender();
+			    }
+
+			    if (peaksSearchInput) {
+			      peaksSearchInput.addEventListener("input", () => {
+			        setPeaksSearchQuery(peaksSearchInput.value);
+			      });
+			      peaksSearchInput.addEventListener("keydown", (ev) => {
+			        if (ev.key === "Enter") {
+			          setPeaksSearchQuery(peaksSearchInput.value);
+			          renderPeaksTable();
+			        }
+			      });
+			    }
+			    if (peaksSearchClearBtn) {
+			      peaksSearchClearBtn.addEventListener("click", () => {
+			        if (peaksSearchInput) peaksSearchInput.value = "";
+			        setPeaksSearchQuery("");
+			        try {
+			          if (peaksSearchInput) peaksSearchInput.focus();
+			        } catch (_) {}
+			      });
+			    }
+
+			    function schedulePeaksTableRender() {
+			      if (peaksTableRenderScheduled) return;
+			      peaksTableRenderScheduled = true;
+			      const run = () => {
 		        peaksTableRenderScheduled = false;
 		        renderPeaksTable();
 		      };
@@ -1370,17 +1445,44 @@ const HTML = `<!DOCTYPE html>
 	      peaksSortPaneEl.appendChild(applyBtn);
 	    }
 
-	    function renderPeaksTable() {
-	      if (!peaksTableContainer) return;
-	      if (!peaksItems.length) {
-	        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
-	        return;
-      }
+		    function renderPeaksTable() {
+		      if (!peaksTableContainer) return;
+		      if (!peaksItems.length) {
+		        if (peaksSearchStatusEl) peaksSearchStatusEl.textContent = "";
+		        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
+		        return;
+	      }
 
-	      const rows = peaksItems.slice();
+		      const allRows = peaksItems.slice();
+		      const q =
+		        typeof peaksSearchQuery === "string"
+		          ? peaksSearchQuery.trim().toLowerCase()
+		          : "";
+		      let rows = allRows;
+		      if (q) {
+		        rows = allRows.filter((row) => {
+		          const idStr =
+		            row && row.item_id != null ? String(row.item_id) : "";
+		          const name =
+		            row && row.name ? String(row.name).toLowerCase() : "";
+		          return (
+		            (idStr && idStr.includes(q)) ||
+		            (name && name.includes(q))
+		          );
+		        });
+		      }
+		      if (peaksSearchStatusEl) {
+		        peaksSearchStatusEl.textContent = q
+		          ? "Filtered: " + rows.length + " / " + allRows.length + " items."
+		          : allRows.length + " items.";
+		      }
+		      if (!rows.length) {
+		        peaksTableContainer.textContent = "No items match that filter.";
+		        return;
+		      }
 
-	      const pageSize =
-	        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
+		      const pageSize =
+		        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
 
 	      const table = document.createElement("table");
 	      const thead = document.createElement("thead");
@@ -1515,17 +1617,17 @@ const HTML = `<!DOCTYPE html>
 		        "avg_time_between_peaks_days"
 		      ]);
 
-		      const pctByItemIdByKey = new Map();
-		      baseColumns.forEach((col) => {
-		        pctByItemIdByKey.set(
-		          col.key,
-		          computePercentRankByItemId(
-		            rows,
-		            col.value,
-		            invertPercentKeys.has(col.key)
-		          )
-		        );
-		      });
+			      const pctByItemIdByKey = new Map();
+			      baseColumns.forEach((col) => {
+			        pctByItemIdByKey.set(
+			          col.key,
+			          computePercentRankByItemId(
+			            allRows,
+			            col.value,
+			            invertPercentKeys.has(col.key)
+			          )
+			        );
+			      });
 
 					      const percentColumns = baseColumns.map((col) => ({
 					        key: col.key + "_norm_pct",
@@ -1653,9 +1755,11 @@ const HTML = `<!DOCTYPE html>
 		          tr.appendChild(td);
 	        });
 
-        tr.addEventListener("click", () => {
-          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id));
-        });
+	        tr.addEventListener("click", () => {
+	          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
+	            showForecast: false
+	          });
+	        });
 
         tbody.appendChild(tr);
       });
@@ -1921,53 +2025,54 @@ const HTML = `<!DOCTYPE html>
 	      return { startTs, endTs, sum, bucketsInWindow, bucketsWithVolume };
 	    }
 
-	    async function loadPriceSeries(itemId, name) {
-	      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
-	      priceStatusEl.textContent = "Loading price series...";
+		    async function loadPriceSeries(itemId, name, opts) {
+		      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
+		      priceStatusEl.textContent = "Loading price series...";
 
-      try {
-        const res = await fetch("/price-series?item_id=" + encodeURIComponent(itemId));
-        if (!res.ok) {
-          priceStatusEl.textContent =
-            "No price data available (HTTP " + res.status + ").";
+	      try {
+	        const showForecast = !(opts && opts.showForecast === false);
+	        const res = await fetch("/price-series?item_id=" + encodeURIComponent(itemId));
+	        if (!res.ok) {
+	          priceStatusEl.textContent =
+	            "No price data available (HTTP " + res.status + ").";
           if (priceChart) {
             priceChart.destroy();
             priceChart = null;
           }
           return;
         }
+	
+	        const data = await res.json();
+	        const history = data.history || [];
+	        const forecast = showForecast ? data.forecast || [] : [];
 
-        const data = await res.json();
-        const history = data.history || [];
-        const forecast = data.forecast || [];
-
-        if (!history.length && !forecast.length) {
-          priceStatusEl.textContent = "No price data yet for this item.";
-          if (priceChart) {
+	        if (!history.length && !forecast.length) {
+	          priceStatusEl.textContent = "No price data yet for this item.";
+	          if (priceChart) {
             priceChart.destroy();
             priceChart = null;
           }
           return;
         }
 
-        const pinnedState = loadPinnedState();
-        const pinEntry = pinnedState[String(itemId)];
-        const starInfo =
-          pinEntry && pinEntry.pinned
-            ? {
-                starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
-                forecastAtStar: pinEntry.forecastAtStar || []
-              }
+	        const pinnedState = loadPinnedState();
+	        const pinEntry = pinnedState[String(itemId)];
+	        const starInfo =
+	          showForecast && pinEntry && pinEntry.pinned
+	            ? {
+	                starredAtIso: pinEntry.starredAtIso || pinEntry.pinnedAtIso,
+	                forecastAtStar: pinEntry.forecastAtStar || []
+	              }
             : null;
 
         const tl = buildTimeline(history, forecast, starInfo);
         const labels = tl.labels;
         const histData = tl.histData;
-        const volumeData = tl.volumeData;
-        const fcData = tl.fcData;
-        const oldFcData = tl.oldFcData;
-	        const starMarkerData = tl.starMarkerData;
-	        const nowMarkerData = tl.nowMarkerData;
+	        const volumeData = tl.volumeData;
+	        const fcData = tl.fcData;
+	        const oldFcData = tl.oldFcData;
+		        const starMarkerData = tl.starMarkerData;
+		        const nowMarkerData = tl.nowMarkerData;
 
 	        latestVolumeTimeline = Array.isArray(volumeData) ? volumeData.slice() : [];
 	        const volWindow24h = computeBucketVolumeWindow(
@@ -1998,7 +2103,9 @@ const HTML = `<!DOCTYPE html>
 	        }
 
 	        const allPrices = []
-	          .concat(histData, fcData)
+	          .concat(histData)
+	          .concat(showForecast ? oldFcData : [])
+	          .concat(showForecast ? fcData : [])
 	          .filter((v) => v != null && Number.isFinite(v));
 
         let yMin = 0;
@@ -2026,59 +2133,64 @@ const HTML = `<!DOCTYPE html>
           priceChart.destroy();
         }
 
-        const datasets = [
-          {
-            label: "Historical mid price (5m last 24h, 30m older)",
-            data: histData,
-            borderColor: "rgba(59,130,246,1)",
-            backgroundColor: "rgba(59,130,246,0.2)",
-            pointRadius: 0,
-            borderWidth: 2,
-            tension: 0.15,
-            spanGaps: true
-          },
-          {
-            label: "Forecast price (next 2h, 5m steps)",
-            data: fcData,
-            borderColor: "rgba(16,185,129,1)",
-            backgroundColor: "rgba(16,185,129,0.15)",
-            pointRadius: 0,
-            borderWidth: 2,
-            borderDash: [6, 3],
-            tension: 0.15,
-            spanGaps: true
-          }
-        ];
+	        const datasets = [
+	          {
+	            label: "Historical mid price (5m last 24h, 30m older)",
+	            data: histData,
+	            borderColor: "rgba(59,130,246,1)",
+	            backgroundColor: "rgba(59,130,246,0.2)",
+	            pointRadius: 0,
+	            borderWidth: 2,
+	            tension: 0.15,
+	            spanGaps: true
+	          }
+	        ];
 
-        if (starInfo && oldFcData.some((v) => v != null)) {
-          datasets.splice(1, 0, {
-            label: "Forecast at pin time",
-            data: oldFcData,
-            borderColor: "rgba(234,179,8,1)",
-            backgroundColor: "rgba(234,179,8,0.15)",
+	        if (showForecast && starInfo && oldFcData.some((v) => v != null)) {
+	          datasets.push({
+	            label: "Forecast at pin time",
+	            data: oldFcData,
+	            borderColor: "rgba(234,179,8,1)",
+	            backgroundColor: "rgba(234,179,8,0.15)",
             pointRadius: 0,
             borderWidth: 1.5,
             borderDash: [6, 4],
             tension: 0.15,
-            spanGaps: true
-          });
-        }
+	            spanGaps: true
+	          });
+	        }
 
-        if (starInfo && starMarkerData.some((v) => v != null)) {
-          datasets.push({
-            label: "Pin time",
-            data: starMarkerData,
-            borderColor: "rgba(250,204,21,1)",
-            backgroundColor: "rgba(250,204,21,1)",
-            pointRadius: 4,
-            borderWidth: 0,
-            showLine: false
-          });
-        }
+	        const hasCurrentForecastData =
+	          showForecast && fcData.some((v) => v != null && Number.isFinite(v));
+	        if (hasCurrentForecastData) {
+	          datasets.push({
+	            label: "Forecast price (next 2h, 5m steps)",
+	            data: fcData,
+	            borderColor: "rgba(16,185,129,1)",
+	            backgroundColor: "rgba(16,185,129,0.15)",
+	            pointRadius: 0,
+	            borderWidth: 2,
+	            borderDash: [6, 3],
+	            tension: 0.15,
+	            spanGaps: true
+	          });
+	        }
 
-        if (nowMarkerData.some((v) => v != null)) {
-          datasets.push({
-            label: "Now",
+	        if (showForecast && starInfo && starMarkerData.some((v) => v != null)) {
+	          datasets.push({
+	            label: "Pin time",
+	            data: starMarkerData,
+	            borderColor: "rgba(250,204,21,1)",
+	            backgroundColor: "rgba(250,204,21,1)",
+	            pointRadius: 4,
+	            borderWidth: 0,
+	            showLine: false
+	          });
+	        }
+
+	        if (nowMarkerData.some((v) => v != null)) {
+	          datasets.push({
+	            label: "Now",
             data: nowMarkerData,
             borderColor: "rgba(248,250,252,1)",
             backgroundColor: "rgba(248,250,252,1)",
@@ -2206,22 +2318,28 @@ const HTML = `<!DOCTYPE html>
             : false;
         const historyLatestIso =
           data.meta && data.meta.history_latest_iso ? data.meta.history_latest_iso : null;
-        const latest5mIso =
-          data.meta && data.meta.latest_5m_timestamp_iso ? data.meta.latest_5m_timestamp_iso : null;
-        const hasForecast = forecast && forecast.length > 1;
-        const historySourceText =
-          "History source: " + src + (truncated ? " (truncated)" : "") + ".";
+	        const latest5mIso =
+	          data.meta && data.meta.latest_5m_timestamp_iso ? data.meta.latest_5m_timestamp_iso : null;
+	        const hasForecast = showForecast && forecast && forecast.length > 1;
+	        const historySourceText =
+	          "History source: " + src + (truncated ? " (truncated)" : "") + ".";
         const lastTimestampText = historyLatestIso
           ? " Last price timestamp: " + historyLatestIso + "."
           : latest5mIso
           ? " Last price timestamp: " + latest5mIso + "."
           : "";
 
-	        if (!hasForecast) {
-	          priceStatusEl.textContent =
-	            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
-	            historySourceText +
-	            lastTimestampText +
+		        if (!showForecast) {
+		          priceStatusEl.textContent =
+		            historySourceText +
+		            lastTimestampText +
+		            volumeInfoText +
+		            " Forecast hidden on Catching Peaks view.";
+		        } else if (!hasForecast) {
+		          priceStatusEl.textContent =
+		            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
+		            historySourceText +
+		            lastTimestampText +
 	            volumeInfoText;
 	        } else if (starInfo) {
 	          priceStatusEl.textContent =
