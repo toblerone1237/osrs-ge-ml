@@ -1756,11 +1756,13 @@ const HTML = `<!DOCTYPE html>
 		          tr.appendChild(td);
 	        });
 
-	        tr.addEventListener("click", () => {
-	          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
-	            showForecast: false
-	          });
-	        });
+		        tr.addEventListener("click", () => {
+		          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
+		            showForecast: false,
+		            highlightPeaks: true,
+		            peakBaselinePrice: row.low_avg_price
+		          });
+		        });
 
         tbody.appendChild(tr);
       });
@@ -1840,10 +1842,10 @@ const HTML = `<!DOCTYPE html>
       }
     });
 
-    function buildTimeline(history, forecast, starInfo) {
-      const tsSet = new Set();
-      const histMap = new Map();
-      const volMap = new Map();
+	    function buildTimeline(history, forecast, starInfo) {
+	      const tsSet = new Set();
+	      const histMap = new Map();
+	      const volMap = new Map();
       const fcMap = new Map();
       const oldFcMap = new Map();
 
@@ -1963,20 +1965,54 @@ const HTML = `<!DOCTYPE html>
         );
       });
 
-	      return {
-	        labels,
-	        histData,
-	        volumeData,
-	        fcData,
-	        oldFcData,
-	        starMarkerData,
-	        nowMarkerData
-	      };
-	    }
+		      return {
+		        labels,
+		        histData,
+		        volumeData,
+		        fcData,
+		        oldFcData,
+		        starMarkerData,
+		        nowMarkerData
+		      };
+		    }
 
-	    function computeBucketVolumeWindow(labels, volumeData, histData, windowMs) {
-	      if (!Array.isArray(labels) || !labels.length) return null;
-	      if (!Array.isArray(volumeData) || !volumeData.length) return null;
+		    function computePeakMask(histData, baselinePrice, opts) {
+		      if (!Array.isArray(histData) || !histData.length) return null;
+		      if (!Number.isFinite(baselinePrice) || baselinePrice <= 0) return null;
+		      const startMult =
+		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
+		      const endMult =
+		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
+
+		      const minPeakPrice = baselinePrice * startMult;
+		      const peakEndPrice = baselinePrice * endMult;
+
+		      const mask = new Array(histData.length).fill(false);
+		      let inPeak = false;
+		      for (let i = 0; i < histData.length; i++) {
+		        const price = histData[i];
+		        if (!Number.isFinite(price)) {
+		          inPeak = false;
+		          continue;
+		        }
+		        if (!inPeak) {
+		          if (price >= minPeakPrice) {
+		            inPeak = true;
+		            mask[i] = true;
+		          }
+		          continue;
+		        }
+		        mask[i] = true;
+		        if (price <= peakEndPrice) {
+		          inPeak = false;
+		        }
+		      }
+		      return mask;
+		    }
+
+		    function computeBucketVolumeWindow(labels, volumeData, histData, windowMs) {
+		      if (!Array.isArray(labels) || !labels.length) return null;
+		      if (!Array.isArray(volumeData) || !volumeData.length) return null;
 
 	      function getLabelTs(label) {
 	        if (label instanceof Date) return label.getTime();
@@ -2129,23 +2165,48 @@ const HTML = `<!DOCTYPE html>
           yMax = rawMax + pad;
         }
 
-        const ctx = chartCanvas.getContext("2d");
-        if (priceChart) {
-          priceChart.destroy();
-        }
+	        const ctx = chartCanvas.getContext("2d");
+	        if (priceChart) {
+	          priceChart.destroy();
+	        }
 
-	        const datasets = [
-	          {
-	            label: "Historical mid price (5m last 24h, 30m older)",
-	            data: histData,
-	            borderColor: "rgba(59,130,246,1)",
-	            backgroundColor: "rgba(59,130,246,0.2)",
-	            pointRadius: 0,
-	            borderWidth: 2,
-	            tension: 0.15,
-	            spanGaps: true
-	          }
-	        ];
+	        const highlightPeaks = Boolean(opts && opts.highlightPeaks);
+	        const peakBaselinePrice = opts ? Number(opts.peakBaselinePrice) : NaN;
+	        const peakMask = highlightPeaks
+	          ? computePeakMask(histData, peakBaselinePrice)
+	          : null;
+	        const hasPeakSegments =
+	          Array.isArray(peakMask) && peakMask.some((v) => v === true);
+
+	        const historyLineColor = "rgba(59,130,246,1)";
+	        const peakLineColor = "rgba(16,185,129,1)";
+
+	        const historyDataset = {
+	          label: "Historical mid price (5m last 24h, 30m older)",
+	          data: histData,
+	          borderColor: historyLineColor,
+	          backgroundColor: "rgba(59,130,246,0.2)",
+	          pointRadius: 0,
+	          borderWidth: 2,
+	          tension: 0.15,
+	          spanGaps: true
+	        };
+
+	        if (hasPeakSegments) {
+	          historyDataset.segment = {
+	            borderColor: (ctx) => {
+	              const i0 = ctx && Number.isFinite(ctx.p0DataIndex) ? ctx.p0DataIndex : null;
+	              const i1 = ctx && Number.isFinite(ctx.p1DataIndex) ? ctx.p1DataIndex : null;
+	              const p0IsPeak =
+	                i0 != null && i0 >= 0 && i0 < peakMask.length && peakMask[i0];
+	              const p1IsPeak =
+	                i1 != null && i1 >= 0 && i1 < peakMask.length && peakMask[i1];
+	              return p0IsPeak || p1IsPeak ? peakLineColor : historyLineColor;
+	            }
+	          };
+	        }
+
+	        const datasets = [historyDataset];
 
 	        if (showForecast && starInfo && oldFcData.some((v) => v != null)) {
 	          datasets.push({
@@ -2330,16 +2391,17 @@ const HTML = `<!DOCTYPE html>
           ? " Last price timestamp: " + latest5mIso + "."
           : "";
 
-		        if (!showForecast) {
-		          priceStatusEl.textContent =
-		            historySourceText +
-		            lastTimestampText +
-		            volumeInfoText +
-		            " Forecast hidden on Catching Peaks view.";
-		        } else if (!hasForecast) {
-		          priceStatusEl.textContent =
-		            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
-		            historySourceText +
+			        if (!showForecast) {
+			          priceStatusEl.textContent =
+			            historySourceText +
+			            lastTimestampText +
+			            volumeInfoText +
+			            " Forecast hidden on Catching Peaks view." +
+			            (hasPeakSegments ? " Green segments = peak windows." : "");
+			        } else if (!hasForecast) {
+			          priceStatusEl.textContent =
+			            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
+			            historySourceText +
 		            lastTimestampText +
 	            volumeInfoText;
 	        } else if (starInfo) {
