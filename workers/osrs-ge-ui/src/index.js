@@ -164,6 +164,21 @@ const HTML = `<!DOCTYPE html>
       width: 100% !important;
       height: 100% !important;
     }
+    .chart-scrollbar {
+      display: none;
+      margin-top: 0.35rem;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .chart-scrollbar input[type="range"] {
+      width: 100%;
+    }
+    .chart-scrollbar .chart-scroll-label {
+      font-size: 0.75rem;
+      color: #9ca3af;
+      white-space: nowrap;
+      user-select: none;
+    }
     .pagination-controls {
       display: flex;
       align-items: center;
@@ -452,8 +467,20 @@ const HTML = `<!DOCTYPE html>
       <div class="chart-wrapper">
         <canvas id="priceChart"></canvas>
       </div>
+      <div id="priceChartScrollWrap" class="chart-scrollbar" aria-hidden="true">
+        <span class="chart-scroll-label">Pan</span>
+        <input
+          id="priceChartScroll"
+          type="range"
+          min="0"
+          max="1000"
+          value="0"
+          step="1"
+          aria-label="Pan chart window"
+        />
+      </div>
       <div id="priceStatus" class="small" style="margin-top:0.4rem;"></div>
-      <div class="small" style="margin-top:0.25rem;">Scroll to zoom, Shift+drag to pan, double‑click to reset.</div>
+      <div class="small" style="margin-top:0.25rem;">Scroll to zoom, Shift+drag to pan, drag the slider to scroll, double‑click to reset.</div>
     </div>
   </main>
 
@@ -467,6 +494,8 @@ const HTML = `<!DOCTYPE html>
     const priceTitleEl = document.getElementById("priceTitle");
     const priceStatusEl = document.getElementById("priceStatus");
     const chartCanvas = document.getElementById("priceChart");
+    const chartScrollWrapEl = document.getElementById("priceChartScrollWrap");
+    const chartScrollEl = document.getElementById("priceChartScroll");
 
     const searchInput = document.getElementById("searchInput");
     const searchButton = document.getElementById("searchButton");
@@ -513,6 +542,8 @@ const HTML = `<!DOCTYPE html>
 	    const PEAKS_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
 			    let peaksItems = [];
 			    let peaksLoaded = false;
+			    let peaksWindowDays = null;
+			    let peaksBaselineHalfWindowDays = null;
 			    let peaksSortKey = "sharpness";
 			    let peaksSortDir = "desc";
 			    const DEFAULT_PEAK_WEIGHT = 100;
@@ -525,6 +556,139 @@ const HTML = `<!DOCTYPE html>
 				    let peaksTableRenderScheduled = false;
 			    // Latest volume timeline for the active chart (aligned to labels)
 			    let latestVolumeTimeline = [];
+
+			    const CHART_SCROLL_STEPS = 1000;
+
+			    function clampNumber(v, lo, hi) {
+			      const n = Number(v);
+			      if (!Number.isFinite(n)) return lo;
+			      return Math.min(hi, Math.max(lo, n));
+			    }
+
+			    function setChartScrollVisible(visible) {
+			      if (!chartScrollWrapEl) return;
+			      chartScrollWrapEl.style.display = visible ? "flex" : "none";
+			      chartScrollWrapEl.setAttribute("aria-hidden", visible ? "false" : "true");
+			    }
+
+			    function setChartOriginalXRange(chart) {
+			      if (!chart || !chart.scales || !chart.scales.x) return;
+			      const x = chart.scales.x;
+			      const min = x.min;
+			      const max = x.max;
+			      if (Number.isFinite(min) && Number.isFinite(max) && max > min) {
+			        chart.__xOriginal = { min, max };
+			      }
+			    }
+
+			    function updateChartScrollFromChart(chart) {
+			      if (!chartScrollEl || !chartScrollWrapEl || !chart) return;
+			      const x = chart.scales && chart.scales.x ? chart.scales.x : null;
+			      if (!x) return;
+
+			      const original = chart.__xOriginal;
+			      const originalMin = original ? original.min : null;
+			      const originalMax = original ? original.max : null;
+			      const curMin = x.min;
+			      const curMax = x.max;
+
+			      if (
+			        !Number.isFinite(originalMin) ||
+			        !Number.isFinite(originalMax) ||
+			        !Number.isFinite(curMin) ||
+			        !Number.isFinite(curMax)
+			      ) {
+			        setChartScrollVisible(false);
+			        return;
+			      }
+
+			      const fullWidth = originalMax - originalMin;
+			      const windowWidth = curMax - curMin;
+			      if (!(fullWidth > 0) || !(windowWidth > 0)) {
+			        setChartScrollVisible(false);
+			        return;
+			      }
+
+			      const isZoomed = windowWidth < fullWidth - 1;
+			      if (!isZoomed) {
+			        setChartScrollVisible(false);
+			        return;
+			      }
+
+			      const maxOffset = fullWidth - windowWidth;
+			      const offset = clampNumber(curMin - originalMin, 0, maxOffset);
+			      const frac = maxOffset > 0 ? offset / maxOffset : 0;
+			      chartScrollEl.value = String(
+			        Math.round(clampNumber(frac, 0, 1) * CHART_SCROLL_STEPS)
+			      );
+			      setChartScrollVisible(true);
+			    }
+
+			    function applyChartScrollFromSlider(chart) {
+			      if (!chartScrollEl || !chart) return;
+			      const x = chart.scales && chart.scales.x ? chart.scales.x : null;
+			      if (!x) return;
+
+			      const original = chart.__xOriginal;
+			      const originalMin = original ? original.min : null;
+			      const originalMax = original ? original.max : null;
+			      if (!Number.isFinite(originalMin) || !Number.isFinite(originalMax)) return;
+
+			      const curMin = x.min;
+			      const curMax = x.max;
+			      if (!Number.isFinite(curMin) || !Number.isFinite(curMax)) return;
+
+			      const fullWidth = originalMax - originalMin;
+			      const windowWidth = curMax - curMin;
+			      const maxOffset = fullWidth - windowWidth;
+			      if (!(maxOffset > 0)) return;
+
+			      const frac = clampNumber(
+			        Number(chartScrollEl.value) / CHART_SCROLL_STEPS,
+			        0,
+			        1
+			      );
+			      const nextMin = originalMin + frac * maxOffset;
+			      const nextMax = nextMin + windowWidth;
+
+			      if (typeof chart.zoomScale === "function") {
+			        try {
+			          chart.zoomScale("x", { min: nextMin, max: nextMax });
+			          updateChartScrollFromChart(chart);
+			          return;
+			        } catch (_) {}
+			      }
+
+			      if (chart.options && chart.options.scales && chart.options.scales.x) {
+			        chart.options.scales.x.min = nextMin;
+			        chart.options.scales.x.max = nextMax;
+			      } else if (x.options) {
+			        x.options.min = nextMin;
+			        x.options.max = nextMax;
+			      }
+			      try {
+			        chart.update("none");
+			      } catch (_) {
+			        chart.update();
+			      }
+			      updateChartScrollFromChart(chart);
+			    }
+
+			    if (chartScrollEl) {
+			      chartScrollEl.addEventListener("input", function () {
+			        if (!priceChart) return;
+			        applyChartScrollFromSlider(priceChart);
+			      });
+			    }
+
+			    if (chartCanvas) {
+			      chartCanvas.addEventListener("dblclick", function () {
+			        if (priceChart && typeof priceChart.resetZoom === "function") {
+			          priceChart.resetZoom();
+			          updateChartScrollFromChart(priceChart);
+			        }
+			      });
+			    }
 
 	    function moveChartToTab(tabName) {
 	      const mount =
@@ -2051,7 +2215,10 @@ const HTML = `<!DOCTYPE html>
 		          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
 		            showForecast: false,
 		            highlightPeaks: true,
-		            peakBaselinePrice: row.low_avg_price
+		            peakBaselinePrice: row.low_avg_price,
+		            peakBaselineHalfWindowDays: peaksBaselineHalfWindowDays,
+		            peakExpectedCount: row.peaks_count,
+		            peakWindowDays: peaksWindowDays
 		          });
 		        });
 
@@ -2267,16 +2434,42 @@ const HTML = `<!DOCTYPE html>
 		      };
 		    }
 
-		    function computePeakMask(histData, baselinePrice, opts) {
+		    function countPeakWindows(mask) {
+		      if (!Array.isArray(mask) || !mask.length) return 0;
+		      let count = 0;
+		      let prev = false;
+		      for (let i = 0; i < mask.length; i++) {
+		        const cur = Boolean(mask[i]);
+		        if (cur && !prev) count += 1;
+		        prev = cur;
+		      }
+		      return count;
+		    }
+
+		    function computePeakMaskFixedBaseline(histData, baselinePrice, opts) {
 		      if (!Array.isArray(histData) || !histData.length) return null;
-		      if (!Number.isFinite(baselinePrice) || baselinePrice <= 0) return null;
 		      const startMult =
 		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
 		      const endMult =
 		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
 
-		      const minPeakPrice = baselinePrice * startMult;
-		      const peakEndPrice = baselinePrice * endMult;
+		      let base = Number(baselinePrice);
+		      if (!Number.isFinite(base) || base <= 0) {
+		        let sum = 0;
+		        let count = 0;
+		        histData.forEach((v) => {
+		          if (!Number.isFinite(v)) return;
+		          sum += v;
+		          count += 1;
+		        });
+		        if (count > 0 && Number.isFinite(sum)) {
+		          base = sum / count;
+		        }
+		      }
+		      if (!Number.isFinite(base) || base <= 0) return null;
+
+		      const minPeakPrice = base * startMult;
+		      const peakEndPrice = base * endMult;
 
 		      const mask = new Array(histData.length).fill(false);
 		      let inPeak = false;
@@ -2298,6 +2491,125 @@ const HTML = `<!DOCTYPE html>
 		        }
 		      }
 		      return mask;
+		    }
+
+		    function computePeakMaskLocalMean(labels, histData, opts) {
+		      if (
+		        !Array.isArray(labels) ||
+		        !Array.isArray(histData) ||
+		        labels.length !== histData.length
+		      ) {
+		        return null;
+		      }
+
+		      const halfWindowDays =
+		        opts && Number.isFinite(opts.halfWindowDays) ? opts.halfWindowDays : null;
+		      if (!(halfWindowDays > 0)) return null;
+
+		      const startMult =
+		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
+		      const endMult =
+		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
+
+		      const halfWindowMs = halfWindowDays * 86400 * 1000;
+
+		      let idx = [];
+		      let ts = [];
+		      let prices = [];
+		      for (let i = 0; i < histData.length; i++) {
+		        const p = histData[i];
+		        if (!Number.isFinite(p) || p <= 0) continue;
+		        const d = labels[i];
+		        const t =
+		          d instanceof Date
+		            ? d.getTime()
+		            : typeof d === "string"
+		              ? Date.parse(d)
+		              : NaN;
+		        if (!Number.isFinite(t)) continue;
+		        idx.push(i);
+		        ts.push(t);
+		        prices.push(p);
+		      }
+
+		      const windowDays =
+		        opts && Number.isFinite(opts.windowDays) ? opts.windowDays : null;
+		      if (windowDays != null && windowDays > 0 && ts.length) {
+		        const cutoff = ts[ts.length - 1] - windowDays * 86400 * 1000;
+		        if (Number.isFinite(cutoff)) {
+		          const fIdx = [];
+		          const fTs = [];
+		          const fPrices = [];
+		          for (let i = 0; i < prices.length; i++) {
+		            if (ts[i] >= cutoff) {
+		              fIdx.push(idx[i]);
+		              fTs.push(ts[i]);
+		              fPrices.push(prices[i]);
+		            }
+		          }
+		          idx = fIdx;
+		          ts = fTs;
+		          prices = fPrices;
+		        }
+		      }
+		      if (prices.length < 2) return null;
+
+		      // Sliding mean within ±halfWindowMs (matches ml/score_catching_peaks.py)
+		      const localMean = new Array(prices.length).fill(NaN);
+		      let left = 0;
+		      let right = 0;
+		      let windowSum = 0;
+
+		      for (let i = 0; i < prices.length; i++) {
+		        const center = ts[i];
+		        const rightBound = center + halfWindowMs;
+		        const leftBound = center - halfWindowMs;
+
+		        while (right < prices.length && ts[right] <= rightBound) {
+		          windowSum += prices[right];
+		          right += 1;
+		        }
+		        while (left < prices.length && ts[left] < leftBound) {
+		          windowSum -= prices[left];
+		          left += 1;
+		        }
+
+		        const count = right - left;
+		        if (count > 0) {
+		          localMean[i] = windowSum / count;
+		        }
+		      }
+
+		      const mask = new Array(histData.length).fill(false);
+		      let inPeak = false;
+		      for (let i = 0; i < prices.length; i++) {
+		        const mean = localMean[i];
+		        if (!Number.isFinite(mean) || mean <= 0) continue;
+		        const ratio = prices[i] / mean;
+		        if (!Number.isFinite(ratio)) continue;
+
+		        if (!inPeak) {
+		          if (ratio >= startMult) {
+		            inPeak = true;
+		            mask[idx[i]] = true;
+		          }
+		          continue;
+		        }
+
+		        mask[idx[i]] = true;
+		        if (ratio <= endMult) {
+		          inPeak = false;
+		        }
+		      }
+
+		      return mask;
+		    }
+
+		    function computePeakMask(labels, histData, opts) {
+		      const localMask = computePeakMaskLocalMean(labels, histData, opts);
+		      if (localMask) return localMask;
+		      const baselinePrice = opts ? Number(opts.baselinePrice) : NaN;
+		      return computePeakMaskFixedBaseline(histData, baselinePrice, opts);
 		    }
 
 		    const avgLineOverlayPlugin = {
@@ -2465,6 +2777,7 @@ const HTML = `<!DOCTYPE html>
             priceChart.destroy();
             priceChart = null;
           }
+	          setChartScrollVisible(false);
           return;
         }
 	
@@ -2478,6 +2791,7 @@ const HTML = `<!DOCTYPE html>
             priceChart.destroy();
             priceChart = null;
           }
+	          setChartScrollVisible(false);
           return;
         }
 
@@ -2575,15 +2889,31 @@ const HTML = `<!DOCTYPE html>
 
 	        const highlightPeaks = Boolean(opts && opts.highlightPeaks);
 	        const peakBaselinePrice = opts ? Number(opts.peakBaselinePrice) : NaN;
-	        const peakRefPrice =
-	          avgPrice != null && Number.isFinite(avgPrice) && avgPrice > 0
-	            ? avgPrice
-	            : peakBaselinePrice;
+	        const peakBaselineHalfWindowDays = opts
+	          ? Number(opts.peakBaselineHalfWindowDays)
+	          : NaN;
+	        const peakExpectedCount = opts ? Number(opts.peakExpectedCount) : NaN;
+	        const peakWindowDays = opts ? Number(opts.peakWindowDays) : NaN;
+
+	        let peakRefPrice = peakBaselinePrice;
+	        if (!(Number.isFinite(peakRefPrice) && peakRefPrice > 0)) {
+	          peakRefPrice =
+	            avgPrice != null && Number.isFinite(avgPrice) && avgPrice > 0
+	              ? avgPrice
+	              : NaN;
+	        }
+
 	        const peakMask = highlightPeaks
-	          ? computePeakMask(histData, peakRefPrice)
+	          ? computePeakMask(labels, histData, {
+	              baselinePrice: peakRefPrice,
+	              halfWindowDays: peakBaselineHalfWindowDays,
+	              windowDays: peakWindowDays,
+	              startMult: 1.5,
+	              endMult: 1.1
+	            })
 	          : null;
-	        const hasPeakSegments =
-	          Array.isArray(peakMask) && peakMask.some((v) => v === true);
+	        const peakWindowCount = highlightPeaks ? countPeakWindows(peakMask) : 0;
+	        const hasPeakSegments = peakWindowCount > 0;
 
 	        const historyLineColor = "rgba(59,130,246,1)";
 	        const peakLineColor = "rgba(16,185,129,1)";
@@ -2773,26 +3103,34 @@ const HTML = `<!DOCTYPE html>
                   pinch: {
                     enabled: true
                   },
-                  mode: "x"
+                  mode: "x",
+                  onZoomComplete: (ctx) =>
+                    updateChartScrollFromChart(ctx && ctx.chart ? ctx.chart : null)
                 },
                 pan: {
                   enabled: true,
                   mode: "x",
-                  modifierKey: "shift"
+                  modifierKey: "shift",
+                  onPanComplete: (ctx) =>
+                    updateChartScrollFromChart(ctx && ctx.chart ? ctx.chart : null)
                 },
                 limits: {
                   x: { min: "original", max: "original" }
                 }
               }
-            }
-          }
-        });
+	            }
+	          }
+	        });
 
-        chartCanvas.addEventListener("dblclick", function () {
-          if (priceChart && typeof priceChart.resetZoom === "function") {
-            priceChart.resetZoom();
-          }
-        });
+	        setChartScrollVisible(false);
+	        setChartOriginalXRange(priceChart);
+	        updateChartScrollFromChart(priceChart);
+	        const chartRef = priceChart;
+	        setTimeout(() => {
+	          if (priceChart !== chartRef) return;
+	          setChartOriginalXRange(chartRef);
+	          updateChartScrollFromChart(chartRef);
+	        }, 0);
 
         const src =
           data.meta && data.meta.source ? data.meta.source : "precomputed";
@@ -2814,14 +3152,29 @@ const HTML = `<!DOCTYPE html>
           : "";
 
 			        if (!showForecast) {
+			          let peakInfoText = "";
+			          if (highlightPeaks) {
+			            peakInfoText =
+			              " Peak windows (green): shown " +
+			              peakWindowCount +
+			              (Number.isFinite(peakExpectedCount)
+			                ? ", table " + Math.round(peakExpectedCount)
+			                : "") +
+			              (Number.isFinite(peakWindowDays) && peakWindowDays > 0
+			                ? ", window " + peakWindowDays + "d"
+			                : "") +
+			              (Number.isFinite(peakBaselineHalfWindowDays) &&
+			              peakBaselineHalfWindowDays > 0
+			                ? ", baseline ±" + peakBaselineHalfWindowDays + "d"
+			                : "") +
+			              "; starts at +50%, ends at +10%).";
+			          }
 			          priceStatusEl.textContent =
 			            historySourceText +
 			            lastTimestampText +
 			            volumeInfoText +
 			            " Forecast hidden on Catching Peaks view." +
-			            (hasPeakSegments
-			              ? " Green segments = peak windows (>= +50% above avg; ends at +10%)."
-			              : "");
+			            peakInfoText;
 			        } else if (!hasForecast) {
 			          priceStatusEl.textContent =
 			            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
@@ -2848,6 +3201,7 @@ const HTML = `<!DOCTYPE html>
           priceChart.destroy();
           priceChart = null;
         }
+	        setChartScrollVisible(false);
       }
     }
 
@@ -2915,6 +3269,10 @@ const HTML = `<!DOCTYPE html>
         const json = await res.json();
         peaksItems = Array.isArray(json.items) ? json.items : [];
         peaksLoaded = true;
+	        peaksWindowDays = Number.isFinite(json.window_days) ? json.window_days : null;
+	        peaksBaselineHalfWindowDays = Number.isFinite(json.baseline_half_window_days)
+	          ? json.baseline_half_window_days
+	          : null;
         peaksStatusEl.textContent = "";
         if (peaksMetaEl) {
           const baselineHalf = Number.isFinite(json.baseline_half_window_days)
