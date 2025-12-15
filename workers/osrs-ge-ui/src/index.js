@@ -2723,7 +2723,7 @@ const HTML = `<!DOCTYPE html>
 		    function computePeakMaskFixedBaseline(histData, baselinePrice, opts) {
 		      if (!Array.isArray(histData) || !histData.length) return null;
 		      const startMult =
-		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
+		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 3.0;
 		      const endMult =
 		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
 		      const wantDiagnostics = Boolean(opts && opts.returnDiagnostics);
@@ -2807,7 +2807,7 @@ const HTML = `<!DOCTYPE html>
 		      if (!(halfWindowDays > 0)) return null;
 
 		      const startMult =
-		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
+		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 3.0;
 		      const endMult =
 		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
 		      const wantDiagnostics = Boolean(opts && opts.returnDiagnostics);
@@ -3248,7 +3248,7 @@ const HTML = `<!DOCTYPE html>
 	                baselinePrice: peakRefPrice,
 	                halfWindowDays: peakBaselineHalfWindowDays,
 	                windowDays: peakWindowDays,
-	                startMult: 1.5,
+	                startMult: 3.0,
 	                endMult: 1.1,
 	                returnDiagnostics: true
 	              };
@@ -3563,7 +3563,7 @@ const HTML = `<!DOCTYPE html>
 			              peakBaselineHalfWindowDays > 0
 			                ? ", baseline ±" + peakBaselineHalfWindowDays + "d"
 			                : "") +
-			              "; starts at +50%, ends at +10%).";
+			              "; starts at +200%, ends at +10%).";
 			          }
 			          priceStatusEl.textContent =
 			            historySourceText +

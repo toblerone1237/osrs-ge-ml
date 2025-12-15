@@ -224,12 +224,12 @@ def compute_catching_peaks_metric(
 
     # Count peaks using a hysteresis band around a *local* baseline:
     # - Baseline(t) = mean price within ±BASELINE_HALF_WINDOW_DAYS days of t
-    # - A peak starts when price >= Baseline(t) * 1.5 (+50%).
+    # - A peak starts when price >= Baseline(t) * 3.0 (+200%).
     # - Once "in a peak", it doesn't end until price <= Baseline(t) * 1.1 (+10%).
     half_window_ms = float(BASELINE_HALF_WINDOW_DAYS) * 86400.0 * 1000.0
     local_mean = compute_local_mean(ts_ms, prices, half_window_ms=half_window_ms)
     ratios = np.where(np.isfinite(local_mean) & (local_mean > 0), prices / local_mean, np.nan)
-    min_peak_ratio = 1.5
+    min_peak_ratio = 3.0
     peak_end_ratio = 1.1
 
     peak_ts_list: List[float] = []
