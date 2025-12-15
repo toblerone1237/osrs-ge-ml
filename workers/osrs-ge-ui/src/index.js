@@ -3272,10 +3272,7 @@ const HTML = `<!DOCTYPE html>
 	                i0 != null && i0 >= 0 && i0 < peakMask.length && peakMask[i0];
 	              const p1IsPeak =
 	                i1 != null && i1 >= 0 && i1 < peakMask.length && peakMask[i1];
-	              if (i1 != null) {
-	                return p1IsPeak ? peakLineColor : historyLineColor;
-	              }
-	              return p0IsPeak ? peakLineColor : historyLineColor;
+	              return p0IsPeak || p1IsPeak ? peakLineColor : historyLineColor;
 	            }
 	          };
 	        }
