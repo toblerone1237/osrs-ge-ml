@@ -2452,6 +2452,7 @@ const HTML = `<!DOCTYPE html>
 		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
 		      const endMult =
 		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
+		      const wantDiagnostics = Boolean(opts && opts.returnDiagnostics);
 
 		      let base = Number(baselinePrice);
 		      if (!Number.isFinite(base) || base <= 0) {
@@ -2472,12 +2473,21 @@ const HTML = `<!DOCTYPE html>
 		      const peakEndPrice = base * endMult;
 
 		      const mask = new Array(histData.length).fill(false);
+		      const baselineByIndex = wantDiagnostics
+		        ? new Array(histData.length).fill(null)
+		        : null;
+		      const ratioByIndex = wantDiagnostics
+		        ? new Array(histData.length).fill(null)
+		        : null;
 		      let inPeak = false;
 		      for (let i = 0; i < histData.length; i++) {
 		        const price = histData[i];
 		        if (!Number.isFinite(price)) {
+		          if (inPeak) inPeak = false;
 		          continue;
 		        }
+		        if (baselineByIndex) baselineByIndex[i] = base;
+		        if (ratioByIndex) ratioByIndex[i] = price / base;
 		        if (!inPeak) {
 		          if (price >= minPeakPrice) {
 		            inPeak = true;
@@ -2485,10 +2495,14 @@ const HTML = `<!DOCTYPE html>
 		          }
 		          continue;
 		        }
-		        mask[i] = true;
 		        if (price <= peakEndPrice) {
 		          inPeak = false;
+		          continue;
 		        }
+		        mask[i] = true;
+		      }
+		      if (wantDiagnostics) {
+		        return { mask, baselineByIndex, ratioByIndex };
 		      }
 		      return mask;
 		    }
@@ -2510,6 +2524,7 @@ const HTML = `<!DOCTYPE html>
 		        opts && Number.isFinite(opts.startMult) ? opts.startMult : 1.5;
 		      const endMult =
 		        opts && Number.isFinite(opts.endMult) ? opts.endMult : 1.1;
+		      const wantDiagnostics = Boolean(opts && opts.returnDiagnostics);
 
 		      const halfWindowMs = halfWindowDays * 86400 * 1000;
 
@@ -2581,27 +2596,46 @@ const HTML = `<!DOCTYPE html>
 		      }
 
 		      const mask = new Array(histData.length).fill(false);
+		      const baselineByIndex = wantDiagnostics
+		        ? new Array(histData.length).fill(null)
+		        : null;
+		      const ratioByIndex = wantDiagnostics
+		        ? new Array(histData.length).fill(null)
+		        : null;
 		      let inPeak = false;
 		      for (let i = 0; i < prices.length; i++) {
 		        const mean = localMean[i];
-		        if (!Number.isFinite(mean) || mean <= 0) continue;
+		        if (!Number.isFinite(mean) || mean <= 0) {
+		          if (inPeak) inPeak = false;
+		          continue;
+		        }
 		        const ratio = prices[i] / mean;
-		        if (!Number.isFinite(ratio)) continue;
+		        if (!Number.isFinite(ratio)) {
+		          if (inPeak) inPeak = false;
+		          continue;
+		        }
+		        const outIndex = idx[i];
+		        if (baselineByIndex && outIndex != null) baselineByIndex[outIndex] = mean;
+		        if (ratioByIndex && outIndex != null) ratioByIndex[outIndex] = ratio;
 
 		        if (!inPeak) {
 		          if (ratio >= startMult) {
 		            inPeak = true;
-		            mask[idx[i]] = true;
+		            mask[outIndex] = true;
 		          }
 		          continue;
 		        }
 
-		        mask[idx[i]] = true;
 		        if (ratio <= endMult) {
 		          inPeak = false;
+		          continue;
 		        }
+		        mask[outIndex] = true;
 		      }
 
+		      if (wantDiagnostics) {
+		        return { mask, baselineByIndex, ratioByIndex };
+		      }
 		      return mask;
 		    }
 
@@ -2903,16 +2937,40 @@ const HTML = `<!DOCTYPE html>
 	              : NaN;
 	        }
 
-	        const peakMask = highlightPeaks
-	          ? computePeakMask(labels, histData, {
-	              baselinePrice: peakRefPrice,
-	              halfWindowDays: peakBaselineHalfWindowDays,
-	              windowDays: peakWindowDays,
-	              startMult: 1.5,
-	              endMult: 1.1
-	            })
+	        const peakDiag = highlightPeaks
+	          ? (function () {
+	              const baseOpts = {
+	                baselinePrice: peakRefPrice,
+	                halfWindowDays: peakBaselineHalfWindowDays,
+	                windowDays: peakWindowDays,
+	                startMult: 1.5,
+	                endMult: 1.1,
+	                returnDiagnostics: true
+	              };
+
+	              const local = computePeakMaskLocalMean(labels, histData, baseOpts);
+	              if (local && local.mask && Array.isArray(local.mask)) return local;
+
+	              const fixed = computePeakMaskFixedBaseline(histData, peakRefPrice, baseOpts);
+	              if (fixed && fixed.mask && Array.isArray(fixed.mask)) return fixed;
+
+	              return null;
+	            })()
 	          : null;
-	        const peakWindowCount = highlightPeaks ? countPeakWindows(peakMask) : 0;
+	        const peakMask =
+	          highlightPeaks && peakDiag && Array.isArray(peakDiag.mask)
+	            ? peakDiag.mask
+	            : null;
+	        const peakBaselineByIndex =
+	          highlightPeaks && peakDiag && Array.isArray(peakDiag.baselineByIndex)
+	            ? peakDiag.baselineByIndex
+	            : null;
+	        const peakRatioByIndex =
+	          highlightPeaks && peakDiag && Array.isArray(peakDiag.ratioByIndex)
+	            ? peakDiag.ratioByIndex
+	            : null;
+	        const peakWindowCount =
+	          highlightPeaks && peakMask ? countPeakWindows(peakMask) : 0;
 	        const hasPeakSegments = peakWindowCount > 0;
 
 	        const historyLineColor = "rgba(59,130,246,1)";
@@ -2938,7 +2996,10 @@ const HTML = `<!DOCTYPE html>
 	                i0 != null && i0 >= 0 && i0 < peakMask.length && peakMask[i0];
 	              const p1IsPeak =
 	                i1 != null && i1 >= 0 && i1 < peakMask.length && peakMask[i1];
-	              return p0IsPeak || p1IsPeak ? peakLineColor : historyLineColor;
+	              if (i1 != null) {
+	                return p1IsPeak ? peakLineColor : historyLineColor;
+	              }
+	              return p0IsPeak ? peakLineColor : historyLineColor;
 	            }
 	          };
 	        }
@@ -3089,6 +3150,39 @@ const HTML = `<!DOCTYPE html>
 	                    if (vol != null && Number.isFinite(vol) && vol > 0) {
 	                      base +=
 	                        " (bucket vol " + Math.round(vol).toLocaleString("en-US") + ")";
+	                    }
+
+	                    if (
+	                      highlightPeaks &&
+	                      peakBaselineByIndex &&
+	                      peakRatioByIndex &&
+	                      typeof dsLabel === "string" &&
+	                      dsLabel.startsWith("Historical mid price")
+	                    ) {
+	                      const baseline =
+	                        idx != null &&
+	                        idx >= 0 &&
+	                        idx < peakBaselineByIndex.length
+	                          ? peakBaselineByIndex[idx]
+	                          : null;
+	                      const ratio =
+	                        idx != null && idx >= 0 && idx < peakRatioByIndex.length
+	                          ? peakRatioByIndex[idx]
+	                          : null;
+	                      if (
+	                        baseline != null &&
+	                        Number.isFinite(baseline) &&
+	                        baseline > 0 &&
+	                        ratio != null &&
+	                        Number.isFinite(ratio)
+	                      ) {
+	                        base +=
+	                          " (baseline " +
+	                          Math.round(baseline).toLocaleString("en-US") +
+	                          ", x" +
+	                          ratio.toFixed(2) +
+	                          ")";
+	                      }
 	                    }
 
                     return base;
