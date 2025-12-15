@@ -239,8 +239,49 @@ def compute_catching_peaks_metric(
     current_peak_max_price: Optional[float] = None
     current_peak_max_ts: Optional[float] = None
     current_peak_max_baseline: Optional[float] = None
+    current_peak_start_idx: Optional[int] = None
+    current_peak_end_idx: Optional[int] = None
 
-    def record_peak() -> None:
+    def peak_avg_exceeds_surrounding(
+        start_idx: Optional[int],
+        end_idx: Optional[int],
+        factor: float = 2.0,
+    ) -> bool:
+        if start_idx is None or end_idx is None:
+            return False
+        if start_idx < 0 or end_idx < start_idx or end_idx >= int(prices.size):
+            return False
+
+        width = end_idx - start_idx + 1
+        if width <= 0:
+            return False
+
+        peak_slice = prices[start_idx : end_idx + 1]
+        if peak_slice.size == 0:
+            return False
+        peak_sum = float(np.sum(peak_slice))
+        peak_avg = peak_sum / float(peak_slice.size)
+
+        left_start = max(0, start_idx - width)
+        left_slice = prices[left_start:start_idx]
+        right_end = min(int(prices.size), end_idx + 1 + width)
+        right_slice = prices[end_idx + 1 : right_end]
+        surround_count = int(left_slice.size) + int(right_slice.size)
+        if surround_count <= 0:
+            return False
+        surround_sum = float(np.sum(left_slice)) + float(np.sum(right_slice))
+        surround_avg = surround_sum / float(surround_count)
+
+        if not np.isfinite(peak_avg) or not np.isfinite(surround_avg) or surround_avg <= 0:
+            return False
+        if not np.isfinite(factor) or factor <= 0:
+            factor = 2.0
+        return float(peak_avg) > float(factor) * float(surround_avg)
+
+    def record_peak(start_idx: Optional[int], end_idx: Optional[int]) -> None:
+        if not peak_avg_exceeds_surrounding(start_idx, end_idx, factor=2.0):
+            return
+
         if current_peak_max_ts is not None:
             peak_ts_list.append(float(current_peak_max_ts))
 
@@ -261,7 +302,7 @@ def compute_catching_peaks_metric(
         if np.isfinite(pct):
             tip_pct_list.append(max(0.0, float(pct)))
 
-    for (ts, price, _), ratio, baseline in zip(pts, ratios, local_mean):
+    for i, ((ts, price, _), ratio, baseline) in enumerate(zip(pts, ratios, local_mean)):
         if not np.isfinite(ratio) or not np.isfinite(baseline) or baseline <= 0:
             continue
         if not in_peak:
@@ -271,8 +312,12 @@ def compute_catching_peaks_metric(
                 current_peak_max_price = price
                 current_peak_max_ts = ts
                 current_peak_max_baseline = float(baseline)
+                current_peak_start_idx = i
+                current_peak_end_idx = i
             continue
 
+        if ratio > peak_end_ratio:
+            current_peak_end_idx = i
         if current_peak_max_ratio is None or ratio > current_peak_max_ratio:
             current_peak_max_ratio = float(ratio)
             current_peak_max_price = price
@@ -280,15 +325,17 @@ def compute_catching_peaks_metric(
             current_peak_max_baseline = float(baseline)
 
         if ratio <= peak_end_ratio:
-            record_peak()
+            record_peak(current_peak_start_idx, current_peak_end_idx)
             in_peak = False
             current_peak_max_ratio = None
             current_peak_max_price = None
             current_peak_max_ts = None
             current_peak_max_baseline = None
+            current_peak_start_idx = None
+            current_peak_end_idx = None
 
     if in_peak and current_peak_max_ts is not None:
-        record_peak()
+        record_peak(current_peak_start_idx, current_peak_end_idx)
 
     peaks_count = len(peak_ts_list)
 

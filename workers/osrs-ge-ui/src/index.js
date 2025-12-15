@@ -2647,6 +2647,79 @@ const HTML = `<!DOCTYPE html>
 		      return count;
 		    }
 
+		    function filterPeakMaskBySurroundingAverage(histData, mask, factor) {
+		      if (
+		        !Array.isArray(histData) ||
+		        !Array.isArray(mask) ||
+		        histData.length !== mask.length
+		      ) {
+		        return mask;
+		      }
+
+		      const mult = Number.isFinite(factor) && factor > 0 ? factor : 2;
+		      const out = mask.map(Boolean);
+		      const n = out.length;
+
+		      let i = 0;
+		      while (i < n) {
+		        if (!out[i]) {
+		          i += 1;
+		          continue;
+		        }
+		        const start = i;
+		        while (i < n && out[i]) i += 1;
+		        const end = i - 1;
+		        const width = end - start + 1;
+		        if (width <= 0) continue;
+
+		        let peakSum = 0;
+		        let peakCount = 0;
+		        for (let j = start; j <= end; j++) {
+		          const v = histData[j];
+		          if (v != null && Number.isFinite(v) && v > 0) {
+		            peakSum += v;
+		            peakCount += 1;
+		          }
+		        }
+
+		        let surroundSum = 0;
+		        let surroundCount = 0;
+		        for (let j = start - width; j <= start - 1; j++) {
+		          if (j < 0 || j >= n) continue;
+		          const v = histData[j];
+		          if (v != null && Number.isFinite(v) && v > 0) {
+		            surroundSum += v;
+		            surroundCount += 1;
+		          }
+		        }
+		        for (let j = end + 1; j <= end + width; j++) {
+		          if (j < 0 || j >= n) continue;
+		          const v = histData[j];
+		          if (v != null && Number.isFinite(v) && v > 0) {
+		            surroundSum += v;
+		            surroundCount += 1;
+		          }
+		        }
+
+		        let keep = false;
+		        if (peakCount > 0 && surroundCount > 0) {
+		          const peakAvg = peakSum / peakCount;
+		          const surroundAvg = surroundSum / surroundCount;
+		          keep =
+		            Number.isFinite(peakAvg) &&
+		            Number.isFinite(surroundAvg) &&
+		            surroundAvg > 0 &&
+		            peakAvg > mult * surroundAvg;
+		        }
+
+		        if (!keep) {
+		          for (let j = start; j <= end; j++) out[j] = false;
+		        }
+		      }
+
+		      return out;
+		    }
+
 		    function computePeakMaskFixedBaseline(histData, baselinePrice, opts) {
 		      if (!Array.isArray(histData) || !histData.length) return null;
 		      const startMult =
@@ -2702,10 +2775,11 @@ const HTML = `<!DOCTYPE html>
 		        }
 		        mask[i] = true;
 		      }
+		      const filteredMask = filterPeakMaskBySurroundingAverage(histData, mask, 2);
 		      if (wantDiagnostics) {
-		        return { mask, baselineByIndex, ratioByIndex };
+		        return { mask: filteredMask, baselineByIndex, ratioByIndex };
 		      }
-		      return mask;
+		      return filteredMask;
 		    }
 
 		    function computePeakMaskLocalMean(labels, histData, opts) {
@@ -2834,10 +2908,11 @@ const HTML = `<!DOCTYPE html>
 		        mask[outIndex] = true;
 		      }
 
+		      const filteredMask = filterPeakMaskBySurroundingAverage(histData, mask, 2);
 		      if (wantDiagnostics) {
-		        return { mask, baselineByIndex, ratioByIndex };
+		        return { mask: filteredMask, baselineByIndex, ratioByIndex };
 		      }
-		      return mask;
+		      return filteredMask;
 		    }
 
 		    function computePeakMask(labels, histData, opts) {
