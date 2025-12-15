@@ -2754,10 +2754,14 @@ const HTML = `<!DOCTYPE html>
 		        ? new Array(histData.length).fill(null)
 		        : null;
 		      let inPeak = false;
+		      let peakStartIndex = null;
 		      for (let i = 0; i < histData.length; i++) {
 		        const price = histData[i];
 		        if (!Number.isFinite(price)) {
-		          if (inPeak) inPeak = false;
+		          if (inPeak) {
+		            inPeak = false;
+		            peakStartIndex = null;
+		          }
 		          continue;
 		        }
 		        if (baselineByIndex) baselineByIndex[i] = base;
@@ -2765,15 +2769,22 @@ const HTML = `<!DOCTYPE html>
 		        if (!inPeak) {
 		          if (price >= minPeakPrice) {
 		            inPeak = true;
+		            peakStartIndex = i;
 		            mask[i] = true;
 		          }
 		          continue;
 		        }
 		        if (price <= peakEndPrice) {
 		          inPeak = false;
+		          peakStartIndex = null;
 		          continue;
 		        }
 		        mask[i] = true;
+		      }
+		      if (inPeak && peakStartIndex != null) {
+		        for (let j = peakStartIndex; j < mask.length; j++) {
+		          mask[j] = false;
+		        }
 		      }
 		      const filteredMask = filterPeakMaskBySurroundingAverage(histData, mask, 2);
 		      if (wantDiagnostics) {
@@ -2878,15 +2889,22 @@ const HTML = `<!DOCTYPE html>
 		        ? new Array(histData.length).fill(null)
 		        : null;
 		      let inPeak = false;
+		      let currentPeakOutIndices = [];
 		      for (let i = 0; i < prices.length; i++) {
 		        const mean = localMean[i];
 		        if (!Number.isFinite(mean) || mean <= 0) {
-		          if (inPeak) inPeak = false;
+		          if (inPeak) {
+		            inPeak = false;
+		            currentPeakOutIndices = [];
+		          }
 		          continue;
 		        }
 		        const ratio = prices[i] / mean;
 		        if (!Number.isFinite(ratio)) {
-		          if (inPeak) inPeak = false;
+		          if (inPeak) {
+		            inPeak = false;
+		            currentPeakOutIndices = [];
+		          }
 		          continue;
 		        }
 		        const outIndex = idx[i];
@@ -2897,15 +2915,26 @@ const HTML = `<!DOCTYPE html>
 		          if (ratio >= startMult) {
 		            inPeak = true;
 		            mask[outIndex] = true;
+		            currentPeakOutIndices = [outIndex];
 		          }
 		          continue;
 		        }
 
 		        if (ratio <= endMult) {
 		          inPeak = false;
+		          currentPeakOutIndices = [];
 		          continue;
 		        }
 		        mask[outIndex] = true;
+		        currentPeakOutIndices.push(outIndex);
+		      }
+
+		      if (inPeak && currentPeakOutIndices.length) {
+		        currentPeakOutIndices.forEach((outIndex) => {
+		          if (outIndex != null && outIndex >= 0 && outIndex < mask.length) {
+		            mask[outIndex] = false;
+		          }
+		        });
 		      }
 
 		      const filteredMask = filterPeakMaskBySurroundingAverage(histData, mask, 2);

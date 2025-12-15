@@ -334,8 +334,8 @@ def compute_catching_peaks_metric(
             current_peak_start_idx = None
             current_peak_end_idx = None
 
-    if in_peak and current_peak_max_ts is not None:
-        record_peak(current_peak_start_idx, current_peak_end_idx)
+    # If we end the window while still in a peak, we intentionally do NOT count it.
+    # (We haven't observed the peak returning back below the end threshold yet.)
 
     peaks_count = len(peak_ts_list)
 
