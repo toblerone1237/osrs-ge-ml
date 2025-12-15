@@ -227,13 +227,42 @@ const HTML = `<!DOCTYPE html>
 	      font-size: 0.8rem;
 	      color: #9ca3af;
 	    }
-	    .peaks-weight-row input[type="range"] {
-	      width: 100%;
-	    }
-	    .peaks-apply-btn {
-	      width: 100%;
-	      margin-top: 0.25rem;
-	      padding: 0.35rem 0.6rem;
+		    .peaks-weight-row input[type="range"] {
+		      width: 100%;
+		    }
+		    .peaks-filter-row {
+		      display: flex;
+		      flex-direction: column;
+		      gap: 0.25rem;
+		      margin-bottom: 0.7rem;
+		    }
+		    .peaks-filter-controls {
+		      display: flex;
+		      gap: 0.35rem;
+		      align-items: center;
+		    }
+		    .peaks-filter-controls select,
+		    .peaks-filter-controls input {
+		      padding: 0.25rem 0.35rem;
+		      border-radius: 0.35rem;
+		      border: 1px solid #374151;
+		      background: #020617;
+		      color: #e5e7eb;
+		      font-size: 0.8rem;
+		      min-width: 0;
+		    }
+		    .peaks-filter-controls select {
+		      width: 64px;
+		      flex: 0 0 auto;
+		    }
+		    .peaks-filter-controls input {
+		      flex: 1;
+		      width: 100%;
+		    }
+		    .peaks-apply-btn {
+		      width: 100%;
+		      margin-top: 0.25rem;
+		      padding: 0.35rem 0.6rem;
 	      border-radius: 0.35rem;
 	      border: 1px solid #4b5563;
 	      background: #111827;
@@ -403,7 +432,7 @@ const HTML = `<!DOCTYPE html>
 
 	        <div class="peaks-tab-side">
 	          <div class="card peaks-sort-card">
-	            <h3>Weighted sort</h3>
+		            <h3>Sort &amp; filter</h3>
 	            <div id="peaksSortPane"></div>
 	          </div>
 	        </div>
@@ -460,10 +489,11 @@ const HTML = `<!DOCTYPE html>
     const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
 
-	    const PIN_KEY = "osrs_ge_pins_v3";
-	    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
-	    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
-	    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
+		    const PIN_KEY = "osrs_ge_pins_v3";
+		    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
+		    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
+		    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
+		    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -481,16 +511,18 @@ const HTML = `<!DOCTYPE html>
 	    let peaksPageSize = 10;
 	    let peaksCurrentPage = 1;
 	    const PEAKS_PAGE_SIZE_OPTIONS = [10, 50, 100, 250, 500];
-		    let peaksItems = [];
-		    let peaksLoaded = false;
-		    let peaksSortKey = "sharpness";
-		    let peaksSortDir = "desc";
-		    const DEFAULT_PEAK_WEIGHT = 100;
-		    let peaksPercentWeights = {};
-			    let peaksSortPaneKeys = [];
-			    let peaksShowAsPercent = false;
-			    let peaksSearchQuery = "";
-			    let peaksTableRenderScheduled = false;
+			    let peaksItems = [];
+			    let peaksLoaded = false;
+			    let peaksSortKey = "sharpness";
+			    let peaksSortDir = "desc";
+			    const DEFAULT_PEAK_WEIGHT = 100;
+			    let peaksPercentWeights = {};
+			    let peaksColumnFilters = {};
+			    let peaksSortPaneMode = "weights";
+			    let peaksSortPaneSignature = "";
+				    let peaksShowAsPercent = false;
+				    let peaksSearchQuery = "";
+				    let peaksTableRenderScheduled = false;
 			    // Latest volume timeline for the active chart (aligned to labels)
 			    let latestVolumeTimeline = [];
 
@@ -597,22 +629,58 @@ const HTML = `<!DOCTYPE html>
 	      return {};
 	    }
 
-	    function savePeaksWeights(weights) {
-	      try {
-	        window.localStorage.setItem(
-	          PEAKS_WEIGHTS_KEY,
-	          JSON.stringify(weights || {})
-	        );
-	      } catch (err) {
-	        console.warn("Failed to save peaks weights:", err);
-	      }
-	    }
-
-		    peaksPercentWeights = loadPeaksWeights();
-
-		    function loadPeaksShowAsPercent() {
+		    function savePeaksWeights(weights) {
 		      try {
-		        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
+		        window.localStorage.setItem(
+		          PEAKS_WEIGHTS_KEY,
+		          JSON.stringify(weights || {})
+		        );
+		      } catch (err) {
+		        console.warn("Failed to save peaks weights:", err);
+		      }
+		    }
+
+		    function loadPeaksFilters() {
+		      try {
+		        const raw = window.localStorage.getItem(PEAKS_FILTERS_KEY);
+		        if (!raw) return {};
+		        const obj = JSON.parse(raw);
+		        if (!obj || typeof obj !== "object") return {};
+
+		        const allowedOps = new Set([">", ">=", "=", "<=", "<"]);
+		        const out = {};
+		        Object.entries(obj).forEach(([k, v]) => {
+		          if (!v || typeof v !== "object") return;
+		          const op = String(v.op || "");
+		          const n = Number(v.value);
+		          if (!allowedOps.has(op)) return;
+		          if (!Number.isFinite(n)) return;
+		          out[k] = { op, value: n };
+		        });
+		        return out;
+		      } catch (err) {
+		        console.warn("Failed to parse peaks filters:", err);
+		      }
+		      return {};
+		    }
+
+		    function savePeaksFilters(filters) {
+		      try {
+		        window.localStorage.setItem(
+		          PEAKS_FILTERS_KEY,
+		          JSON.stringify(filters || {})
+		        );
+		      } catch (err) {
+		        console.warn("Failed to save peaks filters:", err);
+		      }
+		    }
+
+			    peaksPercentWeights = loadPeaksWeights();
+			    peaksColumnFilters = loadPeaksFilters();
+
+			    function loadPeaksShowAsPercent() {
+			      try {
+			        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
 		      } catch (_) {
 		        return false;
 		      }
@@ -1374,45 +1442,188 @@ const HTML = `<!DOCTYPE html>
       return container;
 	    }
 
-	    function renderPeaksSortPane(percentColumns) {
-	      if (!peaksSortPaneEl || !Array.isArray(percentColumns)) return;
+		    function renderPeaksSortPane({ displayColumns, percentColumns }) {
+		      if (!peaksSortPaneEl) return;
 
-	      const keys = percentColumns.map((c) => c.key);
-	      const sameKeys =
-	        keys.length === peaksSortPaneKeys.length &&
-	        keys.every((k, i) => k === peaksSortPaneKeys[i]);
-	      if (sameKeys && peaksSortPaneEl.childElementCount > 0) {
-	        return;
-	      }
-	      peaksSortPaneKeys = keys;
+		      const mode = peaksSortPaneMode === "filters" ? "filters" : "weights";
+		      const columns = mode === "filters" ? displayColumns : percentColumns;
+		      if (!Array.isArray(columns)) return;
 
-	      peaksSortPaneEl.innerHTML = "";
-	      percentColumns.forEach((col, idx) => {
-	        const weightExisting = peaksPercentWeights[col.key];
-	        const weightVal = Number.isFinite(weightExisting)
-	          ? weightExisting
-	          : DEFAULT_PEAK_WEIGHT;
-	        peaksPercentWeights[col.key] = weightVal;
+		      const keys = columns.map((c) => c.key);
+		      const signature = mode + ":" + keys.join("|");
+		      if (signature === peaksSortPaneSignature && peaksSortPaneEl.childElementCount > 0) {
+		        return;
+		      }
+		      peaksSortPaneSignature = signature;
 
-	        const rowEl = document.createElement("div");
-	        rowEl.className = "peaks-weight-row";
+		      peaksSortPaneEl.innerHTML = "";
 
-	        const labelEl = document.createElement("div");
-	        labelEl.className = "peaks-weight-label";
-	        const nameSpan = document.createElement("span");
-	        nameSpan.textContent = col.header;
-	        const valueSpan = document.createElement("span");
-	        valueSpan.textContent = String(weightVal);
-	        labelEl.appendChild(nameSpan);
-	        labelEl.appendChild(valueSpan);
+		      const allowedOps = [
+		        { value: "", label: "off" },
+		        { value: ">", label: ">" },
+		        { value: ">=", label: ">=" },
+		        { value: "=", label: "=" },
+		        { value: "<=", label: "<=" },
+		        { value: "<", label: "<" }
+		      ];
 
-	        const slider = document.createElement("input");
-	        slider.type = "range";
-	        slider.min = "0";
-	        slider.max = "100";
-	        slider.step = "1";
-	        slider.value = String(weightVal);
-	        slider.setAttribute("aria-label", col.header + " weight");
+		      if (mode === "filters") {
+		        const noteEl = document.createElement("div");
+		        noteEl.className = "small";
+		        noteEl.style.marginBottom = "0.5rem";
+
+		        const activeCount = Object.values(peaksColumnFilters || {}).filter((v) => {
+		          if (!v || typeof v !== "object") return false;
+		          if (!["<", "<=", "=", ">=", ">"].includes(v.op)) return false;
+		          return Number.isFinite(v.value);
+		        }).length;
+		        noteEl.textContent =
+		          "Filters apply to raw column values." +
+		          (activeCount ? " Active: " + activeCount + "." : "");
+		        peaksSortPaneEl.appendChild(noteEl);
+
+		        columns.forEach((col, idx) => {
+		          const existing = peaksColumnFilters && peaksColumnFilters[col.key];
+		          const existingOp =
+		            existing && typeof existing.op === "string" ? existing.op : "";
+		          const existingValue =
+		            existing && Number.isFinite(existing.value) ? existing.value : null;
+
+		          const rowEl = document.createElement("div");
+		          rowEl.className = "peaks-filter-row";
+
+		          const labelEl = document.createElement("div");
+		          labelEl.className = "peaks-weight-label";
+		          const nameSpan = document.createElement("span");
+		          nameSpan.textContent = col.header;
+		          labelEl.appendChild(nameSpan);
+		          rowEl.appendChild(labelEl);
+
+		          const controlsEl = document.createElement("div");
+		          controlsEl.className = "peaks-filter-controls";
+
+		          const opSelect = document.createElement("select");
+		          opSelect.id = "peaks-filter-op-" + idx;
+		          opSelect.setAttribute("aria-label", col.header + " filter operator");
+		          allowedOps.forEach((o) => {
+		            const opt = document.createElement("option");
+		            opt.value = o.value;
+		            opt.textContent = o.label;
+		            opSelect.appendChild(opt);
+		          });
+		          opSelect.value = allowedOps.some((o) => o.value === existingOp)
+		            ? existingOp
+		            : "";
+
+		          const valueInput = document.createElement("input");
+		          valueInput.type = "number";
+		          valueInput.step = "any";
+		          valueInput.placeholder = "value";
+		          valueInput.id = "peaks-filter-val-" + idx;
+		          valueInput.setAttribute("aria-label", col.header + " filter value");
+		          if (existingValue != null) {
+		            valueInput.value = String(existingValue);
+		          }
+
+		          function updateFilter(saveNow) {
+		            const op = String(opSelect.value || "");
+		            const raw = String(valueInput.value || "").trim();
+		            const v = raw ? Number(raw) : NaN;
+
+		            if (!op || !Number.isFinite(v)) {
+		              if (peaksColumnFilters && peaksColumnFilters[col.key]) {
+		                delete peaksColumnFilters[col.key];
+		              }
+		            } else {
+		              peaksColumnFilters[col.key] = { op, value: v };
+		            }
+
+		            if (saveNow) {
+		              savePeaksFilters(peaksColumnFilters);
+		            }
+		            peaksCurrentPage = 1;
+		            schedulePeaksTableRender();
+		          }
+
+		          opSelect.addEventListener("change", () => updateFilter(true));
+		          valueInput.addEventListener("input", () => updateFilter(false));
+		          valueInput.addEventListener("change", () => updateFilter(true));
+		          valueInput.addEventListener("keydown", (ev) => {
+		            if (ev.key === "Enter") {
+		              updateFilter(true);
+		              renderPeaksTable();
+		            }
+		          });
+
+		          controlsEl.appendChild(opSelect);
+		          controlsEl.appendChild(valueInput);
+		          rowEl.appendChild(controlsEl);
+		          peaksSortPaneEl.appendChild(rowEl);
+		        });
+
+		        const applyBtn = document.createElement("button");
+		        applyBtn.type = "button";
+		        applyBtn.className = "peaks-apply-btn";
+		        applyBtn.textContent = "Apply filters";
+		        applyBtn.addEventListener("click", () => {
+		          peaksCurrentPage = 1;
+		          renderPeaksTable();
+		        });
+		        peaksSortPaneEl.appendChild(applyBtn);
+
+		        const clearBtn = document.createElement("button");
+		        clearBtn.type = "button";
+		        clearBtn.className = "peaks-apply-btn";
+		        clearBtn.textContent = "Clear filters";
+		        clearBtn.addEventListener("click", () => {
+		          peaksColumnFilters = {};
+		          savePeaksFilters(peaksColumnFilters);
+		          peaksCurrentPage = 1;
+		          peaksSortPaneSignature = "";
+		          renderPeaksTable();
+		        });
+		        peaksSortPaneEl.appendChild(clearBtn);
+
+		        const backBtn = document.createElement("button");
+		        backBtn.type = "button";
+		        backBtn.className = "peaks-apply-btn";
+		        backBtn.textContent = "Back to weights";
+		        backBtn.addEventListener("click", () => {
+		          peaksSortPaneMode = "weights";
+		          peaksSortPaneSignature = "";
+		          renderPeaksTable();
+		        });
+		        peaksSortPaneEl.appendChild(backBtn);
+
+		        return;
+		      }
+
+		      columns.forEach((col, idx) => {
+		        const weightExisting = peaksPercentWeights[col.key];
+		        const weightVal = Number.isFinite(weightExisting)
+		          ? weightExisting
+		          : DEFAULT_PEAK_WEIGHT;
+		        peaksPercentWeights[col.key] = weightVal;
+
+		        const rowEl = document.createElement("div");
+		        rowEl.className = "peaks-weight-row";
+
+		        const labelEl = document.createElement("div");
+		        labelEl.className = "peaks-weight-label";
+		        const nameSpan = document.createElement("span");
+		        nameSpan.textContent = col.header;
+		        const valueSpan = document.createElement("span");
+		        valueSpan.textContent = String(weightVal);
+		        labelEl.appendChild(nameSpan);
+		        labelEl.appendChild(valueSpan);
+
+		        const slider = document.createElement("input");
+		        slider.type = "range";
+		        slider.min = "0";
+		        slider.max = "100";
+		        slider.step = "1";
+		        slider.value = String(weightVal);
+		        slider.setAttribute("aria-label", col.header + " weight");
 		        slider.id = "peaks-weight-" + idx;
 		        slider.addEventListener("input", (ev) => {
 		          const v = Number(ev.target.value);
@@ -1427,24 +1638,35 @@ const HTML = `<!DOCTYPE html>
 		          savePeaksWeights(peaksPercentWeights);
 		        });
 
-	        rowEl.appendChild(labelEl);
-	        rowEl.appendChild(slider);
-	        peaksSortPaneEl.appendChild(rowEl);
-	      });
-	      savePeaksWeights(peaksPercentWeights);
+		        rowEl.appendChild(labelEl);
+		        rowEl.appendChild(slider);
+		        peaksSortPaneEl.appendChild(rowEl);
+		      });
+		      savePeaksWeights(peaksPercentWeights);
 
-	      const applyBtn = document.createElement("button");
-	      applyBtn.type = "button";
-	      applyBtn.className = "peaks-apply-btn";
-	      applyBtn.textContent = "Apply weights";
-	      applyBtn.addEventListener("click", () => {
-	        peaksSortKey = "__weighted_avg";
-	        peaksSortDir = "desc";
-	        peaksCurrentPage = 1;
-	        renderPeaksTable();
-	      });
-	      peaksSortPaneEl.appendChild(applyBtn);
-	    }
+		      const applyBtn = document.createElement("button");
+		      applyBtn.type = "button";
+		      applyBtn.className = "peaks-apply-btn";
+		      applyBtn.textContent = "Apply weights";
+		      applyBtn.addEventListener("click", () => {
+		        peaksSortKey = "__weighted_avg";
+		        peaksSortDir = "desc";
+		        peaksCurrentPage = 1;
+		        renderPeaksTable();
+		      });
+		      peaksSortPaneEl.appendChild(applyBtn);
+
+		      const filterBtn = document.createElement("button");
+		      filterBtn.type = "button";
+		      filterBtn.className = "peaks-apply-btn";
+		      filterBtn.textContent = "Filter mode";
+		      filterBtn.addEventListener("click", () => {
+		        peaksSortPaneMode = "filters";
+		        peaksSortPaneSignature = "";
+		        renderPeaksTable();
+		      });
+		      peaksSortPaneEl.appendChild(filterBtn);
+		    }
 
 		    function renderPeaksTable() {
 		      if (!peaksTableContainer) return;
@@ -1454,36 +1676,26 @@ const HTML = `<!DOCTYPE html>
 		        return;
 	      }
 
-		      const allRows = peaksItems.slice();
-		      const q =
-		        typeof peaksSearchQuery === "string"
-		          ? peaksSearchQuery.trim().toLowerCase()
-		          : "";
-		      let rows = allRows;
-		      if (q) {
-		        rows = allRows.filter((row) => {
-		          const idStr =
-		            row && row.item_id != null ? String(row.item_id) : "";
-		          const name =
-		            row && row.name ? String(row.name).toLowerCase() : "";
-		          return (
-		            (idStr && idStr.includes(q)) ||
-		            (name && name.includes(q))
-		          );
-		        });
-		      }
-		      if (peaksSearchStatusEl) {
-		        peaksSearchStatusEl.textContent = q
-		          ? "Filtered: " + rows.length + " / " + allRows.length + " items."
-		          : allRows.length + " items.";
-		      }
-		      if (!rows.length) {
-		        peaksTableContainer.textContent = "No items match that filter.";
-		        return;
-		      }
-
-		      const pageSize =
-		        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
+			      const allRows = peaksItems.slice();
+			      const q =
+			        typeof peaksSearchQuery === "string"
+			          ? peaksSearchQuery.trim().toLowerCase()
+			          : "";
+			      let rows = allRows;
+			      if (q) {
+			        rows = allRows.filter((row) => {
+			          const idStr =
+			            row && row.item_id != null ? String(row.item_id) : "";
+			          const name =
+			            row && row.name ? String(row.name).toLowerCase() : "";
+			          return (
+			            (idStr && idStr.includes(q)) ||
+			            (name && name.includes(q))
+			          );
+			        });
+			      }
+			      const pageSize =
+			        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
 
 	      const table = document.createElement("table");
 	      const thead = document.createElement("thead");
@@ -1653,13 +1865,92 @@ const HTML = `<!DOCTYPE html>
 			        }
 			      });
 
-			      renderPeaksSortPane(percentColumns);
+				      renderPeaksSortPane({ displayColumns: baseColumns, percentColumns });
 
-		      const allColumns = baseColumns.concat(percentColumns);
+			      const allColumns = baseColumns.concat(percentColumns);
 
-		      function getWeightedAverage(row) {
-		        let numerator = 0;
-		        let denom = 0;
+			      const activeFilters = Object.entries(peaksColumnFilters || {}).filter(
+			        ([, f]) =>
+			          f &&
+			          typeof f === "object" &&
+			          ["<", "<=", "=", ">=", ">"].includes(f.op) &&
+			          Number.isFinite(f.value)
+			      );
+
+			      if (activeFilters.length) {
+			        const colByKey = new Map();
+			        baseColumns.forEach((col) => {
+			          colByKey.set(col.key, col);
+			        });
+
+			        const EPS = 1e-9;
+			        rows = rows.filter((row) => {
+			          for (const [key, f] of activeFilters) {
+			            const col = colByKey.get(key);
+			            if (!col) continue;
+
+			            const target = Number(f.value);
+			            const rawVal = col.value(row);
+			            if (!Number.isFinite(rawVal) || !Number.isFinite(target)) return false;
+			            const v = rawVal;
+
+			            switch (f.op) {
+			              case ">":
+			                if (!(v > target)) return false;
+			                break;
+			              case ">=":
+			                if (!(v >= target)) return false;
+			                break;
+			              case "<":
+			                if (!(v < target)) return false;
+			                break;
+			              case "<=":
+			                if (!(v <= target)) return false;
+			                break;
+			              case "=":
+			                if (!(Math.abs(v - target) <= EPS)) return false;
+			                break;
+			              default:
+			                break;
+			            }
+			          }
+			          return true;
+			        });
+			      }
+
+			      if (peaksSearchStatusEl) {
+			        const hasSearch = Boolean(q);
+			        const hasFilters = activeFilters.length > 0;
+			        if (!hasSearch && !hasFilters) {
+			          peaksSearchStatusEl.textContent = allRows.length + " items.";
+			        } else {
+			          const parts = [];
+			          if (hasSearch) parts.push("search");
+			          if (hasFilters) {
+			            parts.push(
+			              activeFilters.length +
+			                " column filter" +
+			                (activeFilters.length === 1 ? "" : "s")
+			            );
+			          }
+			          peaksSearchStatusEl.textContent =
+			            "Filtered: " +
+			            rows.length +
+			            " / " +
+			            allRows.length +
+			            " items." +
+			            (parts.length ? " (" + parts.join(", ") + ")" : "");
+			        }
+			      }
+
+			      if (!rows.length) {
+			        peaksTableContainer.textContent = "No items match that filter.";
+			        return;
+			      }
+
+			      function getWeightedAverage(row) {
+			        let numerator = 0;
+			        let denom = 0;
 		        percentColumns.forEach((col) => {
 		          const wRaw = peaksPercentWeights[col.key];
 		          const w = Number.isFinite(wRaw) ? wRaw : DEFAULT_PEAK_WEIGHT;
