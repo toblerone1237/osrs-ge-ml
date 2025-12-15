@@ -382,11 +382,11 @@ const HTML = `<!DOCTYPE html>
 
 			          <div class="card">
 			            <h2>Catching Peaks leaderboard</h2>
-			            <div class="small" style="margin-bottom:0.4rem;">
-			              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
-			              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
-			              Sharpness = average % above the mean at each peak tip.
-			            </div>
+				            <div class="small" style="margin-bottom:0.4rem;">
+				              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
+				              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
+				              Sharpness = average % above the local mean (±3 days) at each peak tip.
+				            </div>
 			            <div class="peaks-controls">
 			              <div class="search-row peaks-search-row">
 			                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
@@ -2626,12 +2626,16 @@ const HTML = `<!DOCTYPE html>
         peaksLoaded = true;
         peaksStatusEl.textContent = "";
         if (peaksMetaEl) {
+          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
+            ? json.baseline_half_window_days
+            : null;
           peaksMetaEl.textContent =
             "Computed at " +
             (json.generated_at_iso || "unknown time") +
             " over ~" +
             (json.window_days || "?") +
-            " days.";
+            " days." +
+            (baselineHalf != null ? " Peak baseline: ±" + baselineHalf + " days." : "");
         }
         renderPeaksTable();
       } catch (err) {

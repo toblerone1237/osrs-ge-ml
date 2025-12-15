@@ -11,6 +11,7 @@ from features import get_r2_client, list_keys_with_prefix
 
 
 WINDOW_DAYS = int(os.getenv("PEAKS_WINDOW_DAYS", "14"))
+BASELINE_HALF_WINDOW_DAYS = int(os.getenv("PEAKS_BASELINE_HALF_WINDOW_DAYS", "3"))
 MAX_ITER = int(os.getenv("PEAKS_EM_MAX_ITER", "15"))
 FETCH_WORKERS = int(os.getenv("PEAKS_FETCH_WORKERS", "16"))
 
@@ -139,6 +140,7 @@ def compute_catching_peaks_metric(
         return None
 
     pts.sort(key=lambda x: x[0])
+    ts_ms = np.array([ts for ts, _, _ in pts], dtype="float64")
     prices = np.array([p for _, p, _ in pts], dtype="float64")
 
     fit = fit_two_gaussian_mixture_log(prices, max_iter=MAX_ITER)
@@ -193,46 +195,100 @@ def compute_catching_peaks_metric(
     separation = peak_avg / low_avg
     pct_diff = (separation - 1.0) * 100.0
 
-    # Count peaks using a hysteresis band around the mean price:
-    # - A peak is only valid if price reaches >= +50% above the mean.
-    # - Once "in a peak", it doesn't end until price returns to within +10% of mean.
-    mean_price = float(prices.mean())
-    if not np.isfinite(mean_price) or mean_price <= 0:
-        mean_price = float(low_avg)
-    min_peak_price = mean_price * 1.5
-    peak_end_price = mean_price * 1.1
+    def compute_local_mean(ts: np.ndarray, ys: np.ndarray, half_window_ms: float) -> np.ndarray:
+        out = np.full(ys.shape, np.nan, dtype="float64")
+        if ys.size == 0:
+            return out
+
+        left = 0
+        right = 0
+        window_sum = 0.0
+
+        for i in range(ys.size):
+            center = float(ts[i])
+            right_bound = center + half_window_ms
+            left_bound = center - half_window_ms
+
+            while right < ys.size and float(ts[right]) <= right_bound:
+                window_sum += float(ys[right])
+                right += 1
+
+            while left < ys.size and float(ts[left]) < left_bound:
+                window_sum -= float(ys[left])
+                left += 1
+
+            count = right - left
+            if count > 0:
+                out[i] = window_sum / count
+        return out
+
+    # Count peaks using a hysteresis band around a *local* baseline:
+    # - Baseline(t) = mean price within ±BASELINE_HALF_WINDOW_DAYS days of t
+    # - A peak starts when price >= Baseline(t) * 1.5 (+50%).
+    # - Once "in a peak", it doesn't end until price <= Baseline(t) * 1.1 (+10%).
+    half_window_ms = float(BASELINE_HALF_WINDOW_DAYS) * 86400.0 * 1000.0
+    local_mean = compute_local_mean(ts_ms, prices, half_window_ms=half_window_ms)
+    ratios = np.where(np.isfinite(local_mean) & (local_mean > 0), prices / local_mean, np.nan)
+    min_peak_ratio = 1.5
+    peak_end_ratio = 1.1
 
     peak_ts_list: List[float] = []
-    peak_tip_price_list: List[float] = []
+    tip_pct_list: List[float] = []
     in_peak = False
+    current_peak_max_ratio: Optional[float] = None
     current_peak_max_price: Optional[float] = None
     current_peak_max_ts: Optional[float] = None
+    current_peak_max_baseline: Optional[float] = None
 
-    for ts, price, _ in pts:
+    def record_peak() -> None:
+        if current_peak_max_ts is not None:
+            peak_ts_list.append(float(current_peak_max_ts))
+
+        if (
+            current_peak_max_price is None
+            or not np.isfinite(current_peak_max_price)
+            or current_peak_max_price <= 0
+        ):
+            return
+        if (
+            current_peak_max_baseline is None
+            or not np.isfinite(current_peak_max_baseline)
+            or current_peak_max_baseline <= 0
+        ):
+            return
+
+        pct = (float(current_peak_max_price) / float(current_peak_max_baseline) - 1.0) * 100.0
+        if np.isfinite(pct):
+            tip_pct_list.append(max(0.0, float(pct)))
+
+    for (ts, price, _), ratio, baseline in zip(pts, ratios, local_mean):
+        if not np.isfinite(ratio) or not np.isfinite(baseline) or baseline <= 0:
+            continue
         if not in_peak:
-            if price >= min_peak_price:
+            if ratio >= min_peak_ratio:
                 in_peak = True
+                current_peak_max_ratio = float(ratio)
                 current_peak_max_price = price
                 current_peak_max_ts = ts
+                current_peak_max_baseline = float(baseline)
             continue
 
-        if current_peak_max_price is None or price > current_peak_max_price:
+        if current_peak_max_ratio is None or ratio > current_peak_max_ratio:
+            current_peak_max_ratio = float(ratio)
             current_peak_max_price = price
             current_peak_max_ts = ts
+            current_peak_max_baseline = float(baseline)
 
-        if price <= peak_end_price:
-            if current_peak_max_ts is not None:
-                peak_ts_list.append(float(current_peak_max_ts))
-                if current_peak_max_price is not None and np.isfinite(current_peak_max_price):
-                    peak_tip_price_list.append(float(current_peak_max_price))
+        if ratio <= peak_end_ratio:
+            record_peak()
             in_peak = False
+            current_peak_max_ratio = None
             current_peak_max_price = None
             current_peak_max_ts = None
+            current_peak_max_baseline = None
 
     if in_peak and current_peak_max_ts is not None:
-        peak_ts_list.append(float(current_peak_max_ts))
-        if current_peak_max_price is not None and np.isfinite(current_peak_max_price):
-            peak_tip_price_list.append(float(current_peak_max_price))
+        record_peak()
 
     peaks_count = len(peak_ts_list)
 
@@ -250,15 +306,6 @@ def compute_catching_peaks_metric(
                 avg_time_between_peaks_days = float(np.mean(gaps))
         elif peaks_count == 1:
             avg_time_between_peaks_days = 1000.0
-
-    tip_pct_list: List[float] = []
-    if np.isfinite(mean_price) and mean_price > 0:
-        for tip_price in peak_tip_price_list:
-            if not np.isfinite(tip_price) or tip_price <= 0:
-                continue
-            pct = (tip_price / mean_price - 1.0) * 100.0
-            if np.isfinite(pct):
-                tip_pct_list.append(max(0.0, float(pct)))
 
     score = float(np.mean(tip_pct_list)) if tip_pct_list else 0.0
 
@@ -406,6 +453,7 @@ def main():
     out = {
         "generated_at_iso": now.isoformat(),
         "window_days": WINDOW_DAYS,
+        "baseline_half_window_days": BASELINE_HALF_WINDOW_DAYS,
         "items_scanned": len(keys),
         "items": results,
     }
