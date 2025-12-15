@@ -169,9 +169,75 @@ const HTML = `<!DOCTYPE html>
       margin-top: 0.35rem;
       align-items: center;
       gap: 0.5rem;
+      padding: 0.15rem 0.35rem;
+      border-radius: 999px;
+      border: 1px solid rgba(55,65,81,0.8);
+      background: rgba(15,23,42,0.35);
     }
     .chart-scrollbar input[type="range"] {
       width: 100%;
+      margin: 0;
+      height: 14px;
+      background: transparent;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      --thumb-width: 48px;
+    }
+    .chart-scrollbar input[type="range"]:focus {
+      outline: none;
+    }
+    .chart-scrollbar input[type="range"]::-webkit-slider-runnable-track {
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(148,163,184,0.16);
+      box-shadow: inset 0 0 0 1px rgba(148,163,184,0.12);
+    }
+    .chart-scrollbar input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 10px;
+      width: var(--thumb-width);
+      border-radius: 999px;
+      background: rgba(148,163,184,0.55);
+      margin-top: -1px;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.35),
+        inset 0 0 0 1px rgba(248,250,252,0.18);
+    }
+    .chart-scrollbar input[type="range"]:hover::-webkit-slider-thumb {
+      background: rgba(148,163,184,0.72);
+    }
+    .chart-scrollbar input[type="range"]:active::-webkit-slider-thumb {
+      background: rgba(226,232,240,0.85);
+    }
+    .chart-scrollbar input[type="range"]:focus-visible::-webkit-slider-thumb {
+      box-shadow:
+        0 0 0 3px rgba(59,130,246,0.35),
+        0 1px 0 rgba(0,0,0,0.35),
+        inset 0 0 0 1px rgba(248,250,252,0.18);
+    }
+    .chart-scrollbar input[type="range"]::-moz-range-track {
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(148,163,184,0.16);
+      box-shadow: inset 0 0 0 1px rgba(148,163,184,0.12);
+    }
+    .chart-scrollbar input[type="range"]::-moz-range-thumb {
+      height: 10px;
+      width: var(--thumb-width);
+      border-radius: 999px;
+      border: none;
+      background: rgba(148,163,184,0.55);
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.35),
+        inset 0 0 0 1px rgba(248,250,252,0.18);
+    }
+    .chart-scrollbar input[type="range"]:hover::-moz-range-thumb {
+      background: rgba(148,163,184,0.72);
+    }
+    .chart-scrollbar input[type="range"]:active::-moz-range-thumb {
+      background: rgba(226,232,240,0.85);
     }
     .chart-scrollbar .chart-scroll-label {
       font-size: 0.75rem;
@@ -565,6 +631,20 @@ const HTML = `<!DOCTYPE html>
 			      return Math.min(hi, Math.max(lo, n));
 			    }
 
+			    function setChartScrollThumbWidth(fullWidth, windowWidth) {
+			      if (!chartScrollEl) return;
+			      if (!(Number.isFinite(fullWidth) && fullWidth > 0)) return;
+			      if (!(Number.isFinite(windowWidth) && windowWidth > 0)) return;
+
+			      const frac = clampNumber(windowWidth / fullWidth, 0, 1);
+			      const minPx = 28;
+			      const maxPx = 180;
+			      const thumbPx = Math.round(
+			        clampNumber(minPx + (maxPx - minPx) * frac, minPx, maxPx)
+			      );
+			      chartScrollEl.style.setProperty("--thumb-width", thumbPx + "px");
+			    }
+
 			    function setChartScrollVisible(visible) {
 			      if (!chartScrollWrapEl) return;
 			      chartScrollWrapEl.style.display = visible ? "flex" : "none";
@@ -578,6 +658,120 @@ const HTML = `<!DOCTYPE html>
 			      const max = x.max;
 			      if (Number.isFinite(min) && Number.isFinite(max) && max > min) {
 			        chart.__xOriginal = { min, max };
+			      }
+			    }
+
+			    function setChartOriginalYRange(chart) {
+			      if (!chart) return;
+			      if (chart.__yOriginal) return;
+			      const yOpts =
+			        chart.options && chart.options.scales && chart.options.scales.y
+			          ? chart.options.scales.y
+			          : null;
+			      if (!yOpts) return;
+			      chart.__yOriginal = { min: yOpts.min, max: yOpts.max };
+			    }
+
+			    function restoreChartYRange(chart) {
+			      if (!chart || !chart.__yOriginal) return;
+			      const yOpts =
+			        chart.options && chart.options.scales && chart.options.scales.y
+			          ? chart.options.scales.y
+			          : null;
+			      if (!yOpts) return;
+
+			      const nextMin = chart.__yOriginal.min;
+			      const nextMax = chart.__yOriginal.max;
+			      const curMin = yOpts.min;
+			      const curMax = yOpts.max;
+
+			      if (curMin === nextMin && curMax === nextMax) return;
+			      yOpts.min = nextMin;
+			      yOpts.max = nextMax;
+			      try {
+			        chart.update("none");
+			      } catch (_) {
+			        chart.update();
+			      }
+			    }
+
+			    function labelToUnixMs(label) {
+			      if (label == null) return NaN;
+			      if (typeof label === "number") return label;
+			      if (label instanceof Date) return label.getTime();
+			      const t = new Date(label).getTime();
+			      return Number.isFinite(t) ? t : NaN;
+			    }
+
+			    function updateChartYForVisibleRange(chart, xMin, xMax, isZoomed) {
+			      if (!chart) return;
+			      const yOpts =
+			        chart.options && chart.options.scales && chart.options.scales.y
+			          ? chart.options.scales.y
+			          : null;
+			      if (!yOpts) return;
+
+			      setChartOriginalYRange(chart);
+
+			      if (!isZoomed) {
+			        restoreChartYRange(chart);
+			        return;
+			      }
+
+			      if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) return;
+
+			      const labels =
+			        chart.data && Array.isArray(chart.data.labels) ? chart.data.labels : [];
+			      const datasets =
+			        chart.data && Array.isArray(chart.data.datasets) ? chart.data.datasets : [];
+
+			      let rawMin = Infinity;
+			      let rawMax = -Infinity;
+
+			      for (let i = 0; i < labels.length; i++) {
+			        const ts = labelToUnixMs(labels[i]);
+			        if (!Number.isFinite(ts)) continue;
+			        if (ts < xMin || ts > xMax) continue;
+
+			        for (let d = 0; d < datasets.length; d++) {
+			          const ds = datasets[d];
+			          if (!ds || ds.hidden) continue;
+			          const arr = ds.data;
+			          if (!Array.isArray(arr) || i >= arr.length) continue;
+			          const v = Number(arr[i]);
+			          if (!Number.isFinite(v)) continue;
+			          rawMin = Math.min(rawMin, v);
+			          rawMax = Math.max(rawMax, v);
+			        }
+			      }
+
+			      if (!Number.isFinite(rawMin) || !Number.isFinite(rawMax)) return;
+
+			      const mid = (rawMin + rawMax) / 2;
+			      const maxSpreadFactor = 50;
+			      if (mid > 0 && rawMax / mid > maxSpreadFactor) {
+			        rawMax = mid * maxSpreadFactor;
+			      }
+			      if (mid > 0 && mid / rawMin > maxSpreadFactor) {
+			        rawMin = mid / maxSpreadFactor;
+			      }
+
+			      const pad = (rawMax - rawMin) * 0.1 || Math.abs(mid) * 0.05 || 1;
+			      const nextMin = Math.max(0, Math.floor(rawMin - pad));
+			      const nextMax = Math.ceil(rawMax + pad);
+			      if (!(Number.isFinite(nextMin) && Number.isFinite(nextMax) && nextMax > nextMin))
+			        return;
+
+			      const curMin = yOpts.min;
+			      const curMax = yOpts.max;
+			      if (curMin === nextMin && curMax === nextMax) return;
+
+			      yOpts.min = nextMin;
+			      yOpts.max = nextMax;
+			      try {
+			        chart.update("none");
+			      } catch (_) {
+			        chart.update();
 			      }
 			    }
 
@@ -599,6 +793,7 @@ const HTML = `<!DOCTYPE html>
 			        !Number.isFinite(curMax)
 			      ) {
 			        setChartScrollVisible(false);
+			        restoreChartYRange(chart);
 			        return;
 			      }
 
@@ -606,14 +801,20 @@ const HTML = `<!DOCTYPE html>
 			      const windowWidth = curMax - curMin;
 			      if (!(fullWidth > 0) || !(windowWidth > 0)) {
 			        setChartScrollVisible(false);
+			        restoreChartYRange(chart);
 			        return;
 			      }
 
 			      const isZoomed = windowWidth < fullWidth - 1;
 			      if (!isZoomed) {
 			        setChartScrollVisible(false);
+			        updateChartYForVisibleRange(chart, curMin, curMax, false);
 			        return;
 			      }
+
+			      setChartScrollVisible(true);
+			      setChartScrollThumbWidth(fullWidth, windowWidth);
+			      updateChartYForVisibleRange(chart, curMin, curMax, true);
 
 			      const maxOffset = fullWidth - windowWidth;
 			      const offset = clampNumber(curMin - originalMin, 0, maxOffset);
@@ -621,7 +822,6 @@ const HTML = `<!DOCTYPE html>
 			      chartScrollEl.value = String(
 			        Math.round(clampNumber(frac, 0, 1) * CHART_SCROLL_STEPS)
 			      );
-			      setChartScrollVisible(true);
 			    }
 
 			    function applyChartScrollFromSlider(chart) {
@@ -718,6 +918,7 @@ const HTML = `<!DOCTYPE html>
 	        try {
 	          priceChart.update("none");
 	        } catch (_) {}
+	        updateChartScrollFromChart(priceChart);
 	      }
 	    }
 
