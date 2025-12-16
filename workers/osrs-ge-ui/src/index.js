@@ -94,13 +94,19 @@ const HTML = `<!DOCTYPE html>
     tr.clickable {
       cursor: pointer;
     }
-    tr.clickable:hover {
-      background: rgba(55,65,81,0.5);
-    }
-    .pill {
-      display: inline-block;
-      padding: 0.1rem 0.4rem;
-      border-radius: 999px;
+	    tr.clickable:hover {
+	      background: rgba(55,65,81,0.5);
+	    }
+	    td.item-name-cell.selected-item-name {
+	      background: rgba(250,204,21,0.22);
+	      color: #fde68a;
+	      font-weight: 600;
+	      box-shadow: inset 0 0 0 1px rgba(250,204,21,0.45);
+	    }
+	    .pill {
+	      display: inline-block;
+	      padding: 0.1rem 0.4rem;
+	      border-radius: 999px;
       font-size: 0.75rem;
       background: #1f2937;
       color: #d1d5db;
@@ -599,6 +605,7 @@ const HTML = `<!DOCTYPE html>
 	    let MODEL_TAX = 0.02;
 	    let priceChart = null;
 	    let activeTab = "standard";
+	    let selectedItemId = null;
     // Ranking pagination
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
@@ -993,6 +1000,25 @@ const HTML = `<!DOCTYPE html>
 	      return {};
 	    }
 
+	    function updateSelectedItemHighlights() {
+	      const cells = Array.from(document.querySelectorAll("td.item-name-cell"));
+	      const selected =
+	        selectedItemId != null && Number.isFinite(selectedItemId) ? selectedItemId : null;
+	      cells.forEach((cell) => {
+	        const id = Number(cell.dataset.itemId);
+	        cell.classList.toggle(
+	          "selected-item-name",
+	          selected != null && Number.isFinite(id) && id === selected
+	        );
+	      });
+	    }
+
+	    function setSelectedItem(nextItemId) {
+	      const id = Number(nextItemId);
+	      selectedItemId = Number.isFinite(id) ? id : null;
+	      updateSelectedItemHighlights();
+	    }
+
 	    function savePinnedState(state) {
 	      try {
 	        window.localStorage.setItem(PIN_KEY, JSON.stringify(state));
@@ -1367,16 +1393,21 @@ const HTML = `<!DOCTYPE html>
       });
       thead.appendChild(trHead);
 
-      entries.forEach((row) => {
-        const tr = document.createElement("tr");
-        tr.className = "clickable";
-        tr.addEventListener("click", () => {
-          loadPriceSeries(row.item_id, row.name);
-        });
+	      entries.forEach((row) => {
+	        const tr = document.createElement("tr");
+	        tr.className = "clickable";
+	        tr.addEventListener("click", () => {
+	          loadPriceSeries(row.item_id, row.name);
+	        });
 
-        const tdName = document.createElement("td");
-        tdName.textContent = row.name;
-        tr.appendChild(tdName);
+	        const tdName = document.createElement("td");
+	        tdName.textContent = row.name;
+	        tdName.classList.add("item-name-cell");
+	        tdName.dataset.itemId = String(row.item_id);
+	        if (selectedItemId != null && row.item_id === selectedItemId) {
+	          tdName.classList.add("selected-item-name");
+	        }
+	        tr.appendChild(tdName);
 
         const tdPinned = document.createElement("td");
         tdPinned.textContent = row.pinnedAtIso || "unknown";
@@ -1392,11 +1423,12 @@ const HTML = `<!DOCTYPE html>
       table.appendChild(thead);
       table.appendChild(tbody);
       const scroll = document.createElement("div");
-      scroll.className = "table-scroll";
-      scroll.appendChild(table);
-      pinnedListEl.innerHTML = "";
-      pinnedListEl.appendChild(scroll);
-    }
+	      scroll.className = "table-scroll";
+	      scroll.appendChild(table);
+	      pinnedListEl.innerHTML = "";
+	      pinnedListEl.appendChild(scroll);
+	      updateSelectedItemHighlights();
+	    }
 
     function buildPaginationControls(totalRows, pageSize, currentPage) {
       const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
@@ -1646,9 +1678,14 @@ const HTML = `<!DOCTYPE html>
         tdStar.appendChild(btn);
         tr.appendChild(tdStar);
     
-        const tdName = document.createElement("td");
-        tdName.textContent = row.name;
-        tr.appendChild(tdName);
+	        const tdName = document.createElement("td");
+	        tdName.textContent = row.name;
+	        tdName.classList.add("item-name-cell");
+	        tdName.dataset.itemId = String(row.id);
+	        if (selectedItemId != null && row.id === selectedItemId) {
+	          tdName.classList.add("selected-item-name");
+	        }
+	        tr.appendChild(tdName);
     
         const tdRegime = document.createElement("td");
         if (row.regime === "high") {
@@ -1706,9 +1743,9 @@ const HTML = `<!DOCTYPE html>
 	        applyDecileHeat(tdHold, pctHoldById.get(row.id));
 	        tr.appendChild(tdHold);
     
-        tr.addEventListener("click", () => {
-          loadPriceSeries(row.id, row.name);
-        });
+	        tr.addEventListener("click", () => {
+	          loadPriceSeries(row.id, row.name);
+	        });
     
         tbody.appendChild(tr);
       });
@@ -1731,9 +1768,10 @@ const HTML = `<!DOCTYPE html>
       const scroll = document.createElement("div");
       scroll.className = "table-scroll";
       scroll.appendChild(table);
-      tableContainer.appendChild(scroll);
-      tableContainer.appendChild(pagerBottom);
-    }
+	      tableContainer.appendChild(scroll);
+	      tableContainer.appendChild(pagerBottom);
+	      updateSelectedItemHighlights();
+	    }
 
 	    function buildPeaksPaginationControls(totalRows, pageSize, currentPage) {
       const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
@@ -2416,9 +2454,14 @@ const HTML = `<!DOCTYPE html>
 	        const tr = document.createElement("tr");
 	        tr.className = "clickable";
 
-        const tdName = document.createElement("td");
-        tdName.textContent = row.name || ("Item " + row.item_id);
-        tr.appendChild(tdName);
+	        const tdName = document.createElement("td");
+	        tdName.textContent = row.name || ("Item " + row.item_id);
+	        tdName.classList.add("item-name-cell");
+	        tdName.dataset.itemId = String(row.item_id);
+	        if (selectedItemId != null && Number(row.item_id) === selectedItemId) {
+	          tdName.classList.add("selected-item-name");
+	        }
+	        tr.appendChild(tdName);
 
 		        displayColumns.forEach((col) => {
 		          const td = document.createElement("td");
@@ -2437,10 +2480,10 @@ const HTML = `<!DOCTYPE html>
 		          tr.appendChild(td);
 	        });
 
-		        tr.addEventListener("click", () => {
-		          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
-		            showForecast: false,
-		            highlightPeaks: true,
+			        tr.addEventListener("click", () => {
+			          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
+			            showForecast: false,
+			            highlightPeaks: true,
 		            peakBaselinePrice: row.low_avg_price,
 		            peakBaselineHalfWindowDays: peaksBaselineHalfWindowDays,
 		            peakExpectedCount: row.peaks_count,
@@ -3230,9 +3273,10 @@ const HTML = `<!DOCTYPE html>
 	      return { startTs, endTs, sum, bucketsInWindow, bucketsWithVolume };
 	    }
 
-		    async function loadPriceSeries(itemId, name, opts) {
-		      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
-		      priceStatusEl.textContent = "Loading price series...";
+	    async function loadPriceSeries(itemId, name, opts) {
+	      setSelectedItem(itemId);
+	      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
+	      priceStatusEl.textContent = "Loading price series...";
 
 	      try {
 	        const showForecast = !(opts && opts.showForecast === false);
