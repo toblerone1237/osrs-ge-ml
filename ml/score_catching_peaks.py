@@ -232,8 +232,7 @@ def compute_catching_peaks_metric(
     min_peak_ratio = 3.0
     peak_end_ratio = 1.1
 
-    peak_ts_list: List[float] = []
-    tip_pct_list: List[float] = []
+    peaks: List[Dict[str, float]] = []
     in_peak = False
     current_peak_max_ratio: Optional[float] = None
     current_peak_max_price: Optional[float] = None
@@ -282,9 +281,6 @@ def compute_catching_peaks_metric(
         if not peak_avg_exceeds_surrounding(start_idx, end_idx, factor=2.0):
             return
 
-        if current_peak_max_ts is not None:
-            peak_ts_list.append(float(current_peak_max_ts))
-
         if (
             current_peak_max_price is None
             or not np.isfinite(current_peak_max_price)
@@ -298,9 +294,24 @@ def compute_catching_peaks_metric(
         ):
             return
 
-        pct = (float(current_peak_max_price) / float(current_peak_max_baseline) - 1.0) * 100.0
-        if np.isfinite(pct):
-            tip_pct_list.append(max(0.0, float(pct)))
+        if current_peak_max_ts is None or not np.isfinite(current_peak_max_ts):
+            return
+
+        ratio = float(current_peak_max_price) / float(current_peak_max_baseline)
+        if not np.isfinite(ratio) or ratio <= 0:
+            return
+
+        pct = (ratio - 1.0) * 100.0
+        if not np.isfinite(pct):
+            return
+
+        peaks.append(
+            {
+                "ts": float(current_peak_max_ts),
+                "ratio": float(ratio),
+                "tip_pct": max(0.0, float(pct)),
+            }
+        )
 
     for i, ((ts, price, _), ratio, baseline) in enumerate(zip(pts, ratios, local_mean)):
         if not np.isfinite(ratio) or not np.isfinite(baseline) or baseline <= 0:
@@ -337,12 +348,31 @@ def compute_catching_peaks_metric(
     # If we end the window while still in a peak, we intentionally do NOT count it.
     # (We haven't observed the peak returning back below the end threshold yet.)
 
-    peaks_count = len(peak_ts_list)
+    # If multiple peaks occur within the same 3-day period, keep only the largest
+    # (highest peak ratio) and discard the rest.
+    peaks.sort(key=lambda p: p.get("ts", 0.0))
+    keep_window_ms = float(BASELINE_HALF_WINDOW_DAYS) * 86400.0 * 1000.0
+    if keep_window_ms > 0 and len(peaks) > 1:
+        deduped: List[Dict[str, float]] = []
+        for p in peaks:
+            if not deduped:
+                deduped.append(p)
+                continue
+            last = deduped[-1]
+            if float(p["ts"]) - float(last["ts"]) <= keep_window_ms:
+                if float(p["ratio"]) > float(last["ratio"]):
+                    deduped[-1] = p
+                continue
+            deduped.append(p)
+        peaks = deduped
+
+    peaks_count = len(peaks)
 
     ms_per_day = 86400 * 1000.0
     time_since_last_peak_days: Optional[float] = None
     avg_time_between_peaks_days: Optional[float] = None
-    if peak_ts_list:
+    if peaks:
+        peak_ts_list = [float(p["ts"]) for p in peaks]
         last_peak_ts = peak_ts_list[-1]
         time_since_last_peak_days = (now_ms - last_peak_ts) / ms_per_day
         if peaks_count >= 2:
@@ -354,6 +384,7 @@ def compute_catching_peaks_metric(
         elif peaks_count == 1:
             avg_time_between_peaks_days = 1000.0
 
+    tip_pct_list = [float(p["tip_pct"]) for p in peaks if np.isfinite(p.get("tip_pct", np.nan))]
     score = float(np.mean(tip_pct_list)) if tip_pct_list else 0.0
 
     volume24h = 0.0

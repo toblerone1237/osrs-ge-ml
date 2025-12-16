@@ -2647,6 +2647,109 @@ const HTML = `<!DOCTYPE html>
 		      return count;
 		    }
 
+		    function filterPeakMaskKeepLargestInWindow(
+		      labels,
+		      histData,
+		      mask,
+		      ratioByIndex,
+		      windowDays
+		    ) {
+		      if (
+		        !Array.isArray(labels) ||
+		        !Array.isArray(histData) ||
+		        !Array.isArray(mask) ||
+		        labels.length !== histData.length ||
+		        labels.length !== mask.length
+		      ) {
+		        return mask;
+		      }
+
+		      const days =
+		        Number.isFinite(windowDays) && windowDays > 0 ? windowDays : 3;
+		      const windowMs = days * 86400 * 1000;
+		      if (!(windowMs > 0)) return mask;
+
+		      const out = mask.map(Boolean);
+		      const n = out.length;
+		      const peaks = [];
+
+		      function labelTsAt(i) {
+		        if (i == null || i < 0 || i >= labels.length) return NaN;
+		        const d = labels[i];
+		        if (d instanceof Date) return d.getTime();
+		        if (typeof d === "number") return d;
+		        const t = Date.parse(d);
+		        return Number.isFinite(t) ? t : NaN;
+		      }
+
+		      let i = 0;
+		      while (i < n) {
+		        if (!out[i]) {
+		          i += 1;
+		          continue;
+		        }
+		        const start = i;
+		        while (i < n && out[i]) i += 1;
+		        const end = i - 1;
+
+		        let bestScore = -Infinity;
+		        let bestIdx = start;
+		        for (let j = start; j <= end; j++) {
+		          const r =
+		            Array.isArray(ratioByIndex) && ratioByIndex.length === n
+		              ? ratioByIndex[j]
+		              : null;
+		          const raw = histData[j];
+		          const score = r != null && Number.isFinite(r) ? r : raw;
+		          if (score != null && Number.isFinite(score) && score > bestScore) {
+		            bestScore = score;
+		            bestIdx = j;
+		          }
+		        }
+
+		        peaks.push({
+		          start,
+		          end,
+		          ts: labelTsAt(bestIdx),
+		          score: bestScore
+		        });
+		      }
+
+		      peaks.sort((a, b) => {
+		        const ta = Number(a.ts);
+		        const tb = Number(b.ts);
+		        if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+		        return Number(a.score) - Number(b.score);
+		      });
+
+		      const kept = [];
+		      peaks.forEach((p) => {
+		        const ts = Number(p.ts);
+		        if (!Number.isFinite(ts)) {
+		          for (let j = p.start; j <= p.end; j++) out[j] = false;
+		          return;
+		        }
+		        if (!kept.length) {
+		          kept.push(p);
+		          return;
+		        }
+		        const last = kept[kept.length - 1];
+		        const lastTs = Number(last.ts);
+		        if (Number.isFinite(lastTs) && ts - lastTs <= windowMs) {
+		          if (Number(p.score) > Number(last.score)) {
+		            for (let j = last.start; j <= last.end; j++) out[j] = false;
+		            kept[kept.length - 1] = p;
+		          } else {
+		            for (let j = p.start; j <= p.end; j++) out[j] = false;
+		          }
+		          return;
+		        }
+		        kept.push(p);
+		      });
+
+		      return out;
+		    }
+
 		    function filterPeakMaskBySurroundingAverage(histData, mask, factor) {
 		      if (
 		        !Array.isArray(histData) ||
@@ -3262,7 +3365,7 @@ const HTML = `<!DOCTYPE html>
 	              return null;
 	            })()
 	          : null;
-	        const peakMask =
+	        let peakMask =
 	          highlightPeaks && peakDiag && Array.isArray(peakDiag.mask)
 	            ? peakDiag.mask
 	            : null;
@@ -3274,6 +3377,15 @@ const HTML = `<!DOCTYPE html>
 	          highlightPeaks && peakDiag && Array.isArray(peakDiag.ratioByIndex)
 	            ? peakDiag.ratioByIndex
 	            : null;
+	        if (highlightPeaks && peakMask && Array.isArray(peakMask)) {
+	          peakMask = filterPeakMaskKeepLargestInWindow(
+	            labels,
+	            histData,
+	            peakMask,
+	            peakRatioByIndex,
+	            peakBaselineHalfWindowDays
+	          );
+	        }
 	        const peakWindowCount =
 	          highlightPeaks && peakMask ? countPeakWindows(peakMask) : 0;
 	        const hasPeakSegments = peakWindowCount > 0;
