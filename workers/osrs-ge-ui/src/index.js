@@ -598,6 +598,7 @@ const HTML = `<!DOCTYPE html>
 	    let MODEL_HORIZON = 60;
 	    let MODEL_TAX = 0.02;
 	    let priceChart = null;
+	    let activeTab = "standard";
     // Ranking pagination
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
@@ -736,6 +737,7 @@ const HTML = `<!DOCTYPE html>
 			        for (let d = 0; d < datasets.length; d++) {
 			          const ds = datasets[d];
 			          if (!ds || ds.hidden) continue;
+			          if (ds.yAxisID && ds.yAxisID !== "y") continue;
 			          const arr = ds.data;
 			          if (!Array.isArray(arr) || i >= arr.length) continue;
 			          const v = Number(arr[i]);
@@ -901,6 +903,7 @@ const HTML = `<!DOCTYPE html>
 	    function syncForecastVisibilityForTab(tabName) {
 	      if (!priceChart || !priceChart.data) return;
 	      const hideForecast = tabName === "peaks";
+	      const showVolume = tabName === "peaks";
 	      const datasets = Array.isArray(priceChart.data.datasets)
 	        ? priceChart.data.datasets
 	        : [];
@@ -914,6 +917,27 @@ const HTML = `<!DOCTYPE html>
 	          changed = true;
 	        }
 	      });
+
+	      datasets.forEach((ds) => {
+	        if (!ds || ds.yAxisID !== "yVolume") return;
+	        if (Boolean(ds.hidden) === showVolume) {
+	          ds.hidden = !showVolume;
+	          changed = true;
+	        }
+	      });
+
+	      if (
+	        priceChart.options &&
+	        priceChart.options.scales &&
+	        priceChart.options.scales.yVolume
+	      ) {
+	        const yVol = priceChart.options.scales.yVolume;
+	        if (Boolean(yVol.display) !== showVolume) {
+	          yVol.display = showVolume;
+	          changed = true;
+	        }
+	      }
+
 	      if (changed) {
 	        try {
 	          priceChart.update("none");
@@ -924,6 +948,7 @@ const HTML = `<!DOCTYPE html>
 
 	    function setActiveTab(tabName) {
 	      const active = tabName === "peaks" ? "peaks" : "standard";
+	      activeTab = active;
 	      tabButtons.forEach((btn) => {
 	        const isActive = btn.dataset.tab === active;
         btn.classList.toggle("active", isActive);
@@ -3418,7 +3443,21 @@ const HTML = `<!DOCTYPE html>
 	          };
 	        }
 
-	        const datasets = [historyDataset];
+	        const showVolumeLine = activeTab === "peaks";
+	        const volumeDataset = {
+	          label: "Volume (per bucket)",
+	          data: volumeData,
+	          yAxisID: "yVolume",
+	          borderColor: "rgba(148,163,184,0.85)",
+	          backgroundColor: "rgba(148,163,184,0.12)",
+	          pointRadius: 0,
+	          borderWidth: 1,
+	          tension: 0.15,
+	          spanGaps: true,
+	          hidden: !showVolumeLine
+	        };
+
+	        const datasets = [historyDataset, volumeDataset];
 
 	        if (showForecast && starInfo && oldFcData.some((v) => v != null)) {
 	          datasets.push({
@@ -3518,6 +3557,27 @@ const HTML = `<!DOCTYPE html>
                     return v.toFixed(0);
                   }
                 }
+              },
+              yVolume: {
+                display: showVolumeLine,
+                position: "right",
+                beginAtZero: true,
+                grid: {
+                  drawOnChartArea: false
+                },
+                title: {
+                  display: true,
+                  text: "Volume"
+                },
+                ticks: {
+                  callback: function (value) {
+                    const v = Number(value) || 0;
+                    if (v >= 1_000_000_000) return (v / 1_000_000_000).toFixed(1) + "b";
+                    if (v >= 1_000_000) return (v / 1_000_000).toFixed(1) + "m";
+                    if (v >= 1_000) return (v / 1_000).toFixed(1) + "k";
+                    return v.toFixed(0);
+                  }
+                }
               }
             },
 	            plugins: {
@@ -3536,11 +3596,28 @@ const HTML = `<!DOCTYPE html>
 	                backgroundColor: "rgba(2,6,23,0.75)"
 	              },
 	              legend: {
-	                position: "bottom"
+	                position: "bottom",
+	                labels: {
+	                  filter: function (legendItem, data) {
+	                    const ds =
+	                      data &&
+	                      data.datasets &&
+	                      legendItem &&
+	                      typeof legendItem.datasetIndex === "number"
+	                        ? data.datasets[legendItem.datasetIndex]
+	                        : null;
+	                    if (ds && ds.yAxisID === "yVolume") return activeTab === "peaks";
+	                    return true;
+	                  }
+	                }
 	              },
               tooltip: {
                 callbacks: {
                   label: function (context) {
+                    const isVolumeSeries =
+                      context &&
+                      context.dataset &&
+                      context.dataset.yAxisID === "yVolume";
                     const dsLabel = context.dataset && context.dataset.label ? context.dataset.label : "";
                     const value = context.parsed && typeof context.parsed.y === "number"
                       ? context.parsed.y
@@ -3556,12 +3633,20 @@ const HTML = `<!DOCTYPE html>
 
                     let base =
                       dsLabel && value != null
-                        ? dsLabel + ": " + value.toLocaleString("en-US")
+                        ? dsLabel +
+                          ": " +
+                          (isVolumeSeries ? Math.round(value) : value).toLocaleString("en-US")
                         : value != null
-                        ? value.toLocaleString("en-US")
+                        ? (isVolumeSeries ? Math.round(value) : value).toLocaleString("en-US")
                         : dsLabel || "";
 
-	                    if (vol != null && Number.isFinite(vol) && vol > 0) {
+	                    if (
+	                      !isVolumeSeries &&
+	                      activeTab !== "peaks" &&
+	                      vol != null &&
+	                      Number.isFinite(vol) &&
+	                      vol > 0
+	                    ) {
 	                      base +=
 	                        " (bucket vol " + Math.round(vol).toLocaleString("en-US") + ")";
 	                    }
@@ -3681,7 +3766,7 @@ const HTML = `<!DOCTYPE html>
 			            historySourceText +
 			            lastTimestampText +
 			            volumeInfoText +
-			            " Forecast hidden on Catching Peaks view." +
+			            " Forecast hidden on Catching Peaks view. Volume shown on right axis." +
 			            peakInfoText;
 			        } else if (!hasForecast) {
 			          priceStatusEl.textContent =
