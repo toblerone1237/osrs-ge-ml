@@ -143,6 +143,14 @@ def compute_catching_peaks_metric(
     ts_ms = np.array([ts for ts, _, _ in pts], dtype="float64")
     prices = np.array([p for _, p, _ in pts], dtype="float64")
 
+    mean_price = float(np.mean(prices))
+    variance = float(np.mean(np.abs(prices - mean_price))) if np.isfinite(mean_price) else float("nan")
+    variance_pct = (
+        float(variance) / float(mean_price) * 100.0
+        if np.isfinite(variance) and np.isfinite(mean_price) and mean_price > 0
+        else None
+    )
+
     fit = fit_two_gaussian_mixture_log(prices, max_iter=MAX_ITER)
     if fit is None:
         return None
@@ -396,6 +404,8 @@ def compute_catching_peaks_metric(
         "low_avg_price": low_avg,
         "peak_avg_price": peak_avg,
         "pct_difference": pct_diff,
+        "variance": float(variance) if np.isfinite(variance) else None,
+        "variance_pct": float(variance_pct) if variance_pct is not None and np.isfinite(variance_pct) else None,
         "volume_24h": volume24h,
         "peaks_count": peaks_count,
         "time_since_last_peak_days": time_since_last_peak_days,

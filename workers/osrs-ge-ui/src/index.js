@@ -502,6 +502,7 @@ const HTML = `<!DOCTYPE html>
 				              Items with a stable low baseline most of the time, punctuated by rare, short-lived high spikes.
 				              Computed by fitting a two‑state Gaussian mixture (baseline vs spike) to recent mid prices.
 				              Sharpness = average % above the local mean (±3 days) at each peak tip.
+				              Variance = average absolute distance from the mean price; Variance % = variance ÷ mean × 100.
 				            </div>
 			            <div class="peaks-controls">
 			              <div class="search-row peaks-search-row">
@@ -2182,6 +2183,18 @@ const HTML = `<!DOCTYPE html>
           key: "pct_difference",
           header: "% Difference",
           value: (row) => row.pct_difference,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
+        },
+        {
+          key: "variance",
+          header: "Variance",
+          value: (row) => row.variance,
+          format: formatProfitGp
+        },
+        {
+          key: "variance_pct",
+          header: "Variance %",
+          value: (row) => row.variance_pct,
           format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
         },
 	        {
