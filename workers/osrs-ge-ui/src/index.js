@@ -392,6 +392,19 @@ const HTML = `<!DOCTYPE html>
 		      background: #1f2937;
 		      border-color: #6b7280;
 		    }
+		    .series-toggles {
+		      display: flex;
+		      flex-wrap: wrap;
+		      align-items: center;
+		      gap: 0.35rem;
+		      margin: 0 0 0.6rem;
+		    }
+		    .series-toggles-label {
+		      color: #9ca3af;
+		      font-size: 0.8rem;
+		      user-select: none;
+		      white-space: nowrap;
+		    }
 		    @media (max-width: 750px) {
 		      table { font-size: 0.78rem; }
 		      header h1 { font-size: 1.2rem; }
@@ -527,19 +540,26 @@ const HTML = `<!DOCTYPE html>
 	      </div>
 	    </div>
 
-    <div id="priceCard" class="card">
-      <h2>Price history &amp; forecast</h2>
-      <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
-      <div class="small" style="margin-bottom:0.4rem;">
-        <ul style="margin:0; padding-left:1.2rem;">
-          <li><strong>Blue</strong>: actual mid price history (up to ~14 days, 5-minute buckets for the last 24 hours, then ~30-minute buckets further back, limited by data availability).</li>
-          <li><strong>Green</strong>: current forecast from the latest model, from now into the next 120 minutes.</li>
-          <li><strong>Yellow dashed</strong>: forecast that was in effect when you starred the item (if pinned).</li>
-        </ul>
-      </div>
-      <div class="chart-wrapper">
-        <canvas id="priceChart"></canvas>
-      </div>
+	    <div id="priceCard" class="card">
+	      <h2>Price history &amp; forecast</h2>
+	      <div id="priceTitle" class="small">Select an item above to see its price chart.</div>
+	      <div class="small" style="margin-bottom:0.4rem;">
+	        <ul style="margin:0; padding-left:1.2rem;">
+	          <li><strong>Blue</strong>: actual mid price history (up to ~14 days, 5-minute buckets for the last 24 hours, then ~30-minute buckets further back, limited by data availability).</li>
+	          <li><strong>Green</strong>: current forecast from the latest model, from now into the next 120 minutes.</li>
+	          <li><strong>Yellow dashed</strong>: forecast that was in effect when you starred the item (if pinned).</li>
+	        </ul>
+	      </div>
+	      <div id="priceSeriesToggles" class="series-toggles">
+	        <span class="series-toggles-label">Raw /5m series:</span>
+	        <button type="button" class="peaks-toggle-btn" data-series-toggle="avgHigh">Avg high</button>
+	        <button type="button" class="peaks-toggle-btn" data-series-toggle="avgLow">Avg low</button>
+	        <button type="button" class="peaks-toggle-btn" data-series-toggle="highVol">High vol</button>
+	        <button type="button" class="peaks-toggle-btn" data-series-toggle="lowVol">Low vol</button>
+	      </div>
+	      <div class="chart-wrapper">
+	        <canvas id="priceChart"></canvas>
+	      </div>
       <div id="priceChartScrollWrap" class="chart-scrollbar" aria-hidden="true">
         <span class="chart-scroll-label">Pan</span>
         <input
@@ -569,6 +589,9 @@ const HTML = `<!DOCTYPE html>
     const chartCanvas = document.getElementById("priceChart");
     const chartScrollWrapEl = document.getElementById("priceChartScrollWrap");
     const chartScrollEl = document.getElementById("priceChartScroll");
+    const priceSeriesToggleButtons = Array.from(
+      document.querySelectorAll("[data-series-toggle]")
+    );
 
     const searchInput = document.getElementById("searchInput");
     const searchButton = document.getElementById("searchButton");
@@ -593,6 +616,7 @@ const HTML = `<!DOCTYPE html>
 
 		    const PIN_KEY = "osrs_ge_pins_v3";
 		    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
+		    const PRICE_SERIES_TOGGLES_KEY = "osrs_ge_price_series_toggles_v1";
 		    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
 		    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
 		    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
@@ -607,6 +631,13 @@ const HTML = `<!DOCTYPE html>
 	    let priceChart = null;
 	    let activeTab = "standard";
 	    let selectedItemId = null;
+	    const DEFAULT_PRICE_SERIES_TOGGLES = {
+	      avgHigh: false,
+	      avgLow: false,
+	      highVol: false,
+	      lowVol: false
+	    };
+	    let priceSeriesToggles = Object.assign({}, DEFAULT_PRICE_SERIES_TOGGLES);
     // Ranking pagination
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
@@ -911,26 +942,82 @@ const HTML = `<!DOCTYPE html>
 	    function syncForecastVisibilityForTab(tabName) {
 	      if (!priceChart || !priceChart.data) return;
 	      const hideForecast = tabName === "peaks";
-	      const showVolume = tabName === "peaks";
+	      const showDefaultVolume = tabName === "peaks";
+	      const showExtraVolume =
+	        priceSeriesToggles &&
+	        (priceSeriesToggles.highVol || priceSeriesToggles.lowVol);
+	      const showVolumeAxis = showDefaultVolume || showExtraVolume;
 	      const datasets = Array.isArray(priceChart.data.datasets)
 	        ? priceChart.data.datasets
 	        : [];
 	      let changed = false;
 	      datasets.forEach((ds) => {
 	        if (!ds || typeof ds.label !== "string") return;
-	        const isForecast = ds.label.startsWith("Forecast");
-	        if (!isForecast) return;
-	        if (Boolean(ds.hidden) !== hideForecast) {
-	          ds.hidden = hideForecast;
-	          changed = true;
-	        }
-	      });
+	        const key = ds.seriesKey || null;
 
-	      datasets.forEach((ds) => {
-	        if (!ds || ds.yAxisID !== "yVolume") return;
-	        if (Boolean(ds.hidden) === showVolume) {
-	          ds.hidden = !showVolume;
-	          changed = true;
+	        if (key === "forecast_current" || key === "forecast_pin") {
+	          if (Boolean(ds.hidden) !== hideForecast) {
+	            ds.hidden = hideForecast;
+	            changed = true;
+	          }
+	          return;
+	        }
+	        if (!key && ds.label.startsWith("Forecast")) {
+	          if (Boolean(ds.hidden) !== hideForecast) {
+	            ds.hidden = hideForecast;
+	            changed = true;
+	          }
+	          return;
+	        }
+
+	        if (key === "volume_total") {
+	          const wantHidden = !showDefaultVolume;
+	          if (Boolean(ds.hidden) !== wantHidden) {
+	            ds.hidden = wantHidden;
+	            changed = true;
+	          }
+	          return;
+	        }
+	        if (!key && ds.yAxisID === "yVolume" && ds.label === "Volume (per bucket)") {
+	          const wantHidden = !showDefaultVolume;
+	          if (Boolean(ds.hidden) !== wantHidden) {
+	            ds.hidden = wantHidden;
+	            changed = true;
+	          }
+	          return;
+	        }
+
+	        if (key === "avg_high") {
+	          const wantHidden = !priceSeriesToggles.avgHigh;
+	          if (Boolean(ds.hidden) !== wantHidden) {
+	            ds.hidden = wantHidden;
+	            changed = true;
+	          }
+	          return;
+	        }
+	        if (key === "avg_low") {
+	          const wantHidden = !priceSeriesToggles.avgLow;
+	          if (Boolean(ds.hidden) !== wantHidden) {
+	            ds.hidden = wantHidden;
+	            changed = true;
+	          }
+	          return;
+	        }
+	        if (key === "high_vol") {
+	          const wantHidden = !priceSeriesToggles.highVol;
+	          if (Boolean(ds.hidden) !== wantHidden) {
+	            ds.hidden = wantHidden;
+	            changed = true;
+	          }
+	          return;
+	        }
+	        if (key === "low_vol") {
+	          const wantHidden = !priceSeriesToggles.lowVol;
+	          if (Boolean(ds.hidden) !== wantHidden) {
+	            ds.hidden = wantHidden;
+	            changed = true;
+	          }
+	          return;
 	        }
 	      });
 
@@ -940,8 +1027,8 @@ const HTML = `<!DOCTYPE html>
 	        priceChart.options.scales.yVolume
 	      ) {
 	        const yVol = priceChart.options.scales.yVolume;
-	        if (Boolean(yVol.display) !== showVolume) {
-	          yVol.display = showVolume;
+	        if (Boolean(yVol.display) !== showVolumeAxis) {
+	          yVol.display = showVolumeAxis;
 	          changed = true;
 	        }
 	      }
@@ -1026,6 +1113,61 @@ const HTML = `<!DOCTYPE html>
 	      } catch (err) {
 	        console.warn("Failed to save pin state:", err);
 	      }
+	    }
+
+	    function loadPriceSeriesToggles() {
+	      try {
+	        const raw = window.localStorage.getItem(PRICE_SERIES_TOGGLES_KEY);
+	        if (!raw) return Object.assign({}, DEFAULT_PRICE_SERIES_TOGGLES);
+	        const obj = JSON.parse(raw);
+	        if (!obj || typeof obj !== "object") {
+	          return Object.assign({}, DEFAULT_PRICE_SERIES_TOGGLES);
+	        }
+	        const out = Object.assign({}, DEFAULT_PRICE_SERIES_TOGGLES);
+	        Object.keys(out).forEach((k) => {
+	          if (typeof obj[k] === "boolean") {
+	            out[k] = obj[k];
+	          }
+	        });
+	        return out;
+	      } catch (err) {
+	        console.warn("Failed to parse price series toggles:", err);
+	        return Object.assign({}, DEFAULT_PRICE_SERIES_TOGGLES);
+	      }
+	    }
+
+	    function savePriceSeriesToggles(next) {
+	      try {
+	        window.localStorage.setItem(
+	          PRICE_SERIES_TOGGLES_KEY,
+	          JSON.stringify(next || {})
+	        );
+	      } catch (_) {}
+	    }
+
+	    function updatePriceSeriesToggleButtons() {
+	      if (!priceSeriesToggleButtons || !priceSeriesToggleButtons.length) return;
+	      priceSeriesToggleButtons.forEach((btn) => {
+	        if (!btn) return;
+	        const k = btn.dataset.seriesToggle;
+	        if (!k || !(k in DEFAULT_PRICE_SERIES_TOGGLES)) return;
+	        btn.classList.toggle("active", Boolean(priceSeriesToggles[k]));
+	      });
+	    }
+
+	    priceSeriesToggles = loadPriceSeriesToggles();
+	    updatePriceSeriesToggleButtons();
+	    if (priceSeriesToggleButtons && priceSeriesToggleButtons.length) {
+	      priceSeriesToggleButtons.forEach((btn) => {
+	        btn.addEventListener("click", () => {
+	          const k = btn && btn.dataset ? btn.dataset.seriesToggle : null;
+	          if (!k || !(k in DEFAULT_PRICE_SERIES_TOGGLES)) return;
+	          priceSeriesToggles[k] = !priceSeriesToggles[k];
+	          savePriceSeriesToggles(priceSeriesToggles);
+	          updatePriceSeriesToggleButtons();
+	          syncForecastVisibilityForTab(activeTab);
+	        });
+	      });
 	    }
 
 	    function loadPeaksWeights() {
@@ -2586,6 +2728,10 @@ const HTML = `<!DOCTYPE html>
 	      const tsSet = new Set();
 	      const histMap = new Map();
 	      const volMap = new Map();
+	      const avgHighMap = new Map();
+	      const avgLowMap = new Map();
+	      const highVolMap = new Map();
+	      const lowVolMap = new Map();
       const fcMap = new Map();
       const oldFcMap = new Map();
 
@@ -2604,6 +2750,42 @@ const HTML = `<!DOCTYPE html>
         histMap.set(ts, pt.price);
         if (pt.volume != null && Number.isFinite(pt.volume)) {
           volMap.set(ts, pt.volume);
+        }
+
+        const avgHighRaw =
+          pt.avg_high_price != null ? pt.avg_high_price : pt.avgHighPrice;
+        if (avgHighRaw != null) {
+          const n = Number(avgHighRaw);
+          if (Number.isFinite(n) && n > 0) {
+            avgHighMap.set(ts, n);
+          }
+        }
+
+        const avgLowRaw =
+          pt.avg_low_price != null ? pt.avg_low_price : pt.avgLowPrice;
+        if (avgLowRaw != null) {
+          const n = Number(avgLowRaw);
+          if (Number.isFinite(n) && n > 0) {
+            avgLowMap.set(ts, n);
+          }
+        }
+
+        const highVolRaw =
+          pt.high_volume != null ? pt.high_volume : pt.highPriceVolume;
+        if (highVolRaw != null) {
+          const n = Number(highVolRaw);
+          if (Number.isFinite(n) && n >= 0) {
+            highVolMap.set(ts, n);
+          }
+        }
+
+        const lowVolRaw =
+          pt.low_volume != null ? pt.low_volume : pt.lowPriceVolume;
+        if (lowVolRaw != null) {
+          const n = Number(lowVolRaw);
+          if (Number.isFinite(n) && n >= 0) {
+            lowVolMap.set(ts, n);
+          }
         }
       });
 
@@ -2680,6 +2862,10 @@ const HTML = `<!DOCTYPE html>
 
       const histData = [];
       const volumeData = [];
+      const avgHighData = [];
+      const avgLowData = [];
+      const highVolData = [];
+      const lowVolData = [];
       const fcData = [];
       const oldFcData = [];
       const starMarkerData = [];
@@ -2688,6 +2874,10 @@ const HTML = `<!DOCTYPE html>
       tsList.forEach(function (ts) {
         histData.push(histMap.has(ts) ? histMap.get(ts) : null);
         volumeData.push(volMap.has(ts) ? volMap.get(ts) : null);
+        avgHighData.push(avgHighMap.has(ts) ? avgHighMap.get(ts) : null);
+        avgLowData.push(avgLowMap.has(ts) ? avgLowMap.get(ts) : null);
+        highVolData.push(highVolMap.has(ts) ? highVolMap.get(ts) : null);
+        lowVolData.push(lowVolMap.has(ts) ? lowVolMap.get(ts) : null);
 
         const isFutureOrNow = nowTs == null || ts >= nowTs;
         fcData.push(isFutureOrNow && fcMap.has(ts) ? fcMap.get(ts) : null);
@@ -2709,6 +2899,10 @@ const HTML = `<!DOCTYPE html>
 		        labels,
 		        histData,
 		        volumeData,
+		        avgHighData,
+		        avgLowData,
+		        highVolData,
+		        lowVolData,
 		        fcData,
 		        oldFcData,
 		        starMarkerData,
@@ -3333,6 +3527,10 @@ const HTML = `<!DOCTYPE html>
 	        const labels = tl.labels;
 	        const histData = tl.histData;
 		        const volumeData = tl.volumeData;
+		        const avgHighData = tl.avgHighData;
+		        const avgLowData = tl.avgLowData;
+		        const highVolData = tl.highVolData;
+		        const lowVolData = tl.lowVolData;
 		        const fcData = tl.fcData;
 		        const oldFcData = tl.oldFcData;
 		        const starMarkerData = tl.starMarkerData;
@@ -3382,6 +3580,8 @@ const HTML = `<!DOCTYPE html>
 
 		        const allPrices = []
 		          .concat(histData)
+		          .concat(Array.isArray(avgHighData) ? avgHighData : [])
+		          .concat(Array.isArray(avgLowData) ? avgLowData : [])
 		          .concat(showForecast ? oldFcData : [])
 		          .concat(showForecast ? fcData : [])
 	          .filter((v) => v != null && Number.isFinite(v));
@@ -3476,6 +3676,7 @@ const HTML = `<!DOCTYPE html>
 	        const peakLineColor = "rgba(16,185,129,1)";
 
 	        const historyDataset = {
+	          seriesKey: "mid",
 	          label: "Historical mid price (5m last 24h, 30m older)",
 	          data: histData,
 	          borderColor: historyLineColor,
@@ -3501,7 +3702,38 @@ const HTML = `<!DOCTYPE html>
 	        }
 
 	        const showVolumeLine = activeTab === "peaks";
+	        const showVolumeAxis =
+	          showVolumeLine ||
+	          (priceSeriesToggles.highVol || priceSeriesToggles.lowVol);
+
+	        const avgHighDataset = {
+	          seriesKey: "avg_high",
+	          label: "Avg high price",
+	          data: avgHighData,
+	          borderColor: "rgba(239,68,68,0.95)",
+	          backgroundColor: "rgba(239,68,68,0.12)",
+	          pointRadius: 0,
+	          borderWidth: 1.5,
+	          tension: 0.15,
+	          spanGaps: true,
+	          hidden: !priceSeriesToggles.avgHigh
+	        };
+
+	        const avgLowDataset = {
+	          seriesKey: "avg_low",
+	          label: "Avg low price",
+	          data: avgLowData,
+	          borderColor: "rgba(168,85,247,0.95)",
+	          backgroundColor: "rgba(168,85,247,0.12)",
+	          pointRadius: 0,
+	          borderWidth: 1.5,
+	          tension: 0.15,
+	          spanGaps: true,
+	          hidden: !priceSeriesToggles.avgLow
+	        };
+
 	        const volumeDataset = {
+	          seriesKey: "volume_total",
 	          label: "Volume (per bucket)",
 	          data: volumeData,
 	          yAxisID: "yVolume",
@@ -3514,10 +3746,46 @@ const HTML = `<!DOCTYPE html>
 	          hidden: !showVolumeLine
 	        };
 
-	        const datasets = [historyDataset, volumeDataset];
+	        const highVolDataset = {
+	          seriesKey: "high_vol",
+	          label: "High volume",
+	          data: highVolData,
+	          yAxisID: "yVolume",
+	          borderColor: "rgba(251,146,60,0.95)",
+	          backgroundColor: "rgba(251,146,60,0.12)",
+	          pointRadius: 0,
+	          borderWidth: 1,
+	          tension: 0.15,
+	          spanGaps: true,
+	          hidden: !priceSeriesToggles.highVol
+	        };
+
+	        const lowVolDataset = {
+	          seriesKey: "low_vol",
+	          label: "Low volume",
+	          data: lowVolData,
+	          yAxisID: "yVolume",
+	          borderColor: "rgba(56,189,248,0.95)",
+	          backgroundColor: "rgba(56,189,248,0.12)",
+	          pointRadius: 0,
+	          borderWidth: 1,
+	          tension: 0.15,
+	          spanGaps: true,
+	          hidden: !priceSeriesToggles.lowVol
+	        };
+
+	        const datasets = [
+	          historyDataset,
+	          avgHighDataset,
+	          avgLowDataset,
+	          volumeDataset,
+	          highVolDataset,
+	          lowVolDataset
+	        ];
 
 	        if (showForecast && starInfo && oldFcData.some((v) => v != null)) {
 	          datasets.push({
+	            seriesKey: "forecast_pin",
 	            label: "Forecast at pin time",
 	            data: oldFcData,
 	            borderColor: "rgba(234,179,8,1)",
@@ -3534,6 +3802,7 @@ const HTML = `<!DOCTYPE html>
 	          showForecast && fcData.some((v) => v != null && Number.isFinite(v));
 	        if (hasCurrentForecastData) {
 	          datasets.push({
+	            seriesKey: "forecast_current",
 	            label: "Forecast price (next 2h, 5m steps)",
 	            data: fcData,
 	            borderColor: "rgba(16,185,129,1)",
@@ -3548,6 +3817,7 @@ const HTML = `<!DOCTYPE html>
 
 	        if (showForecast && starInfo && starMarkerData.some((v) => v != null)) {
 	          datasets.push({
+	            seriesKey: "marker_pin",
 	            label: "Pin time",
 	            data: starMarkerData,
 	            borderColor: "rgba(250,204,21,1)",
@@ -3560,6 +3830,7 @@ const HTML = `<!DOCTYPE html>
 
 	        if (nowMarkerData.some((v) => v != null)) {
 	          datasets.push({
+	            seriesKey: "marker_now",
 	            label: "Now",
             data: nowMarkerData,
             borderColor: "rgba(248,250,252,1)",
@@ -3616,7 +3887,7 @@ const HTML = `<!DOCTYPE html>
                 }
               },
               yVolume: {
-                display: showVolumeLine,
+                display: showVolumeAxis,
                 position: "right",
                 beginAtZero: true,
                 grid: {
@@ -3663,7 +3934,16 @@ const HTML = `<!DOCTYPE html>
 	                      typeof legendItem.datasetIndex === "number"
 	                        ? data.datasets[legendItem.datasetIndex]
 	                        : null;
-	                    if (ds && ds.yAxisID === "yVolume") return activeTab === "peaks";
+	                    if (ds && ds.yAxisID === "yVolume") {
+	                      const key = ds.seriesKey || "";
+	                      if (activeTab === "peaks") {
+	                        if (key === "volume_total") return true;
+	                      }
+	                      return (
+	                        (key === "high_vol" && priceSeriesToggles.highVol) ||
+	                        (key === "low_vol" && priceSeriesToggles.lowVol)
+	                      );
+	                    }
 	                    return true;
 	                  }
 	                }
@@ -4147,7 +4427,11 @@ function maybeAppendLatestFiveMinute(history, latestSnap, itemId) {
     {
       timestamp_iso: iso,
       price: mid,
-      volume: volume
+      volume: volume,
+      avg_high_price: ah,
+      avg_low_price: al,
+      high_volume: highVol,
+      low_volume: lowVol
     }
   ]);
   return { history: newHistory, added: true, latestIso: iso };
@@ -4272,7 +4556,7 @@ async function handleDaily(env) {
 
 // Load precomputed per-item history from R2: history/{itemId}.json
 async function loadPrecomputedHistory(env, itemId) {
-    const key = "history/" + itemId + ".json";
+  const key = "history/" + itemId + ".json";
   const obj = await bucketGetWithRetry(env, key, { attempts: 2, baseDelayMs: 150 });
   if (!obj) {
     return { history: [], found: false };
@@ -4283,6 +4567,16 @@ async function loadPrecomputedHistory(env, itemId) {
     const parsed = JSON.parse(text);
     const raw = Array.isArray(parsed.history) ? parsed.history : [];
 
+    function asPositiveNumber(v) {
+      const n = typeof v === "number" ? v : Number(v);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    function asNonNegativeNumber(v) {
+      const n = typeof v === "number" ? v : Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    }
+
     const cleaned = raw
       .map((pt) => {
         const iso =
@@ -4292,11 +4586,30 @@ async function loadPrecomputedHistory(env, itemId) {
           typeof pt.price === "number" && Number.isFinite(pt.price)
             ? pt.price
             : NaN;
-        const volume =
+        let volume =
           typeof pt.volume === "number" && Number.isFinite(pt.volume)
             ? pt.volume
             : null;
-        return { ts, iso, price, volume };
+
+        const avgHigh = asPositiveNumber(
+          pt.avg_high_price != null ? pt.avg_high_price : pt.avgHighPrice
+        );
+        const avgLow = asPositiveNumber(
+          pt.avg_low_price != null ? pt.avg_low_price : pt.avgLowPrice
+        );
+
+        const highVol = asNonNegativeNumber(
+          pt.high_volume != null ? pt.high_volume : pt.highPriceVolume
+        );
+        const lowVol = asNonNegativeNumber(
+          pt.low_volume != null ? pt.low_volume : pt.lowPriceVolume
+        );
+
+        if (volume == null && (highVol != null || lowVol != null)) {
+          volume = Number(highVol || 0) + Number(lowVol || 0);
+        }
+
+        return { ts, iso, price, volume, avgHigh, avgLow, highVol, lowVol };
       })
       .filter(
         (pt) =>
@@ -4310,7 +4623,11 @@ async function loadPrecomputedHistory(env, itemId) {
       .map((pt) => ({
         timestamp_iso: new Date(pt.ts).toISOString(),
         price: pt.price,
-        volume: pt.volume
+        volume: pt.volume,
+        avg_high_price: pt.avgHigh,
+        avg_low_price: pt.avgLow,
+        high_volume: pt.highVol,
+        low_volume: pt.lowVol
       }));
 
     return { history: cleaned, found: cleaned.length > 0 };
