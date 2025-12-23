@@ -144,7 +144,11 @@ def compute_catching_peaks_metric(
     prices = np.array([p for _, p, _ in pts], dtype="float64")
 
     mean_price = float(np.mean(prices))
-    variance = float(np.mean(np.abs(prices - mean_price))) if np.isfinite(mean_price) else float("nan")
+    variance = (
+        float(np.mean(np.sqrt(np.abs(prices - mean_price))))
+        if np.isfinite(mean_price)
+        else float("nan")
+    )
     variance_pct = (
         float(variance) / float(mean_price) * 100.0
         if np.isfinite(variance) and np.isfinite(mean_price) and mean_price > 0
