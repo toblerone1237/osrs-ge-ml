@@ -157,6 +157,30 @@ const HTML = `<!DOCTYPE html>
     .search-row button:hover {
       background: #1f2937;
     }
+    .range-filter {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.5rem;
+    }
+    .range-filter label {
+      color: #9ca3af;
+      font-size: 0.85rem;
+      user-select: none;
+      white-space: nowrap;
+    }
+    .range-filter input[type="range"] {
+      width: 240px;
+      max-width: 100%;
+    }
+    .range-value {
+      font-variant-numeric: tabular-nums;
+      color: #e5e7eb;
+      min-width: 3.5ch;
+      text-align: right;
+      user-select: none;
+    }
     .pinned-list table {
       font-size: 0.8rem;
     }
@@ -481,6 +505,11 @@ const HTML = `<!DOCTYPE html>
           Click the ★ column to pin an item. Pins persist across refreshes.<br/>
           Regime column: H = high-value (≥100k), M = mid-value (10k–100k), L = low-value (&lt;10k, noisier / experimental).
         </div>
+        <div class="range-filter">
+          <label for="volumeCoverageMinPct">Min non-zero volume coverage (history window):</label>
+          <input id="volumeCoverageMinPct" type="range" min="0" max="100" value="0" step="1" />
+          <span id="volumeCoverageMinPctValue" class="range-value">0%</span>
+        </div>
         <div id="tableContainer">Waiting for data...</div>
       </div>
 
@@ -592,6 +621,10 @@ const HTML = `<!DOCTYPE html>
     const priceSeriesToggleButtons = Array.from(
       document.querySelectorAll("[data-series-toggle]")
     );
+    const volumeCoverageMinPctEl = document.getElementById("volumeCoverageMinPct");
+    const volumeCoverageMinPctValueEl = document.getElementById(
+      "volumeCoverageMinPctValue"
+    );
 
     const searchInput = document.getElementById("searchInput");
     const searchButton = document.getElementById("searchButton");
@@ -617,6 +650,7 @@ const HTML = `<!DOCTYPE html>
 		    const PIN_KEY = "osrs_ge_pins_v3";
 		    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
 		    const PRICE_SERIES_TOGGLES_KEY = "osrs_ge_price_series_toggles_v1";
+		    const VOLUME_COVERAGE_MIN_KEY = "osrs_ge_volume_coverage_min_pct_v1";
 		    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
 		    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
 		    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
@@ -638,6 +672,9 @@ const HTML = `<!DOCTYPE html>
 	      lowVol: false
 	    };
 	    let priceSeriesToggles = Object.assign({}, DEFAULT_PRICE_SERIES_TOGGLES);
+	    let volumeCoveragePctById = new Map();
+	    let hasVolumeCoverage = false;
+	    let minVolumeCoveragePct = 0;
     // Ranking pagination
     let rankingPageSize = 10;
     let rankingCurrentPage = 1;
@@ -1167,6 +1204,46 @@ const HTML = `<!DOCTYPE html>
 	          updatePriceSeriesToggleButtons();
 	          syncForecastVisibilityForTab(activeTab);
 	        });
+	      });
+	    }
+
+	    function loadVolumeCoverageMinPct() {
+	      try {
+	        const raw = window.localStorage.getItem(VOLUME_COVERAGE_MIN_KEY);
+	        if (raw == null) return 0;
+	        return Math.round(clampNumber(raw, 0, 100));
+	      } catch (_) {
+	        return 0;
+	      }
+	    }
+
+	    function saveVolumeCoverageMinPct(v) {
+	      try {
+	        window.localStorage.setItem(VOLUME_COVERAGE_MIN_KEY, String(v));
+	      } catch (_) {}
+	    }
+
+	    function updateVolumeCoverageFilterUi() {
+	      const v = Math.round(clampNumber(minVolumeCoveragePct, 0, 100));
+	      if (volumeCoverageMinPctEl) {
+	        volumeCoverageMinPctEl.disabled = !hasVolumeCoverage;
+	        volumeCoverageMinPctEl.value = String(v);
+	      }
+	      if (volumeCoverageMinPctValueEl) {
+	        volumeCoverageMinPctValueEl.textContent = hasVolumeCoverage ? v + "%" : "n/a";
+	      }
+	    }
+
+	    minVolumeCoveragePct = loadVolumeCoverageMinPct();
+	    updateVolumeCoverageFilterUi();
+	    if (volumeCoverageMinPctEl) {
+	      volumeCoverageMinPctEl.addEventListener("input", (ev) => {
+	        if (!hasVolumeCoverage) return;
+	        minVolumeCoveragePct = Math.round(clampNumber(ev.target.value, 0, 100));
+	        saveVolumeCoverageMinPct(minVolumeCoveragePct);
+	        updateVolumeCoverageFilterUi();
+	        rankingCurrentPage = 1;
+	        renderTopTable();
 	      });
 	    }
 
@@ -1725,6 +1802,10 @@ const HTML = `<!DOCTYPE html>
             Math.max(0, profit) *
             Math.max(1e-3, liqScore || 1) *
             Math.max(0.1, regimePenalty || 1);
+
+          const volumeCoveragePct = hasVolumeCoverage
+            ? volumeCoveragePctById.get(Number(id)) ?? 0
+            : null;
     
           return {
             raw: s,
@@ -1734,6 +1815,7 @@ const HTML = `<!DOCTYPE html>
             profit,
             gpPerHour,
             volWindow,
+            volumeCoveragePct,
             holdMinutes:
               typeof s.hold_minutes === "number" ? s.hold_minutes : null,
             regime,
@@ -1747,7 +1829,12 @@ const HTML = `<!DOCTYPE html>
         .filter(
           (row) =>
             Number.isFinite(row.combinedScore) &&
-            row.recommendedNotional > 0
+            row.recommendedNotional > 0 &&
+            (!hasVolumeCoverage ||
+              !(minVolumeCoveragePct > 0) ||
+              (row.volumeCoveragePct != null &&
+                Number.isFinite(row.volumeCoveragePct) &&
+                row.volumeCoveragePct >= minVolumeCoveragePct))
         );
     
 	      rows.sort((a, b) => b.combinedScore - a.combinedScore);
@@ -4137,11 +4224,12 @@ const HTML = `<!DOCTYPE html>
 
     async function loadOverview() {
       try {
-        statusEl.textContent = "Fetching /signals and /daily...";
+        statusEl.textContent = "Fetching /signals, /daily, and /history-coverage...";
 
-        const [sigRes, dailyRes] = await Promise.all([
+        const [sigRes, dailyRes, coverageRes] = await Promise.all([
           fetch("/signals"),
-          fetch("/daily")
+          fetch("/daily"),
+          fetch("/history-coverage")
         ]);
 
         if (!sigRes.ok) {
@@ -4167,6 +4255,33 @@ const HTML = `<!DOCTYPE html>
 	          mappingList = [];
 	          volumes24hById = new Map();
 	        }
+
+	        volumeCoveragePctById = new Map();
+	        hasVolumeCoverage = false;
+	        if (coverageRes && coverageRes.ok) {
+	          try {
+	            const coverageJson = await coverageRes.json();
+	            const coverageObj =
+	              coverageJson &&
+	              coverageJson.coverage_pct_by_item_id &&
+	              typeof coverageJson.coverage_pct_by_item_id === "object"
+	                ? coverageJson.coverage_pct_by_item_id
+	                : null;
+	            if (coverageObj) {
+	              for (const [k, v] of Object.entries(coverageObj)) {
+	                const id = Number(k);
+	                const pct = Number(v);
+	                if (!Number.isFinite(id) || id <= 0) continue;
+	                if (!Number.isFinite(pct) || pct < 0) continue;
+	                volumeCoveragePctById.set(id, Math.min(100, pct));
+	              }
+	              hasVolumeCoverage = volumeCoveragePctById.size > 0;
+	            }
+	          } catch (err) {
+	            console.warn("Failed to parse history coverage:", err);
+	          }
+	        }
+	        updateVolumeCoverageFilterUi();
 
         statusEl.textContent = "";
         metaEl.textContent =
@@ -4258,6 +4373,12 @@ let LAST_PEAKS_JSON = null;
 let LAST_PEAKS_FETCHED_AT = 0;
 // Catching-peaks signals are precomputed by the Python agent and stored in R2
 // at signals/peaks/latest.json.
+
+const COVERAGE_CACHE_TTL_MS = 15 * 60 * 1000;
+let LAST_COVERAGE_JSON = null;
+let LAST_COVERAGE_FETCHED_AT = 0;
+// Volume-coverage stats are precomputed by the Python agent and stored in R2
+// at history/_coverage.json.
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -4480,6 +4601,36 @@ function setCachedPriceSeries(cacheKey, payload) {
       PRICE_CACHE.delete(oldestKey);
     }
   }
+}
+
+async function handleHistoryCoverage(env) {
+  const now = Date.now();
+  if (LAST_COVERAGE_JSON && now - LAST_COVERAGE_FETCHED_AT < COVERAGE_CACHE_TTL_MS) {
+    return new Response(LAST_COVERAGE_JSON, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const obj = await bucketGetWithRetry(env, "history/_coverage.json", {
+    attempts: 2,
+    baseDelayMs: 150
+  });
+  if (!obj) {
+    return new Response(JSON.stringify({ error: "No history coverage found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const text = await obj.text();
+  LAST_COVERAGE_JSON = text;
+  LAST_COVERAGE_FETCHED_AT = Date.now();
+
+  return new Response(text, {
+    status: 200,
+    headers: { "Content-Type": "application/json" }
+  });
 }
 
 async function handleCatchingPeaks(env) {
@@ -4781,6 +4932,10 @@ export default {
 
     if (url.pathname === "/daily") {
       return handleDaily(env);
+    }
+
+    if (url.pathname === "/history-coverage") {
+      return handleHistoryCoverage(env);
     }
 
     if (url.pathname === "/price-series") {

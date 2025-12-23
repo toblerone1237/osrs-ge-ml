@@ -21,6 +21,7 @@ SNAPSHOT_FETCH_WORKERS = int(os.environ.get("SNAPSHOT_FETCH_WORKERS", "8"))
 
 # Metadata key to track the last processed snapshot
 HISTORY_META_KEY = "history/_meta.json"
+HISTORY_COVERAGE_KEY = "history/_coverage.json"
 HISTORY_FETCH_WORKERS = int(os.environ.get("HISTORY_FETCH_WORKERS", "16"))
 HISTORY_WRITE_WORKERS = int(os.environ.get("HISTORY_WRITE_WORKERS", "16"))
 
@@ -74,6 +75,59 @@ def save_history_meta(s3, bucket: str, meta: dict):
     s3.put_object(Bucket=bucket, Key=HISTORY_META_KEY, Body=body)
 
 
+def save_history_coverage(s3, bucket: str, coverage: dict):
+    body = json.dumps(coverage).encode("utf-8")
+    s3.put_object(
+        Bucket=bucket,
+        Key=HISTORY_COVERAGE_KEY,
+        Body=body,
+        ContentType="application/json",
+    )
+
+
+def history_coverage_exists(s3, bucket: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=HISTORY_COVERAGE_KEY)
+        return True
+    except Exception:
+        return False
+
+
+def parse_5m_key_to_unix(key: str) -> int | None:
+    try:
+        parts = key.split("/")
+        if len(parts) < 5:
+            return None
+        year = int(parts[1])
+        month = int(parts[2])
+        day = int(parts[3])
+        hm = os.path.splitext(parts[4])[0]  # HH-mm
+        hour_s, minute_s = hm.split("-", 1)
+        hour = int(hour_s)
+        minute = int(minute_s)
+        dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def compute_global_bucket_counts(keys: list[str], cutoff_oldest_unix: int, cutoff_recent_unix: int):
+    recent_ts = set()
+    old_buckets = set()
+
+    for key in keys:
+        ts = parse_5m_key_to_unix(key)
+        if ts is None or ts < cutoff_oldest_unix:
+            continue
+        if ts >= cutoff_recent_unix:
+            recent_ts.add(ts)
+        else:
+            bucket_sec = (ts // (OLDER_INTERVAL_MIN * 60)) * (OLDER_INTERVAL_MIN * 60)
+            old_buckets.add(bucket_sec)
+
+    return len(recent_ts), len(old_buckets)
+
+
 def load_existing_histories(s3, bucket: str, cutoff_oldest_unix: int, cutoff_recent_unix: int):
     """
     Load existing history files to seed older_buckets/recent_points and record
@@ -86,7 +140,11 @@ def load_existing_histories(s3, bucket: str, cutoff_oldest_unix: int, cutoff_rec
     stored_pairs = {}
 
     history_keys = list_keys_with_prefix(s3, bucket, "history/")
-    history_keys = [k for k in history_keys if k.endswith(".json") and k != HISTORY_META_KEY]
+    history_keys = [
+        k
+        for k in history_keys
+        if k.endswith(".json") and k not in (HISTORY_META_KEY, HISTORY_COVERAGE_KEY)
+    ]
     history_keys.sort()
 
     def parse_pos(v):
@@ -426,6 +484,9 @@ def write_histories(
     recent_points,
     stored_pairs,
     min_allowed_unix: int,
+    cutoff_recent_unix: int,
+    total_recent_buckets: int,
+    total_old_buckets: int,
 ):
     """
     Combine older_buckets & recent_points into full histories
@@ -437,6 +498,8 @@ def write_histories(
 
     to_write = []
     skipped = 0
+    coverage_pct_by_item_id = {}
+    denom_minutes = total_recent_buckets * 5 + total_old_buckets * OLDER_INTERVAL_MIN
 
     for item_id in sorted(all_item_ids):
         pts = []
@@ -489,6 +552,20 @@ def write_histories(
             else:
                 dedup.append((ts, price, volume, avg_high, avg_low, high_vol, low_vol))
                 last_ts = ts
+
+        active_recent = 0
+        active_old = 0
+        for ts, _price, volume, _avg_high, _avg_low, _high_vol, _low_vol in dedup:
+            if volume is None or not math.isfinite(volume) or volume <= 0:
+                continue
+            if ts >= cutoff_recent_unix:
+                active_recent += 1
+            else:
+                active_old += 1
+        active_minutes = active_recent * 5 + active_old * OLDER_INTERVAL_MIN
+        coverage_pct_by_item_id[int(item_id)] = (
+            float(active_minutes) / float(denom_minutes) * 100.0 if denom_minutes > 0 else 0.0
+        )
 
         def same_opt_num(a, b):
             if a is None or b is None:
@@ -557,6 +634,7 @@ def write_histories(
                     print(f"... wrote history for {written} items so far")
 
     print(f"Done. Wrote history for {written} items. Skipped {skipped} unchanged files.")
+    return coverage_pct_by_item_id
 
 
 def main():
@@ -575,6 +653,16 @@ def main():
     all_keys = list_recent_5m_keys(s3, bucket)
     all_keys.sort()
     print("Found", len(all_keys), "5m snapshots in the last", MAX_HISTORY_DAYS, "days.")
+    total_recent_buckets, total_old_buckets = compute_global_bucket_counts(
+        all_keys, cutoff_oldest_unix, cutoff_recent_unix
+    )
+    print(
+        "Bucket coverage denominator:",
+        total_recent_buckets,
+        "recent (5m),",
+        total_old_buckets,
+        "older (30m).",
+    )
 
     force_full_rebuild = os.environ.get("FORCE_FULL_REBUILD", "").strip().lower() in (
         "1",
@@ -611,9 +699,13 @@ def main():
         except Exception:
             meta_schema_version = None
     needs_schema_migration = meta_schema_version != HISTORY_SCHEMA_VERSION
-    if seed_from_existing and not new_keys and not needs_schema_migration:
+    needs_coverage_generation = not history_coverage_exists(s3, bucket)
+
+    if seed_from_existing and not new_keys and not needs_schema_migration and not needs_coverage_generation:
         print("No new snapshots since last_processed_key and schema is up-to-date; skipping rebuild.")
         return
+    if seed_from_existing and not new_keys and not needs_schema_migration and needs_coverage_generation:
+        print("No new snapshots, but history coverage is missing; regenerating from existing history files.")
     if seed_from_existing and not new_keys and needs_schema_migration:
         print("No new snapshots, but history schema changed; migrating existing history files.")
 
@@ -635,16 +727,34 @@ def main():
         recent_points,
     )
 
-    write_histories(
+    coverage_pct_by_item_id = write_histories(
         s3,
         bucket,
         older_buckets,
         recent_points,
         stored_pairs,
         min_allowed_unix,
+        cutoff_recent_unix,
+        total_recent_buckets,
+        total_old_buckets,
     )
 
     if all_keys:
+        coverage_doc = {
+            "generated_at_iso": now.isoformat(),
+            "history_schema_version": HISTORY_SCHEMA_VERSION,
+            "max_history_days": MAX_HISTORY_DAYS,
+            "recent_window_hours": RECENT_WINDOW_HOURS,
+            "older_interval_min": OLDER_INTERVAL_MIN,
+            "cutoff_oldest_iso": cutoff_oldest.isoformat(),
+            "cutoff_recent_iso": cutoff_recent.isoformat(),
+            "total_recent_buckets": int(total_recent_buckets),
+            "total_old_buckets": int(total_old_buckets),
+            "coverage_pct_by_item_id": coverage_pct_by_item_id,
+        }
+        save_history_coverage(s3, bucket, coverage_doc)
+        print("Wrote history coverage metrics to:", HISTORY_COVERAGE_KEY)
+
         new_meta = {
             "last_processed_key": all_keys[-1],
             "generated_at_iso": now.isoformat(),
