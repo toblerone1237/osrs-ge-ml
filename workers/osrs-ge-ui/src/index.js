@@ -546,16 +546,21 @@ const HTML = `<!DOCTYPE html>
 				              Sharpness = average % above the local mean (±3 days) at each peak tip.
 				              Variance = average sqrt(|price − mean|); Variance % = variance ÷ mean × 100.
 				            </div>
-			            <div class="peaks-controls">
-			              <div class="search-row peaks-search-row">
-			                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
-			                <button id="peaksSearchClearBtn" type="button">Clear</button>
-			              </div>
-			              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show As %</button>
-			            </div>
-			            <div id="peaksSearchStatus" class="small"></div>
-			            <div id="peaksTableContainer">Waiting for data...</div>
-			          </div>
+				            <div class="peaks-controls">
+				              <div class="search-row peaks-search-row">
+				                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
+				                <button id="peaksSearchClearBtn" type="button">Clear</button>
+				              </div>
+				              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show As %</button>
+				            </div>
+				            <div class="range-filter">
+				              <label for="peaksVolumeCoverageMinPct">Min non-zero volume coverage (history window):</label>
+				              <input id="peaksVolumeCoverageMinPct" type="range" min="0" max="100" value="0" step="1" />
+				              <span id="peaksVolumeCoverageMinPctValue" class="range-value">0%</span>
+				            </div>
+				            <div id="peaksSearchStatus" class="small"></div>
+				            <div id="peaksTableContainer">Waiting for data...</div>
+				          </div>
 
 	          <div id="peaksChartMount"></div>
 	        </div>
@@ -621,10 +626,16 @@ const HTML = `<!DOCTYPE html>
     const priceSeriesToggleButtons = Array.from(
       document.querySelectorAll("[data-series-toggle]")
     );
-    const volumeCoverageMinPctEl = document.getElementById("volumeCoverageMinPct");
-    const volumeCoverageMinPctValueEl = document.getElementById(
-      "volumeCoverageMinPctValue"
-    );
+	    const volumeCoverageMinPctEl = document.getElementById("volumeCoverageMinPct");
+	    const volumeCoverageMinPctValueEl = document.getElementById(
+	      "volumeCoverageMinPctValue"
+	    );
+	    const peaksVolumeCoverageMinPctEl = document.getElementById(
+	      "peaksVolumeCoverageMinPct"
+	    );
+	    const peaksVolumeCoverageMinPctValueEl = document.getElementById(
+	      "peaksVolumeCoverageMinPctValue"
+	    );
 
     const searchInput = document.getElementById("searchInput");
     const searchButton = document.getElementById("searchButton");
@@ -1223,29 +1234,44 @@ const HTML = `<!DOCTYPE html>
 	      } catch (_) {}
 	    }
 
-	    function updateVolumeCoverageFilterUi() {
-	      const v = Math.round(clampNumber(minVolumeCoveragePct, 0, 100));
-	      if (volumeCoverageMinPctEl) {
-	        volumeCoverageMinPctEl.disabled = !hasVolumeCoverage;
-	        volumeCoverageMinPctEl.value = String(v);
-	      }
-	      if (volumeCoverageMinPctValueEl) {
-	        volumeCoverageMinPctValueEl.textContent = hasVolumeCoverage ? v + "%" : "n/a";
-	      }
-	    }
+		    function updateVolumeCoverageFilterUi() {
+		      const v = Math.round(clampNumber(minVolumeCoveragePct, 0, 100));
+		      if (volumeCoverageMinPctEl) {
+		        volumeCoverageMinPctEl.disabled = !hasVolumeCoverage;
+		        volumeCoverageMinPctEl.value = String(v);
+		      }
+		      if (volumeCoverageMinPctValueEl) {
+		        volumeCoverageMinPctValueEl.textContent = hasVolumeCoverage ? v + "%" : "n/a";
+		      }
+		      if (peaksVolumeCoverageMinPctEl) {
+		        peaksVolumeCoverageMinPctEl.disabled = !hasVolumeCoverage;
+		        peaksVolumeCoverageMinPctEl.value = String(v);
+		      }
+		      if (peaksVolumeCoverageMinPctValueEl) {
+		        peaksVolumeCoverageMinPctValueEl.textContent = hasVolumeCoverage ? v + "%" : "n/a";
+		      }
+		    }
 
-	    minVolumeCoveragePct = loadVolumeCoverageMinPct();
-	    updateVolumeCoverageFilterUi();
-	    if (volumeCoverageMinPctEl) {
-	      volumeCoverageMinPctEl.addEventListener("input", (ev) => {
-	        if (!hasVolumeCoverage) return;
-	        minVolumeCoveragePct = Math.round(clampNumber(ev.target.value, 0, 100));
-	        saveVolumeCoverageMinPct(minVolumeCoveragePct);
-	        updateVolumeCoverageFilterUi();
-	        rankingCurrentPage = 1;
-	        renderTopTable();
-	      });
-	    }
+		    minVolumeCoveragePct = loadVolumeCoverageMinPct();
+		    updateVolumeCoverageFilterUi();
+		    function onCoverageSliderInput(ev) {
+		      if (!hasVolumeCoverage) return;
+		      minVolumeCoveragePct = Math.round(clampNumber(ev.target.value, 0, 100));
+		      saveVolumeCoverageMinPct(minVolumeCoveragePct);
+		      updateVolumeCoverageFilterUi();
+		      rankingCurrentPage = 1;
+		      renderTopTable();
+		      if (peaksLoaded) {
+		        peaksCurrentPage = 1;
+		        renderPeaksTable();
+		      }
+		    }
+		    if (volumeCoverageMinPctEl) {
+		      volumeCoverageMinPctEl.addEventListener("input", onCoverageSliderInput);
+		    }
+		    if (peaksVolumeCoverageMinPctEl) {
+		      peaksVolumeCoverageMinPctEl.addEventListener("input", onCoverageSliderInput);
+		    }
 
 	    function loadPeaksWeights() {
 	      try {
@@ -2326,34 +2352,42 @@ const HTML = `<!DOCTYPE html>
 		      peaksSortPaneEl.appendChild(filterBtn);
 		    }
 
-		    function renderPeaksTable() {
-		      if (!peaksTableContainer) return;
-		      if (!peaksItems.length) {
-		        if (peaksSearchStatusEl) peaksSearchStatusEl.textContent = "";
-		        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
-		        return;
-	      }
+			    function renderPeaksTable() {
+			      if (!peaksTableContainer) return;
+			      if (!peaksItems.length) {
+			        if (peaksSearchStatusEl) peaksSearchStatusEl.textContent = "";
+			        peaksTableContainer.textContent = "No catching‑peaks candidates available.";
+			        return;
+		      }
 
-			      const allRows = peaksItems.slice();
-			      const q =
-			        typeof peaksSearchQuery === "string"
-			          ? peaksSearchQuery.trim().toLowerCase()
-			          : "";
-			      let rows = allRows;
-			      if (q) {
-			        rows = allRows.filter((row) => {
-			          const idStr =
-			            row && row.item_id != null ? String(row.item_id) : "";
-			          const name =
-			            row && row.name ? String(row.name).toLowerCase() : "";
-			          return (
-			            (idStr && idStr.includes(q)) ||
-			            (name && name.includes(q))
-			          );
-			        });
-			      }
-			      const pageSize =
-			        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
+				      const allRows = peaksItems.slice();
+				      const hasCoverageFilter = hasVolumeCoverage && minVolumeCoveragePct > 0;
+				      const q =
+				        typeof peaksSearchQuery === "string"
+				          ? peaksSearchQuery.trim().toLowerCase()
+				          : "";
+				      let rows = allRows;
+				      if (q) {
+				        rows = allRows.filter((row) => {
+				          const idStr =
+				            row && row.item_id != null ? String(row.item_id) : "";
+				          const name =
+				            row && row.name ? String(row.name).toLowerCase() : "";
+				          return (
+				            (idStr && idStr.includes(q)) ||
+				            (name && name.includes(q))
+				          );
+				        });
+				      }
+				      if (hasCoverageFilter) {
+				        rows = rows.filter((row) => {
+				          const id = Number(row && row.item_id);
+				          const pct = volumeCoveragePctById.get(id) ?? 0;
+				          return Number.isFinite(pct) && pct >= minVolumeCoveragePct;
+				        });
+				      }
+				      const pageSize =
+				        peaksPageSize && Number.isFinite(peaksPageSize) ? peaksPageSize : 10;
 
 	      const table = document.createElement("table");
 	      const thead = document.createElement("thead");
@@ -2588,25 +2622,28 @@ const HTML = `<!DOCTYPE html>
 			        });
 			      }
 
-			      if (peaksSearchStatusEl) {
-			        const hasSearch = Boolean(q);
-			        const hasFilters = activeFilters.length > 0;
-			        if (!hasSearch && !hasFilters) {
-			          peaksSearchStatusEl.textContent = allRows.length + " items.";
-			        } else {
-			          const parts = [];
-			          if (hasSearch) parts.push("search");
-			          if (hasFilters) {
-			            parts.push(
-			              activeFilters.length +
-			                " column filter" +
-			                (activeFilters.length === 1 ? "" : "s")
-			            );
-			          }
-			          peaksSearchStatusEl.textContent =
-			            "Filtered: " +
-			            rows.length +
-			            " / " +
+				      if (peaksSearchStatusEl) {
+				        const hasSearch = Boolean(q);
+				        const hasFilters = activeFilters.length > 0;
+				        if (!hasSearch && !hasFilters && !hasCoverageFilter) {
+				          peaksSearchStatusEl.textContent = allRows.length + " items.";
+				        } else {
+				          const parts = [];
+				          if (hasSearch) parts.push("search");
+				          if (hasFilters) {
+				            parts.push(
+				              activeFilters.length +
+				                " column filter" +
+				                (activeFilters.length === 1 ? "" : "s")
+				            );
+				          }
+				          if (hasCoverageFilter) {
+				            parts.push("coverage ≥ " + minVolumeCoveragePct + "%");
+				          }
+				          peaksSearchStatusEl.textContent =
+				            "Filtered: " +
+				            rows.length +
+				            " / " +
 			            allRows.length +
 			            " items." +
 			            (parts.length ? " (" + parts.join(", ") + ")" : "");
