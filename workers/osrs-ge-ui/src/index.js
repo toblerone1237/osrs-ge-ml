@@ -2895,16 +2895,34 @@ const HTML = `<!DOCTYPE html>
 			          value: (row) => getTradingCap(row),
 			          format: formatCount
 			        },
-			        {
-			          key: "volume_24h",
-			          header: "Last 24 Trading Volume",
-			          value: (row) => getVolume24h(row),
-			          format: formatCount
-			        },
-			        {
-			          key: "low_avg_price",
-			          header: "Low Average Price",
-	          value: (row) => row.low_avg_price,
+				        {
+				          key: "volume_24h",
+				          header: "Last 24 Trading Volume",
+				          value: (row) => getVolume24h(row),
+				          format: formatCount
+				        },
+				        {
+				          key: "above_mean_avg_price",
+				          header: "Above Mean Average",
+				          value: (row) => row.above_mean_avg_price,
+				          format: formatProfitGp
+				        },
+				        {
+				          key: "below_mean_avg_price",
+				          header: "Below Mean Average",
+				          value: (row) => row.below_mean_avg_price,
+				          format: formatProfitGp
+				        },
+				        {
+				          key: "above_below_diff",
+				          header: "Above-Below Difference",
+				          value: (row) => row.above_below_diff,
+				          format: formatProfitGp
+				        },
+				        {
+				          key: "low_avg_price",
+				          header: "Low Average Price",
+		          value: (row) => row.low_avg_price,
           format: formatProfitGp
         },
         {

@@ -203,6 +203,23 @@ def compute_catching_peaks_metric(
     low_volumes = np.array([lv for _, _, _, _, _, _, lv in side_pts], dtype="float64")
 
     mean_price = float(np.mean(prices))
+    above_mean_avg_price: Optional[float] = None
+    below_mean_avg_price: Optional[float] = None
+    above_below_diff: Optional[float] = None
+    if np.isfinite(mean_price) and mean_price > 0:
+        above_mask = prices > mean_price
+        below_mask = prices < mean_price
+        if int(above_mask.sum()):
+            above_mean_avg_price = float(np.mean(prices[above_mask]))
+        if int(below_mask.sum()):
+            below_mean_avg_price = float(np.mean(prices[below_mask]))
+        if (
+            above_mean_avg_price is not None
+            and below_mean_avg_price is not None
+            and np.isfinite(above_mean_avg_price)
+            and np.isfinite(below_mean_avg_price)
+        ):
+            above_below_diff = float(above_mean_avg_price - below_mean_avg_price)
     variance = (
         float(np.mean(np.sqrt(np.abs(prices - mean_price))))
         if np.isfinite(mean_price)
@@ -657,6 +674,9 @@ def compute_catching_peaks_metric(
             volume24h += vol
 
     return {
+        "above_mean_avg_price": above_mean_avg_price,
+        "below_mean_avg_price": below_mean_avg_price,
+        "above_below_diff": above_below_diff,
         "low_avg_price": low_avg,
         "peak_avg_price": peak_avg,
         "pct_difference": pct_diff,
