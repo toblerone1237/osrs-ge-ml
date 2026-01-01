@@ -14,6 +14,9 @@ WINDOW_DAYS = int(os.getenv("PEAKS_WINDOW_DAYS", "14"))
 BASELINE_HALF_WINDOW_DAYS = int(os.getenv("PEAKS_BASELINE_HALF_WINDOW_DAYS", "3"))
 MAX_ITER = int(os.getenv("PEAKS_EM_MAX_ITER", "15"))
 FETCH_WORKERS = int(os.getenv("PEAKS_FETCH_WORKERS", "16"))
+TAX_RATE = float(os.getenv("PEAKS_TAX_RATE", "0.02"))
+FLIP_BUY_Q = float(os.getenv("PEAKS_FLIP_BUY_Q", "0.10"))
+FLIP_SELL_Q = float(os.getenv("PEAKS_FLIP_SELL_Q", "0.90"))
 
 
 def gaussian_pdf(x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
@@ -99,7 +102,9 @@ def fit_two_gaussian_mixture_log(prices: np.ndarray, max_iter: int = MAX_ITER):
 def compute_catching_peaks_metric(
     history: List[Dict[str, Any]],
     window_days: int = WINDOW_DAYS,
-) -> Optional[Dict[str, float]]:
+    trade_limit_4h: Optional[float] = None,
+    tax_rate: float = TAX_RATE,
+) -> Optional[Dict[str, Any]]:
     if not history or len(history) < 30:
         return None
 
@@ -107,7 +112,30 @@ def compute_catching_peaks_metric(
     cutoff_ms = now_ms - window_days * 86400 * 1000.0
     cutoff24h_ms = now_ms - 24 * 3600 * 1000.0
 
+    def parse_optional_float(v) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        if not np.isfinite(f):
+            return None
+        return float(f)
+
+    def parse_volume(v) -> float:
+        if v is None:
+            return 0.0
+        try:
+            f = float(v)
+        except Exception:
+            return 0.0
+        if not np.isfinite(f) or f < 0:
+            return 0.0
+        return float(f)
+
     pts: List[Tuple[float, float, float]] = []
+    side_pts: List[Tuple[float, float, float, float, float, float, float]] = []
     for pt in history:
         iso = pt.get("timestamp_iso") or pt.get("timestamp")
         if not iso:
@@ -127,14 +155,24 @@ def compute_catching_peaks_metric(
             continue
         if not np.isfinite(price_f) or price_f <= 0:
             continue
-        vol = pt.get("volume", 0.0)
-        try:
-            vol_f = float(vol) if vol is not None else 0.0
-        except Exception:
-            vol_f = 0.0
-        if not np.isfinite(vol_f) or vol_f < 0:
-            vol_f = 0.0
+        vol_f = parse_volume(pt.get("volume", 0.0))
         pts.append((ts, price_f, vol_f))
+
+        avg_high = parse_optional_float(pt.get("avg_high_price"))
+        avg_low = parse_optional_float(pt.get("avg_low_price"))
+        high_vol = parse_volume(pt.get("high_volume"))
+        low_vol = parse_volume(pt.get("low_volume"))
+        side_pts.append(
+            (
+                ts,
+                price_f,
+                vol_f,
+                float(avg_high) if avg_high is not None else float("nan"),
+                float(avg_low) if avg_low is not None else float("nan"),
+                high_vol,
+                low_vol,
+            )
+        )
 
     if len(pts) < 30:
         return None
@@ -142,6 +180,13 @@ def compute_catching_peaks_metric(
     pts.sort(key=lambda x: x[0])
     ts_ms = np.array([ts for ts, _, _ in pts], dtype="float64")
     prices = np.array([p for _, p, _ in pts], dtype="float64")
+
+    # Side-series (if present in history schema v2+): avg_high/avg_low and their volumes.
+    side_pts.sort(key=lambda x: x[0])
+    avg_high_prices = np.array([ah for _, _, _, ah, _, _, _ in side_pts], dtype="float64")
+    avg_low_prices = np.array([al for _, _, _, _, al, _, _ in side_pts], dtype="float64")
+    high_volumes = np.array([hv for _, _, _, _, _, hv, _ in side_pts], dtype="float64")
+    low_volumes = np.array([lv for _, _, _, _, _, _, lv in side_pts], dtype="float64")
 
     mean_price = float(np.mean(prices))
     variance = (
@@ -154,6 +199,160 @@ def compute_catching_peaks_metric(
         if np.isfinite(variance) and np.isfinite(mean_price) and mean_price > 0
         else None
     )
+
+    def unweighted_quantile(x: np.ndarray, q: float) -> Optional[float]:
+        if not np.isfinite(q):
+            return None
+        qq = float(max(0.0, min(1.0, q)))
+        mask = np.isfinite(x) & (x > 0)
+        if not int(mask.sum()):
+            return None
+        return float(np.quantile(x[mask], qq))
+
+    def weighted_quantile(x: np.ndarray, w: np.ndarray, q: float) -> Optional[float]:
+        if not np.isfinite(q):
+            return None
+        qq = float(max(0.0, min(1.0, q)))
+        mask = np.isfinite(x) & (x > 0) & np.isfinite(w) & (w > 0)
+        if not int(mask.sum()):
+            return None
+        xs = x[mask]
+        ws = w[mask]
+        order = np.argsort(xs)
+        xs = xs[order]
+        ws = ws[order]
+        cum = np.cumsum(ws)
+        total = float(cum[-1])
+        if not np.isfinite(total) or total <= 0:
+            return None
+        target = qq * total
+        idx = int(np.searchsorted(cum, target, side="left"))
+        if idx < 0:
+            idx = 0
+        if idx >= int(xs.size):
+            idx = int(xs.size) - 1
+        return float(xs[idx])
+
+    # Flip-oriented metrics: use volume-weighted tails on the buy (avg_low) and sell (avg_high) sides.
+    buy_q = float(max(0.0, min(1.0, FLIP_BUY_Q)))
+    sell_q = float(max(0.0, min(1.0, FLIP_SELL_Q)))
+    flip_buy_price = weighted_quantile(avg_low_prices, low_volumes, buy_q)
+    if flip_buy_price is None:
+        flip_buy_price = unweighted_quantile(avg_low_prices, buy_q)
+    flip_sell_price = weighted_quantile(avg_high_prices, high_volumes, sell_q)
+    if flip_sell_price is None:
+        flip_sell_price = unweighted_quantile(avg_high_prices, sell_q)
+
+    flip_edge_gp: Optional[float] = None
+    flip_edge_pct: Optional[float] = None
+    if (
+        flip_buy_price is not None
+        and flip_sell_price is not None
+        and np.isfinite(flip_buy_price)
+        and np.isfinite(flip_sell_price)
+        and flip_buy_price > 0
+    ):
+        net_sell = float(flip_sell_price) * (1.0 - float(tax_rate))
+        flip_edge_gp = float(net_sell - float(flip_buy_price))
+        flip_edge_pct = float(flip_edge_gp / float(flip_buy_price) * 100.0)
+
+    flip_tail_buy_units_total = 0.0
+    flip_tail_sell_units_total = 0.0
+    if flip_buy_price is not None and np.isfinite(flip_buy_price) and flip_buy_price > 0:
+        buy_mask = np.isfinite(avg_low_prices) & (avg_low_prices > 0) & (avg_low_prices <= float(flip_buy_price))
+        if int(buy_mask.sum()):
+            flip_tail_buy_units_total = float(np.sum(low_volumes[buy_mask]))
+    if flip_sell_price is not None and np.isfinite(flip_sell_price) and flip_sell_price > 0:
+        sell_mask = np.isfinite(avg_high_prices) & (avg_high_prices > 0) & (avg_high_prices >= float(flip_sell_price))
+        if int(sell_mask.sum()):
+            flip_tail_sell_units_total = float(np.sum(high_volumes[sell_mask]))
+
+    denom_days = float(window_days) if window_days > 0 else 1.0
+    flip_tail_buy_units_per_day = float(flip_tail_buy_units_total / denom_days)
+    flip_tail_sell_units_per_day = float(flip_tail_sell_units_total / denom_days)
+
+    flip_flow_balance_pct: Optional[float] = None
+    if flip_tail_buy_units_per_day > 0 or flip_tail_sell_units_per_day > 0:
+        m = max(flip_tail_buy_units_per_day, flip_tail_sell_units_per_day)
+        n = min(flip_tail_buy_units_per_day, flip_tail_sell_units_per_day)
+        if m > 0:
+            flip_flow_balance_pct = float(n / m * 100.0)
+
+    flip_cap_units_per_day: Optional[float] = None
+    if trade_limit_4h is not None:
+        try:
+            lim = float(trade_limit_4h)
+        except Exception:
+            lim = float("nan")
+        if np.isfinite(lim) and lim > 0:
+            flip_cap_units_per_day = float(lim * 6.0)
+
+    flip_units_per_day: Optional[float] = None
+    if flip_tail_buy_units_per_day > 0 or flip_tail_sell_units_per_day > 0:
+        base_units = min(flip_tail_buy_units_per_day, flip_tail_sell_units_per_day)
+        if flip_cap_units_per_day is not None and np.isfinite(flip_cap_units_per_day):
+            flip_units_per_day = float(min(base_units, float(flip_cap_units_per_day)))
+        else:
+            flip_units_per_day = float(base_units)
+
+    flip_expected_gp_per_day: Optional[float] = None
+    if flip_edge_gp is not None and flip_units_per_day is not None:
+        flip_expected_gp_per_day = float(max(0.0, float(flip_edge_gp)) * float(flip_units_per_day))
+
+    spread_pct_mean: Optional[float] = None
+    spread_mask = np.isfinite(avg_high_prices) & (avg_high_prices > 0) & np.isfinite(avg_low_prices) & (avg_low_prices > 0)
+    if int(spread_mask.sum()):
+        mids = (avg_high_prices[spread_mask] + avg_low_prices[spread_mask]) / 2.0
+        valid_mid = np.isfinite(mids) & (mids > 0)
+        if int(valid_mid.sum()):
+            mids = mids[valid_mid]
+            ah = avg_high_prices[spread_mask][valid_mid]
+            al = avg_low_prices[spread_mask][valid_mid]
+            spread_pct = (ah - al) / mids * 100.0
+            weights = high_volumes[spread_mask][valid_mid] + low_volumes[spread_mask][valid_mid]
+            weights = np.where(np.isfinite(weights) & (weights > 0), weights, 0.0)
+            wsum = float(np.sum(weights))
+            if wsum > 0:
+                spread_pct_mean = float(np.sum(spread_pct * weights) / wsum)
+            else:
+                spread_pct_mean = float(np.mean(spread_pct))
+
+    # Cycle stats: how often we see a "tail buy" then later a "tail sell".
+    flip_cycles = 0
+    flip_cycle_durations_ms: List[float] = []
+    if (
+        flip_buy_price is not None
+        and flip_sell_price is not None
+        and np.isfinite(flip_buy_price)
+        and np.isfinite(flip_sell_price)
+        and flip_buy_price > 0
+        and flip_sell_price > 0
+    ):
+        waiting_for = "buy"
+        buy_ts: Optional[float] = None
+        for ts, _, _, ah, al, hv, lv in side_pts:
+            if waiting_for == "buy":
+                if np.isfinite(al) and al > 0 and al <= float(flip_buy_price) and lv > 0:
+                    buy_ts = float(ts)
+                    waiting_for = "sell"
+                continue
+            # waiting_for == "sell"
+            if np.isfinite(ah) and ah > 0 and ah >= float(flip_sell_price) and hv > 0:
+                if buy_ts is not None and np.isfinite(buy_ts) and ts > buy_ts:
+                    flip_cycles += 1
+                    flip_cycle_durations_ms.append(float(ts - buy_ts))
+                buy_ts = None
+                waiting_for = "buy"
+
+    flip_cycles_per_day: Optional[float] = None
+    if flip_cycles > 0 and denom_days > 0:
+        flip_cycles_per_day = float(flip_cycles / denom_days)
+
+    flip_cycle_median_hours: Optional[float] = None
+    if flip_cycle_durations_ms:
+        med_ms = float(np.median(np.array(flip_cycle_durations_ms, dtype="float64")))
+        if np.isfinite(med_ms) and med_ms > 0:
+            flip_cycle_median_hours = float(med_ms / (3600.0 * 1000.0))
 
     fit = fit_two_gaussian_mixture_log(prices, max_iter=MAX_ITER)
     if fit is None:
@@ -415,10 +614,23 @@ def compute_catching_peaks_metric(
         "time_since_last_peak_days": time_since_last_peak_days,
         "avg_time_between_peaks_days": avg_time_between_peaks_days,
         "score": float(score),
+        "flip_buy_price": float(flip_buy_price) if flip_buy_price is not None and np.isfinite(flip_buy_price) else None,
+        "flip_sell_price": float(flip_sell_price) if flip_sell_price is not None and np.isfinite(flip_sell_price) else None,
+        "flip_edge_gp": float(flip_edge_gp) if flip_edge_gp is not None and np.isfinite(flip_edge_gp) else None,
+        "flip_edge_pct": float(flip_edge_pct) if flip_edge_pct is not None and np.isfinite(flip_edge_pct) else None,
+        "flip_tail_buy_units_per_day": float(flip_tail_buy_units_per_day) if np.isfinite(flip_tail_buy_units_per_day) else None,
+        "flip_tail_sell_units_per_day": float(flip_tail_sell_units_per_day) if np.isfinite(flip_tail_sell_units_per_day) else None,
+        "flip_flow_balance_pct": float(flip_flow_balance_pct) if flip_flow_balance_pct is not None and np.isfinite(flip_flow_balance_pct) else None,
+        "flip_units_per_day": float(flip_units_per_day) if flip_units_per_day is not None and np.isfinite(flip_units_per_day) else None,
+        "flip_cap_units_per_day": float(flip_cap_units_per_day) if flip_cap_units_per_day is not None and np.isfinite(flip_cap_units_per_day) else None,
+        "flip_expected_gp_per_day": float(flip_expected_gp_per_day) if flip_expected_gp_per_day is not None and np.isfinite(flip_expected_gp_per_day) else None,
+        "spread_pct_mean": float(spread_pct_mean) if spread_pct_mean is not None and np.isfinite(spread_pct_mean) else None,
+        "flip_cycles_per_day": float(flip_cycles_per_day) if flip_cycles_per_day is not None and np.isfinite(flip_cycles_per_day) else None,
+        "flip_cycle_median_hours": float(flip_cycle_median_hours) if flip_cycle_median_hours is not None and np.isfinite(flip_cycle_median_hours) else None,
     }
 
 
-def load_latest_mapping(s3, bucket) -> Dict[int, str]:
+def load_latest_mapping(s3, bucket) -> Dict[int, Dict[str, Any]]:
     now = datetime.now(timezone.utc)
     for delta in range(7):
         d = now - timedelta(days=delta)
@@ -432,15 +644,26 @@ def load_latest_mapping(s3, bucket) -> Dict[int, str]:
         data = json.loads(obj["Body"].read())
         mapping = data.get("mapping")
         if isinstance(mapping, list):
-            out = {}
+            out: Dict[int, Dict[str, Any]] = {}
             for m in mapping:
                 try:
                     item_id = int(m.get("id"))
                     name = m.get("name")
                 except Exception:
                     continue
+                limit_val = None
+                try:
+                    limit_val = m.get("limit")
+                except Exception:
+                    limit_val = None
+                limit_int = None
+                if limit_val is not None:
+                    try:
+                        limit_int = int(limit_val)
+                    except Exception:
+                        limit_int = None
                 if item_id and isinstance(name, str) and name:
-                    out[item_id] = name
+                    out[item_id] = {"name": name, "limit": limit_int}
             if out:
                 print("Loaded mapping from", latest_key, "(", len(out), "items )")
             return out
@@ -510,13 +733,33 @@ def main():
             obj = s3.get_object(Bucket=bucket, Key=key)
             data = json.loads(obj["Body"].read())
             history = data.get("history") or []
-            metric = compute_catching_peaks_metric(history, window_days=WINDOW_DAYS)
-            if metric is None:
-                return None
-
             base = key.rsplit("/", 1)[-1].split(".", 1)[0]
             item_id = int(base)
-            name = mapping.get(item_id) or data.get("name") or f"Item {item_id}"
+            map_entry = mapping.get(item_id) if isinstance(mapping, dict) else None
+            name = (
+                (map_entry.get("name") if isinstance(map_entry, dict) else None)
+                or data.get("name")
+                or f"Item {item_id}"
+            )
+            limit_4h = None
+            if isinstance(map_entry, dict):
+                try:
+                    limit_raw = map_entry.get("limit")
+                except Exception:
+                    limit_raw = None
+                try:
+                    limit_4h = float(limit_raw) if limit_raw is not None else None
+                except Exception:
+                    limit_4h = None
+
+            metric = compute_catching_peaks_metric(
+                history,
+                window_days=WINDOW_DAYS,
+                trade_limit_4h=limit_4h,
+                tax_rate=TAX_RATE,
+            )
+            if metric is None:
+                return None
 
             daily_vol = volumes24h_by_id.get(item_id)
             if daily_vol is not None and np.isfinite(daily_vol):
@@ -546,6 +789,9 @@ def main():
         "generated_at_iso": now.isoformat(),
         "window_days": WINDOW_DAYS,
         "baseline_half_window_days": BASELINE_HALF_WINDOW_DAYS,
+        "tax_rate": TAX_RATE,
+        "flip_buy_quantile": FLIP_BUY_Q,
+        "flip_sell_quantile": FLIP_SELL_Q,
         "items_scanned": len(keys),
         "items": results,
     }

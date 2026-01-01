@@ -84,13 +84,21 @@ const HTML = `<!DOCTYPE html>
       color: hsl(var(--heat-hue, 120), 75%, 82%);
       transition: background-color 120ms ease, color 120ms ease;
     }
-    th:first-child, td:first-child {
-      text-align: left;
-    }
-    th {
-      color: #9ca3af;
-      font-weight: 600;
-    }
+	    th:first-child, td:first-child {
+	      text-align: left;
+	    }
+      th.item-name-header, td.item-name-cell {
+        text-align: left;
+      }
+      th.rank-cell, td.rank-cell {
+        text-align: right;
+        color: #9ca3af;
+        width: 3.25rem;
+      }
+	    th {
+	      color: #9ca3af;
+	      font-weight: 600;
+	    }
     tr.clickable {
       cursor: pointer;
     }
@@ -321,11 +329,40 @@ const HTML = `<!DOCTYPE html>
 	    .peaks-tab-side {
 	      width: 260px;
 	    }
-	    .peaks-sort-card h3 {
-	      margin: 0 0 0.6rem 0;
-	      font-size: 0.95rem;
-	      color: #e5e7eb;
-	    }
+		    .peaks-sort-card h3 {
+		      margin: 0 0 0.6rem 0;
+		      font-size: 0.95rem;
+		      color: #e5e7eb;
+		    }
+        #peaksConfigPane {
+          margin-bottom: 0.75rem;
+        }
+        .peaks-config-row {
+          display: flex;
+          align-items: center;
+          gap: 0.4rem;
+          margin-bottom: 0.4rem;
+        }
+        .peaks-config-label {
+          font-size: 0.8rem;
+          color: #9ca3af;
+          flex: 0 0 auto;
+        }
+        .peaks-config-select {
+          flex: 1 1 auto;
+          min-width: 0;
+          padding: 0.25rem 0.35rem;
+          border-radius: 0.35rem;
+          border: 1px solid #374151;
+          background: #020617;
+          color: #e5e7eb;
+          font-size: 0.8rem;
+        }
+        .peaks-config-actions {
+          display: flex;
+          gap: 0.35rem;
+          flex-wrap: wrap;
+        }
 	    .peaks-weight-row {
 	      display: flex;
 	      flex-direction: column;
@@ -551,7 +588,7 @@ const HTML = `<!DOCTYPE html>
 				                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
 				                <button id="peaksSearchClearBtn" type="button">Clear</button>
 				              </div>
-				              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show As %</button>
+				              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show Rank%</button>
 				            </div>
 				            <div class="range-filter">
 				              <label for="peaksVolumeCoverageMinPct">Min non-zero volume coverage (history window):</label>
@@ -568,6 +605,7 @@ const HTML = `<!DOCTYPE html>
 	        <div class="peaks-tab-side">
 	          <div class="card peaks-sort-card">
 		            <h3>Sort &amp; filter</h3>
+                <div id="peaksConfigPane"></div>
 	            <div id="peaksSortPane"></div>
 	          </div>
 	        </div>
@@ -646,6 +684,7 @@ const HTML = `<!DOCTYPE html>
 			    const peaksStatusEl = document.getElementById("peaksStatus");
 			    const peaksMetaEl = document.getElementById("peaksMeta");
 			    const peaksTableContainer = document.getElementById("peaksTableContainer");
+          const peaksConfigPaneEl = document.getElementById("peaksConfigPane");
 			    const peaksSortPaneEl = document.getElementById("peaksSortPane");
 			    const peaksSearchInput = document.getElementById("peaksSearchInput");
 			    const peaksSearchClearBtn = document.getElementById("peaksSearchClearBtn");
@@ -665,6 +704,9 @@ const HTML = `<!DOCTYPE html>
 		    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
 		    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
 		    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
+        const PEAKS_CONFIGS_KEY = "osrs_ge_peaks_configs_v1";
+        const PEAKS_ACTIVE_CONFIG_ID_KEY = "osrs_ge_peaks_active_config_id_v1";
+        const PEAKS_CUSTOM_STATE_KEY = "osrs_ge_peaks_custom_state_v1";
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -703,6 +745,8 @@ const HTML = `<!DOCTYPE html>
 			    const DEFAULT_PEAK_WEIGHT = 100;
 			    let peaksPercentWeights = {};
 			    let peaksColumnFilters = {};
+          let peaksConfigs = [];
+          let peaksActiveConfigId = null; // null => "Custom"
 			    let peaksSortPaneMode = "weights";
 			    let peaksSortPaneSignature = "";
 				    let peaksShowAsPercent = false;
@@ -1326,24 +1370,419 @@ const HTML = `<!DOCTYPE html>
 		      return {};
 		    }
 
-		    function savePeaksFilters(filters) {
-		      try {
-		        window.localStorage.setItem(
-		          PEAKS_FILTERS_KEY,
-		          JSON.stringify(filters || {})
-		        );
-		      } catch (err) {
-		        console.warn("Failed to save peaks filters:", err);
-		      }
-		    }
-
-			    peaksPercentWeights = loadPeaksWeights();
-			    peaksColumnFilters = loadPeaksFilters();
-
-			    function loadPeaksShowAsPercent() {
+			    function savePeaksFilters(filters) {
 			      try {
-			        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
-		      } catch (_) {
+			        window.localStorage.setItem(
+			          PEAKS_FILTERS_KEY,
+			          JSON.stringify(filters || {})
+			        );
+			      } catch (err) {
+			        console.warn("Failed to save peaks filters:", err);
+			      }
+			    }
+
+				    peaksPercentWeights = loadPeaksWeights();
+				    peaksColumnFilters = loadPeaksFilters();
+
+            function clampInt(v, lo, hi) {
+              const n = Math.round(clampNumber(v, lo, hi));
+              return Number.isFinite(n) ? n : lo;
+            }
+
+            function cloneJsonSafe(obj) {
+              try {
+                return JSON.parse(JSON.stringify(obj || {}));
+              } catch (_) {
+                return {};
+              }
+            }
+
+            function getDefaultPeaksConfigs() {
+              return [
+                {
+                  id: "preset_flip_profit_balanced_v1",
+                  name: "Flip Profit (balanced tails)",
+                  minVolumeCoveragePct: 70,
+                  weights: {
+                    flip_expected_gp_per_day_norm_pct: 100,
+                    flip_units_per_day_norm_pct: 70,
+                    flip_flow_balance_pct_norm_pct: 60,
+                    flip_edge_gp_norm_pct: 50,
+                    spread_pct_mean_norm_pct: 40,
+                    flip_cycles_per_day_norm_pct: 40
+                  },
+                  filters: {
+                    flip_edge_gp: { op: ">", value: 0 },
+                    flip_units_per_day: { op: ">=", value: 20 },
+                    flip_flow_balance_pct: { op: ">=", value: 40 },
+                    spread_pct_mean: { op: "<=", value: 5 }
+                  }
+                },
+                {
+                  id: "preset_flip_swing_liquid_v1",
+                  name: "Flip Scouts (high swing% + liquid tails)",
+                  minVolumeCoveragePct: 50,
+                  weights: {
+                    variance_pct_norm_pct: 100,
+                    flip_edge_pct_norm_pct: 70,
+                    flip_units_per_day_norm_pct: 60,
+                    flip_flow_balance_pct_norm_pct: 50,
+                    flip_cycles_per_day_norm_pct: 30,
+                    spread_pct_mean_norm_pct: 20
+                  },
+                  filters: {
+                    flip_edge_gp: { op: ">", value: 0 },
+                    flip_edge_pct: { op: ">=", value: 1.0 },
+                    flip_units_per_day: { op: ">=", value: 10 },
+                    spread_pct_mean: { op: "<=", value: 12 }
+                  }
+                }
+              ];
+            }
+
+            function normalizePeaksConfig(raw) {
+              if (!raw || typeof raw !== "object") return null;
+              const id = typeof raw.id === "string" ? raw.id.trim() : "";
+              const name = typeof raw.name === "string" ? raw.name.trim() : "";
+              if (!id || !name) return null;
+
+              const weights = raw.weights && typeof raw.weights === "object" ? raw.weights : {};
+              const weightsOut = {};
+              Object.entries(weights).forEach(([k, v]) => {
+                const key = typeof k === "string" ? k : "";
+                const n = Number(v);
+                if (key && Number.isFinite(n)) weightsOut[key] = n;
+              });
+
+              const allowedOps = new Set([">", ">=", "=", "<=", "<"]);
+              const filters = raw.filters && typeof raw.filters === "object" ? raw.filters : {};
+              const filtersOut = {};
+              Object.entries(filters).forEach(([k, v]) => {
+                const key = typeof k === "string" ? k : "";
+                if (!key || !v || typeof v !== "object") return;
+                const op = String(v.op || "");
+                const n = Number(v.value);
+                if (!allowedOps.has(op)) return;
+                if (!Number.isFinite(n)) return;
+                filtersOut[key] = { op, value: n };
+              });
+
+              const minVolumeCoveragePct = clampInt(raw.minVolumeCoveragePct ?? 0, 0, 100);
+
+              return {
+                id,
+                name,
+                minVolumeCoveragePct,
+                weights: weightsOut,
+                filters: filtersOut
+              };
+            }
+
+            function loadPeaksConfigs() {
+              let list = [];
+              try {
+                const raw = window.localStorage.getItem(PEAKS_CONFIGS_KEY);
+                if (raw) {
+                  const parsed = JSON.parse(raw);
+                  if (Array.isArray(parsed)) list = parsed;
+                }
+              } catch (err) {
+                console.warn("Failed to parse peaks configs:", err);
+              }
+
+              const out = [];
+              const seen = new Set();
+              list.forEach((c) => {
+                const norm = normalizePeaksConfig(c);
+                if (!norm) return;
+                if (seen.has(norm.id)) return;
+                seen.add(norm.id);
+                out.push(norm);
+              });
+
+              const defaults = getDefaultPeaksConfigs();
+              let changed = false;
+              defaults.forEach((c) => {
+                const norm = normalizePeaksConfig(c);
+                if (!norm) return;
+                if (seen.has(norm.id)) return;
+                seen.add(norm.id);
+                out.unshift(norm);
+                changed = true;
+              });
+
+              if (changed) savePeaksConfigs(out);
+              return out;
+            }
+
+            function savePeaksConfigs(configs) {
+              try {
+                const norm = Array.isArray(configs)
+                  ? configs.map(normalizePeaksConfig).filter(Boolean)
+                  : [];
+                window.localStorage.setItem(PEAKS_CONFIGS_KEY, JSON.stringify(norm));
+              } catch (err) {
+                console.warn("Failed to save peaks configs:", err);
+              }
+            }
+
+            function loadPeaksActiveConfigId() {
+              try {
+                const raw = window.localStorage.getItem(PEAKS_ACTIVE_CONFIG_ID_KEY);
+                if (!raw) return null;
+                const id = String(raw);
+                return id ? id : null;
+              } catch (_) {
+                return null;
+              }
+            }
+
+            function savePeaksActiveConfigId(id) {
+              try {
+                window.localStorage.setItem(PEAKS_ACTIVE_CONFIG_ID_KEY, id ? String(id) : "");
+              } catch (_) {}
+            }
+
+            function savePeaksCustomState(state) {
+              try {
+                window.localStorage.setItem(
+                  PEAKS_CUSTOM_STATE_KEY,
+                  JSON.stringify(state || {})
+                );
+              } catch (_) {}
+            }
+
+            function loadPeaksCustomState() {
+              try {
+                const raw = window.localStorage.getItem(PEAKS_CUSTOM_STATE_KEY);
+                if (!raw) return null;
+                const obj = JSON.parse(raw);
+                if (!obj || typeof obj !== "object") return null;
+                return obj;
+              } catch (_) {
+                return null;
+              }
+            }
+
+            function snapshotPeaksState() {
+              return {
+                weights: cloneJsonSafe(peaksPercentWeights),
+                filters: cloneJsonSafe(peaksColumnFilters),
+                minVolumeCoveragePct: clampInt(minVolumeCoveragePct, 0, 100)
+              };
+            }
+
+            function applyPeaksState(state, { rerender = true } = {}) {
+              if (!state || typeof state !== "object") return;
+              const w = state.weights && typeof state.weights === "object" ? state.weights : {};
+              const f = state.filters && typeof state.filters === "object" ? state.filters : {};
+
+              peaksPercentWeights = {};
+              Object.entries(w).forEach(([k, v]) => {
+                const n = Number(v);
+                if (typeof k === "string" && Number.isFinite(n)) peaksPercentWeights[k] = n;
+              });
+              savePeaksWeights(peaksPercentWeights);
+
+              peaksColumnFilters = {};
+              Object.entries(f).forEach(([k, v]) => {
+                if (typeof k !== "string" || !v || typeof v !== "object") return;
+                const op = String(v.op || "");
+                const n = Number(v.value);
+                if (!["<", "<=", "=", ">=", ">"].includes(op)) return;
+                if (!Number.isFinite(n)) return;
+                peaksColumnFilters[k] = { op, value: n };
+              });
+              savePeaksFilters(peaksColumnFilters);
+
+              const cov = clampInt(state.minVolumeCoveragePct ?? minVolumeCoveragePct, 0, 100);
+              minVolumeCoveragePct = cov;
+              saveVolumeCoverageMinPct(minVolumeCoveragePct);
+              updateVolumeCoverageFilterUi();
+
+              peaksSortKey = "__weighted_avg";
+              peaksSortDir = "desc";
+              peaksCurrentPage = 1;
+              peaksSortPaneSignature = "";
+
+              if (rerender) {
+                renderTopTable();
+                if (peaksLoaded) renderPeaksTable();
+              }
+            }
+
+            function renderPeaksConfigPane() {
+              if (!peaksConfigPaneEl) return;
+              peaksConfigPaneEl.innerHTML = "";
+
+              const row1 = document.createElement("div");
+              row1.className = "peaks-config-row";
+
+              const label = document.createElement("label");
+              label.textContent = "Config:";
+              label.className = "peaks-config-label";
+              row1.appendChild(label);
+
+              const select = document.createElement("select");
+              select.className = "peaks-config-select";
+              const optCustom = document.createElement("option");
+              optCustom.value = "";
+              optCustom.textContent = "Custom (unsaved)";
+              select.appendChild(optCustom);
+              (peaksConfigs || []).forEach((c) => {
+                const opt = document.createElement("option");
+                opt.value = c.id;
+                opt.textContent = c.name;
+                select.appendChild(opt);
+              });
+              select.value = peaksActiveConfigId || "";
+              row1.appendChild(select);
+
+              peaksConfigPaneEl.appendChild(row1);
+
+              const actions = document.createElement("div");
+              actions.className = "peaks-config-actions";
+
+              const btnSave = document.createElement("button");
+              btnSave.type = "button";
+              btnSave.className = "peaks-toggle-btn";
+              btnSave.textContent = "Save";
+              btnSave.disabled = !peaksActiveConfigId;
+              btnSave.addEventListener("click", () => {
+                if (!peaksActiveConfigId) return;
+                const idx = (peaksConfigs || []).findIndex((c) => c.id === peaksActiveConfigId);
+                if (idx < 0) return;
+                const next = Object.assign({}, peaksConfigs[idx], snapshotPeaksState());
+                peaksConfigs[idx] = normalizePeaksConfig(next) || peaksConfigs[idx];
+                savePeaksConfigs(peaksConfigs);
+                renderPeaksConfigPane();
+              });
+              actions.appendChild(btnSave);
+
+              const btnSaveAs = document.createElement("button");
+              btnSaveAs.type = "button";
+              btnSaveAs.className = "peaks-toggle-btn";
+              btnSaveAs.textContent = "Save as…";
+              btnSaveAs.addEventListener("click", () => {
+                const proposed = peaksActiveConfigId
+                  ? (peaksConfigs.find((c) => c.id === peaksActiveConfigId)?.name || "New config")
+                  : "New config";
+                const name = window.prompt("New config name:", proposed);
+                if (name == null) return;
+                const clean = String(name).trim();
+                if (!clean) return;
+                const id =
+                  "cfg_" +
+                  Math.random().toString(36).slice(2) +
+                  "_" +
+                  Date.now().toString(36);
+                const cfg = normalizePeaksConfig(
+                  Object.assign({ id, name: clean }, snapshotPeaksState())
+                );
+                if (!cfg) return;
+                peaksConfigs = [cfg].concat(peaksConfigs || []);
+                savePeaksConfigs(peaksConfigs);
+                peaksActiveConfigId = cfg.id;
+                savePeaksActiveConfigId(peaksActiveConfigId);
+                renderPeaksConfigPane();
+              });
+              actions.appendChild(btnSaveAs);
+
+              const btnRename = document.createElement("button");
+              btnRename.type = "button";
+              btnRename.className = "peaks-toggle-btn";
+              btnRename.textContent = "Rename";
+              btnRename.disabled = !peaksActiveConfigId;
+              btnRename.addEventListener("click", () => {
+                if (!peaksActiveConfigId) return;
+                const cfg = (peaksConfigs || []).find((c) => c.id === peaksActiveConfigId);
+                if (!cfg) return;
+                const name = window.prompt("Rename config:", cfg.name);
+                if (name == null) return;
+                const clean = String(name).trim();
+                if (!clean) return;
+                cfg.name = clean;
+                savePeaksConfigs(peaksConfigs);
+                renderPeaksConfigPane();
+              });
+              actions.appendChild(btnRename);
+
+              const btnDelete = document.createElement("button");
+              btnDelete.type = "button";
+              btnDelete.className = "peaks-toggle-btn";
+              btnDelete.textContent = "Delete";
+              btnDelete.disabled = !peaksActiveConfigId;
+              btnDelete.addEventListener("click", () => {
+                if (!peaksActiveConfigId) return;
+                const cfg = (peaksConfigs || []).find((c) => c.id === peaksActiveConfigId);
+                if (!cfg) return;
+                const ok = window.confirm('Delete config "' + cfg.name + '"?');
+                if (!ok) return;
+                peaksConfigs = (peaksConfigs || []).filter((c) => c.id !== peaksActiveConfigId);
+                savePeaksConfigs(peaksConfigs);
+                // Keep current state, but switch back to custom.
+                savePeaksCustomState(snapshotPeaksState());
+                peaksActiveConfigId = null;
+                savePeaksActiveConfigId("");
+                renderPeaksConfigPane();
+              });
+              actions.appendChild(btnDelete);
+
+              peaksConfigPaneEl.appendChild(actions);
+
+              const note = document.createElement("div");
+              note.className = "small";
+              note.textContent = "Saves weights, column filters, and coverage filter.";
+              peaksConfigPaneEl.appendChild(note);
+
+              select.addEventListener("change", () => {
+                const nextId = String(select.value || "");
+                if (!nextId) {
+                  // Unselect => restore last saved custom snapshot if present.
+                  const custom = loadPeaksCustomState();
+                  peaksActiveConfigId = null;
+                  savePeaksActiveConfigId("");
+                  if (custom) {
+                    applyPeaksState(custom);
+                  } else {
+                    renderPeaksConfigPane();
+                  }
+                  return;
+                }
+
+                // Switching from custom -> config: snapshot current state for later restore.
+                if (!peaksActiveConfigId) {
+                  savePeaksCustomState(snapshotPeaksState());
+                }
+
+                peaksActiveConfigId = nextId;
+                savePeaksActiveConfigId(peaksActiveConfigId);
+                const cfg = (peaksConfigs || []).find((c) => c.id === peaksActiveConfigId);
+                if (cfg) {
+                  applyPeaksState(cfg);
+                } else {
+                  renderPeaksConfigPane();
+                }
+              });
+            }
+
+            peaksConfigs = loadPeaksConfigs();
+            peaksActiveConfigId = loadPeaksActiveConfigId();
+            if (peaksActiveConfigId) {
+              const cfg = peaksConfigs.find((c) => c.id === peaksActiveConfigId);
+              if (cfg) {
+                applyPeaksState(cfg, { rerender: false });
+              } else {
+                peaksActiveConfigId = null;
+                savePeaksActiveConfigId("");
+              }
+            }
+            renderPeaksConfigPane();
+
+				    function loadPeaksShowAsPercent() {
+				      try {
+				        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
+			      } catch (_) {
 		        return false;
 		      }
 		    }
@@ -1357,7 +1796,7 @@ const HTML = `<!DOCTYPE html>
 		    function updatePeaksShowAsPercentButton() {
 		      if (!peaksShowAsPctBtn) return;
 		      peaksShowAsPctBtn.classList.toggle("active", peaksShowAsPercent);
-		      peaksShowAsPctBtn.textContent = peaksShowAsPercent ? "Show Raw" : "Show As %";
+		      peaksShowAsPctBtn.textContent = peaksShowAsPercent ? "Show Raw" : "Show Rank%";
 		    }
 
 		    peaksShowAsPercent = loadPeaksShowAsPercent();
@@ -2282,12 +2721,16 @@ const HTML = `<!DOCTYPE html>
 		        return;
 		      }
 
-		      columns.forEach((col, idx) => {
-		        const weightExisting = peaksPercentWeights[col.key];
-		        const weightVal = Number.isFinite(weightExisting)
-		          ? weightExisting
-		          : DEFAULT_PEAK_WEIGHT;
-		        peaksPercentWeights[col.key] = weightVal;
+            const hasAnyWeight =
+              peaksPercentWeights && Object.keys(peaksPercentWeights).length > 0;
+            const defaultMissingWeight = hasAnyWeight ? 0 : DEFAULT_PEAK_WEIGHT;
+
+			      columns.forEach((col, idx) => {
+			        const weightExisting = peaksPercentWeights[col.key];
+			        const weightVal = Number.isFinite(weightExisting)
+			          ? weightExisting
+			          : defaultMissingWeight;
+			        peaksPercentWeights[col.key] = weightVal;
 
 		        const rowEl = document.createElement("div");
 		        rowEl.className = "peaks-weight-row";
@@ -2423,6 +2866,14 @@ const HTML = `<!DOCTYPE html>
 	        return Number.isFinite(v) ? v.toFixed(1) : "-";
 	      }
 
+      function formatHours(v) {
+        return Number.isFinite(v) ? v.toFixed(1) + "h" : "-";
+      }
+
+      function formatGpCompact(v) {
+        return Number.isFinite(v) ? formatGpPerHour(v) : "-";
+      }
+
 		      const baseColumns = [
 		        {
 		          key: "low_avg_price",
@@ -2459,6 +2910,84 @@ const HTML = `<!DOCTYPE html>
           header: "Variance %",
           value: (row) => row.variance_pct,
           format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
+        },
+        {
+          key: "flip_buy_price",
+          header: "Flip Buy (p10 low)",
+          value: (row) => row.flip_buy_price,
+          format: formatProfitGp
+        },
+        {
+          key: "flip_sell_price",
+          header: "Flip Sell (p90 high)",
+          value: (row) => row.flip_sell_price,
+          format: formatProfitGp
+        },
+        {
+          key: "flip_edge_gp",
+          header: "Flip Edge (gp)",
+          value: (row) => row.flip_edge_gp,
+          format: formatProfitGp
+        },
+        {
+          key: "flip_edge_pct",
+          header: "Flip Edge (%)",
+          value: (row) => row.flip_edge_pct,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
+        },
+        {
+          key: "flip_tail_buy_units_per_day",
+          header: "Flip Buy tail units/day",
+          value: (row) => row.flip_tail_buy_units_per_day,
+          format: formatCount
+        },
+        {
+          key: "flip_tail_sell_units_per_day",
+          header: "Flip Sell tail units/day",
+          value: (row) => row.flip_tail_sell_units_per_day,
+          format: formatCount
+        },
+        {
+          key: "flip_units_per_day",
+          header: "Flip Units/day (min side)",
+          value: (row) => row.flip_units_per_day,
+          format: formatCount
+        },
+        {
+          key: "flip_cap_units_per_day",
+          header: "Flip Cap units/day",
+          value: (row) => row.flip_cap_units_per_day,
+          format: formatCount
+        },
+        {
+          key: "flip_flow_balance_pct",
+          header: "Flip Tail Balance",
+          value: (row) => row.flip_flow_balance_pct,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(0) + "%" : "-")
+        },
+        {
+          key: "flip_expected_gp_per_day",
+          header: "Flip Expected GP/day",
+          value: (row) => row.flip_expected_gp_per_day,
+          format: formatGpCompact
+        },
+        {
+          key: "spread_pct_mean",
+          header: "Spread % (mean)",
+          value: (row) => row.spread_pct_mean,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
+        },
+        {
+          key: "flip_cycles_per_day",
+          header: "Flip Cycles/day",
+          value: (row) => row.flip_cycles_per_day,
+          format: (v) => (Number.isFinite(v) ? v.toFixed(2) : "-")
+        },
+        {
+          key: "flip_cycle_median_hours",
+          header: "Flip Cycle (median)",
+          value: (row) => row.flip_cycle_median_hours,
+          format: formatHours
         },
 	        {
 	          key: "sharpness",
@@ -2530,6 +3059,8 @@ const HTML = `<!DOCTYPE html>
 
 		      const invertPercentKeys = new Set([
 		        "low_avg_price",
+          "spread_pct_mean",
+          "flip_cycle_median_hours",
 		        "time_since_last_peak_days",
 		        "avg_time_between_peaks_days"
 		      ]);
@@ -2548,7 +3079,7 @@ const HTML = `<!DOCTYPE html>
 
 					      const percentColumns = baseColumns.map((col) => ({
 					        key: col.key + "_norm_pct",
-					        header: col.header + " %",
+					        header: col.header + " (rank%)",
 					        value: (row) => {
 					          const itemId = Number(row && row.item_id);
 					          if (!Number.isFinite(itemId)) return null;
@@ -2704,18 +3235,20 @@ const HTML = `<!DOCTYPE html>
 	        return peaksSortDir === "asc" ? cmp : -cmp;
 	      });
 
-		      const displayColumns = baseColumns;
+			      const displayColumns = baseColumns;
 
-		      const trHead = document.createElement("tr");
-		      const headerDefs = [{ key: "item", header: "Item" }].concat(
-		        displayColumns.map((c) => ({ key: c.key, header: c.header }))
-		      );
-		      headerDefs.forEach((h) => {
-		        const th = document.createElement("th");
-		        th.textContent = h.header;
-		        trHead.appendChild(th);
-		      });
-		      thead.appendChild(trHead);
+			      const trHead = document.createElement("tr");
+			      const headerDefs = [{ key: "rank", header: "#" }, { key: "item", header: "Item" }].concat(
+			        displayColumns.map((c) => ({ key: c.key, header: c.header }))
+			      );
+			      headerDefs.forEach((h) => {
+			        const th = document.createElement("th");
+			        th.textContent = h.header;
+              if (h.key === "rank") th.classList.add("rank-cell");
+              if (h.key === "item") th.classList.add("item-name-header");
+			        trHead.appendChild(th);
+			      });
+			      thead.appendChild(trHead);
 
 	      const totalRows = rows.length;
 	      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
@@ -2729,14 +3262,19 @@ const HTML = `<!DOCTYPE html>
 	      const end = totalRows === 0 ? 0 : Math.min(totalRows, start + pageSize);
 	      const pageRows = rows.slice(start, end);
 
-	      pageRows.forEach((row) => {
-	        const tr = document.createElement("tr");
-	        tr.className = "clickable";
+		      pageRows.forEach((row, idx) => {
+		        const tr = document.createElement("tr");
+		        tr.className = "clickable";
 
-	        const tdName = document.createElement("td");
-	        tdName.textContent = row.name || ("Item " + row.item_id);
-	        tdName.classList.add("item-name-cell");
-	        tdName.dataset.itemId = String(row.item_id);
+            const tdRank = document.createElement("td");
+            tdRank.textContent = String(start + idx + 1);
+            tdRank.classList.add("rank-cell");
+            tr.appendChild(tdRank);
+
+		        const tdName = document.createElement("td");
+		        tdName.textContent = row.name || ("Item " + row.item_id);
+		        tdName.classList.add("item-name-cell");
+		        tdName.dataset.itemId = String(row.item_id);
 	        if (selectedItemId != null && Number(row.item_id) === selectedItemId) {
 	          tdName.classList.add("selected-item-name");
 	        }
@@ -4356,18 +4894,38 @@ const HTML = `<!DOCTYPE html>
 	          ? json.baseline_half_window_days
 	          : null;
         peaksStatusEl.textContent = "";
-        if (peaksMetaEl) {
-          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
-            ? json.baseline_half_window_days
-            : null;
-          peaksMetaEl.textContent =
-            "Computed at " +
-            (json.generated_at_iso || "unknown time") +
-            " over ~" +
-            (json.window_days || "?") +
-            " days." +
-            (baselineHalf != null ? " Peak baseline: ±" + baselineHalf + " days." : "");
-        }
+	        if (peaksMetaEl) {
+	          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
+	            ? json.baseline_half_window_days
+	            : null;
+          const flipBuyQ =
+            typeof json.flip_buy_quantile === "number" && Number.isFinite(json.flip_buy_quantile)
+              ? json.flip_buy_quantile
+              : null;
+          const flipSellQ =
+            typeof json.flip_sell_quantile === "number" && Number.isFinite(json.flip_sell_quantile)
+              ? json.flip_sell_quantile
+              : null;
+          const peaksTax =
+            typeof json.tax_rate === "number" && Number.isFinite(json.tax_rate)
+              ? json.tax_rate
+              : null;
+	          peaksMetaEl.textContent =
+	            "Computed at " +
+	            (json.generated_at_iso || "unknown time") +
+	            " over ~" +
+	            (json.window_days || "?") +
+	            " days." +
+	            (baselineHalf != null ? " Peak baseline: ±" + baselineHalf + " days." : "") +
+            (peaksTax != null ? " Tax: " + (peaksTax * 100).toFixed(1) + "%." : "") +
+            (flipBuyQ != null && flipSellQ != null
+              ? " Flip tails: buy p" +
+                Math.round(flipBuyQ * 100) +
+                " low, sell p" +
+                Math.round(flipSellQ * 100) +
+                " high."
+              : "");
+	        }
         renderPeaksTable();
       } catch (err) {
         console.error("Error loading catching-peaks overview:", err);
