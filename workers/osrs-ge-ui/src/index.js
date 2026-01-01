@@ -1400,41 +1400,54 @@ const HTML = `<!DOCTYPE html>
             function getDefaultPeaksConfigs() {
               return [
                 {
-                  id: "preset_flip_profit_balanced_v1",
-                  name: "Flip Profit (balanced tails)",
-                  minVolumeCoveragePct: 70,
+                  id: "preset_flip_profit_discovery_v1",
+                  name: "Flip Profit (discovery)",
+                  minVolumeCoveragePct: 0,
+                  weights: {
+                    flip_expected_gp_per_day_norm_pct: 100,
+                    flip_units_per_day_norm_pct: 80,
+                    flip_edge_gp_norm_pct: 60,
+                    flip_flow_balance_pct_norm_pct: 55,
+                    spread_pct_mean_norm_pct: 35,
+                    flip_cycles_per_day_norm_pct: 25,
+                    variance_pct_norm_pct: 15
+                  },
+                  filters: {}
+                },
+                {
+                  id: "preset_flip_profit_quality_v1",
+                  name: "Flip Profit (quality filter)",
+                  minVolumeCoveragePct: 0,
                   weights: {
                     flip_expected_gp_per_day_norm_pct: 100,
                     flip_units_per_day_norm_pct: 70,
-                    flip_flow_balance_pct_norm_pct: 60,
-                    flip_edge_gp_norm_pct: 50,
-                    spread_pct_mean_norm_pct: 40,
-                    flip_cycles_per_day_norm_pct: 40
+                    flip_flow_balance_pct_norm_pct: 55,
+                    flip_edge_gp_norm_pct: 45,
+                    spread_pct_mean_norm_pct: 35,
+                    flip_cycles_per_day_norm_pct: 20
                   },
                   filters: {
-                    flip_edge_gp: { op: ">", value: 0 },
-                    flip_units_per_day: { op: ">=", value: 20 },
-                    flip_flow_balance_pct: { op: ">=", value: 40 },
-                    spread_pct_mean: { op: "<=", value: 5 }
+                    flip_units_per_day: { op: ">=", value: 1 },
+                    flip_flow_balance_pct: { op: ">=", value: 5 },
+                    spread_pct_mean: { op: "<=", value: 25 }
                   }
                 },
                 {
-                  id: "preset_flip_swing_liquid_v1",
-                  name: "Flip Scouts (high swing% + liquid tails)",
-                  minVolumeCoveragePct: 50,
+                  id: "preset_flip_scouts_swing_v1",
+                  name: "Flip Scouts (swing% + executable)",
+                  minVolumeCoveragePct: 0,
                   weights: {
                     variance_pct_norm_pct: 100,
                     flip_edge_pct_norm_pct: 70,
-                    flip_units_per_day_norm_pct: 60,
-                    flip_flow_balance_pct_norm_pct: 50,
-                    flip_cycles_per_day_norm_pct: 30,
-                    spread_pct_mean_norm_pct: 20
+                    flip_cycles_per_day_norm_pct: 45,
+                    flip_units_per_day_norm_pct: 35,
+                    flip_flow_balance_pct_norm_pct: 25,
+                    spread_pct_mean_norm_pct: 15,
+                    flip_expected_gp_per_day_norm_pct: 10
                   },
                   filters: {
-                    flip_edge_gp: { op: ">", value: 0 },
-                    flip_edge_pct: { op: ">=", value: 1.0 },
-                    flip_units_per_day: { op: ">=", value: 10 },
-                    spread_pct_mean: { op: "<=", value: 12 }
+                    flip_units_per_day: { op: ">=", value: 1 },
+                    spread_pct_mean: { op: "<=", value: 35 }
                   }
                 }
               ];
@@ -1500,16 +1513,17 @@ const HTML = `<!DOCTYPE html>
                 out.push(norm);
               });
 
-              const defaults = getDefaultPeaksConfigs();
-              let changed = false;
-              defaults.forEach((c) => {
-                const norm = normalizePeaksConfig(c);
-                if (!norm) return;
-                if (seen.has(norm.id)) return;
-                seen.add(norm.id);
-                out.unshift(norm);
-                changed = true;
-              });
+	              const defaults = getDefaultPeaksConfigs();
+	              let changed = false;
+                for (let i = defaults.length - 1; i >= 0; i--) {
+                  const c = defaults[i];
+	                const norm = normalizePeaksConfig(c);
+	                if (!norm) continue;
+	                if (seen.has(norm.id)) continue;
+	                seen.add(norm.id);
+	                out.unshift(norm);
+	                changed = true;
+                }
 
               if (changed) savePeaksConfigs(out);
               return out;
