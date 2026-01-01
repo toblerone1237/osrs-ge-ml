@@ -2888,11 +2888,23 @@ const HTML = `<!DOCTYPE html>
         return Number.isFinite(v) ? formatGpPerHour(v) : "-";
       }
 
-		      const baseColumns = [
-		        {
-		          key: "low_avg_price",
-		          header: "Low Average Price",
-          value: (row) => row.low_avg_price,
+			      const baseColumns = [
+			        {
+			          key: "trading_cap",
+			          header: "Trading Volume Cap",
+			          value: (row) => getTradingCap(row),
+			          format: formatCount
+			        },
+			        {
+			          key: "volume_24h",
+			          header: "Last 24 Trading Volume",
+			          value: (row) => getVolume24h(row),
+			          format: formatCount
+			        },
+			        {
+			          key: "low_avg_price",
+			          header: "Low Average Price",
+	          value: (row) => row.low_avg_price,
           format: formatProfitGp
         },
         {
@@ -3022,35 +3034,23 @@ const HTML = `<!DOCTYPE html>
 	            const diff = getPriceDifference(row);
 	            const vol = getVolume24h(row);
 	            return Number.isFinite(diff) && Number.isFinite(vol) ? diff * vol : null;
-	          },
-	          format: formatProfitGp
-	        },
+		          },
+		          format: formatProfitGp
+		        },
 	        {
-	          key: "volume_24h",
-	          header: "Last 24 Trading Volume",
-	          value: (row) => getVolume24h(row),
-	          format: formatCount
-	        },
-        {
-          key: "profit_cap",
-          header: "Cap Trading Profit",
-          value: (row) => {
+	          key: "profit_cap",
+	          header: "Cap Trading Profit",
+	          value: (row) => {
             const diff = getPriceDifference(row);
             const cap = getTradingCap(row);
             return Number.isFinite(diff) && Number.isFinite(cap) ? diff * cap : null;
-          },
-          format: formatProfitGp
-        },
-	        {
-	          key: "trading_cap",
-	          header: "Trading Volume Cap",
-	          value: (row) => getTradingCap(row),
-	          format: formatCount
+	          },
+	          format: formatProfitGp
 	        },
-	        {
-	          key: "time_since_last_peak_days",
-	          header: "Time Since Last Peak",
-	          value: (row) => row.time_since_last_peak_days,
+		        {
+		          key: "time_since_last_peak_days",
+		          header: "Time Since Last Peak",
+		          value: (row) => row.time_since_last_peak_days,
 	          format: formatDays
 	        },
 		        {
