@@ -4907,11 +4907,11 @@ const HTML = `<!DOCTYPE html>
 	        peaksBaselineHalfWindowDays = Number.isFinite(json.baseline_half_window_days)
 	          ? json.baseline_half_window_days
 	          : null;
-        peaksStatusEl.textContent = "";
-	        if (peaksMetaEl) {
-	          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
-	            ? json.baseline_half_window_days
-	            : null;
+	        peaksStatusEl.textContent = "";
+		        if (peaksMetaEl) {
+		          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
+		            ? json.baseline_half_window_days
+		            : null;
           const flipBuyQ =
             typeof json.flip_buy_quantile === "number" && Number.isFinite(json.flip_buy_quantile)
               ? json.flip_buy_quantile
@@ -4920,26 +4920,39 @@ const HTML = `<!DOCTYPE html>
             typeof json.flip_sell_quantile === "number" && Number.isFinite(json.flip_sell_quantile)
               ? json.flip_sell_quantile
               : null;
-          const peaksTax =
-            typeof json.tax_rate === "number" && Number.isFinite(json.tax_rate)
-              ? json.tax_rate
-              : null;
-	          peaksMetaEl.textContent =
-	            "Computed at " +
-	            (json.generated_at_iso || "unknown time") +
-	            " over ~" +
-	            (json.window_days || "?") +
-	            " days." +
-	            (baselineHalf != null ? " Peak baseline: ±" + baselineHalf + " days." : "") +
-            (peaksTax != null ? " Tax: " + (peaksTax * 100).toFixed(1) + "%." : "") +
-            (flipBuyQ != null && flipSellQ != null
-              ? " Flip tails: buy p" +
-                Math.round(flipBuyQ * 100) +
-                " low, sell p" +
-                Math.round(flipSellQ * 100) +
-                " high."
-              : "");
-	        }
+	          const peaksTax =
+	            typeof json.tax_rate === "number" && Number.isFinite(json.tax_rate)
+	              ? json.tax_rate
+	              : null;
+            const hasAnyFlipValues =
+              Array.isArray(peaksItems) &&
+              peaksItems.some((row) => {
+                const v = row && row.flip_buy_price;
+                return typeof v === "number" && Number.isFinite(v) && v > 0;
+              });
+            const flipWarning =
+              flipBuyQ == null || flipSellQ == null
+                ? " Flip metrics missing (rerun python ml/score_catching_peaks.py; spread needs updated history files)."
+                : !hasAnyFlipValues
+                  ? " Flip metrics empty (history schema likely missing avg_high/avg_low or volumes; rerun ml/build_price_history.py then ml/score_catching_peaks.py)."
+                  : "";
+		          peaksMetaEl.textContent =
+		            "Computed at " +
+		            (json.generated_at_iso || "unknown time") +
+		            " over ~" +
+		            (json.window_days || "?") +
+		            " days." +
+		            (baselineHalf != null ? " Peak baseline: ±" + baselineHalf + " days." : "") +
+	            (peaksTax != null ? " Tax: " + (peaksTax * 100).toFixed(1) + "%." : "") +
+	            (flipBuyQ != null && flipSellQ != null
+	              ? " Flip tails: buy p" +
+	                Math.round(flipBuyQ * 100) +
+	                " low, sell p" +
+	                Math.round(flipSellQ * 100) +
+	                " high."
+	              : "");
+            if (flipWarning) peaksMetaEl.textContent += flipWarning;
+		        }
         renderPeaksTable();
       } catch (err) {
         console.error("Error loading catching-peaks overview:", err);

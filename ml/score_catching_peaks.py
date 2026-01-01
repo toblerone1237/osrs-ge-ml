@@ -158,10 +158,23 @@ def compute_catching_peaks_metric(
         vol_f = parse_volume(pt.get("volume", 0.0))
         pts.append((ts, price_f, vol_f))
 
-        avg_high = parse_optional_float(pt.get("avg_high_price"))
-        avg_low = parse_optional_float(pt.get("avg_low_price"))
-        high_vol = parse_volume(pt.get("high_volume"))
-        low_vol = parse_volume(pt.get("low_volume"))
+        avg_high_raw = pt.get("avg_high_price")
+        if avg_high_raw is None and "avgHighPrice" in pt:
+            avg_high_raw = pt.get("avgHighPrice")
+        avg_low_raw = pt.get("avg_low_price")
+        if avg_low_raw is None and "avgLowPrice" in pt:
+            avg_low_raw = pt.get("avgLowPrice")
+        high_vol_raw = pt.get("high_volume")
+        if high_vol_raw is None and "highPriceVolume" in pt:
+            high_vol_raw = pt.get("highPriceVolume")
+        low_vol_raw = pt.get("low_volume")
+        if low_vol_raw is None and "lowPriceVolume" in pt:
+            low_vol_raw = pt.get("lowPriceVolume")
+
+        avg_high = parse_optional_float(avg_high_raw)
+        avg_low = parse_optional_float(avg_low_raw)
+        high_vol = parse_volume(high_vol_raw)
+        low_vol = parse_volume(low_vol_raw)
         side_pts.append(
             (
                 ts,
@@ -180,6 +193,7 @@ def compute_catching_peaks_metric(
     pts.sort(key=lambda x: x[0])
     ts_ms = np.array([ts for ts, _, _ in pts], dtype="float64")
     prices = np.array([p for _, p, _ in pts], dtype="float64")
+    volumes = np.array([v for _, _, v in pts], dtype="float64")
 
     # Side-series (if present in history schema v2+): avg_high/avg_low and their volumes.
     side_pts.sort(key=lambda x: x[0])
@@ -233,15 +247,30 @@ def compute_catching_peaks_metric(
             idx = int(xs.size) - 1
         return float(xs[idx])
 
-    # Flip-oriented metrics: use volume-weighted tails on the buy (avg_low) and sell (avg_high) sides.
+    # Flip-oriented metrics: prefer volume-weighted tails on the buy (avg_low) and sell (avg_high)
+    # sides; if side-series data is missing, fall back to mid-price tails.
     buy_q = float(max(0.0, min(1.0, FLIP_BUY_Q)))
     sell_q = float(max(0.0, min(1.0, FLIP_SELL_Q)))
+
+    buy_used_side = True
     flip_buy_price = weighted_quantile(avg_low_prices, low_volumes, buy_q)
     if flip_buy_price is None:
         flip_buy_price = unweighted_quantile(avg_low_prices, buy_q)
+    if flip_buy_price is None:
+        buy_used_side = False
+        flip_buy_price = weighted_quantile(prices, volumes, buy_q)
+        if flip_buy_price is None:
+            flip_buy_price = unweighted_quantile(prices, buy_q)
+
+    sell_used_side = True
     flip_sell_price = weighted_quantile(avg_high_prices, high_volumes, sell_q)
     if flip_sell_price is None:
         flip_sell_price = unweighted_quantile(avg_high_prices, sell_q)
+    if flip_sell_price is None:
+        sell_used_side = False
+        flip_sell_price = weighted_quantile(prices, volumes, sell_q)
+        if flip_sell_price is None:
+            flip_sell_price = unweighted_quantile(prices, sell_q)
 
     flip_edge_gp: Optional[float] = None
     flip_edge_pct: Optional[float] = None
@@ -259,13 +288,23 @@ def compute_catching_peaks_metric(
     flip_tail_buy_units_total = 0.0
     flip_tail_sell_units_total = 0.0
     if flip_buy_price is not None and np.isfinite(flip_buy_price) and flip_buy_price > 0:
-        buy_mask = np.isfinite(avg_low_prices) & (avg_low_prices > 0) & (avg_low_prices <= float(flip_buy_price))
-        if int(buy_mask.sum()):
-            flip_tail_buy_units_total = float(np.sum(low_volumes[buy_mask]))
+        if buy_used_side:
+            buy_mask = np.isfinite(avg_low_prices) & (avg_low_prices > 0) & (avg_low_prices <= float(flip_buy_price))
+            if int(buy_mask.sum()):
+                flip_tail_buy_units_total = float(np.sum(low_volumes[buy_mask]))
+        else:
+            buy_mask = np.isfinite(prices) & (prices > 0) & (prices <= float(flip_buy_price))
+            if int(buy_mask.sum()):
+                flip_tail_buy_units_total = float(np.sum(volumes[buy_mask]))
     if flip_sell_price is not None and np.isfinite(flip_sell_price) and flip_sell_price > 0:
-        sell_mask = np.isfinite(avg_high_prices) & (avg_high_prices > 0) & (avg_high_prices >= float(flip_sell_price))
-        if int(sell_mask.sum()):
-            flip_tail_sell_units_total = float(np.sum(high_volumes[sell_mask]))
+        if sell_used_side:
+            sell_mask = np.isfinite(avg_high_prices) & (avg_high_prices > 0) & (avg_high_prices >= float(flip_sell_price))
+            if int(sell_mask.sum()):
+                flip_tail_sell_units_total = float(np.sum(high_volumes[sell_mask]))
+        else:
+            sell_mask = np.isfinite(prices) & (prices > 0) & (prices >= float(flip_sell_price))
+            if int(sell_mask.sum()):
+                flip_tail_sell_units_total = float(np.sum(volumes[sell_mask]))
 
     denom_days = float(window_days) if window_days > 0 else 1.0
     flip_tail_buy_units_per_day = float(flip_tail_buy_units_total / denom_days)
@@ -330,19 +369,33 @@ def compute_catching_peaks_metric(
     ):
         waiting_for = "buy"
         buy_ts: Optional[float] = None
-        for ts, _, _, ah, al, hv, lv in side_pts:
-            if waiting_for == "buy":
-                if np.isfinite(al) and al > 0 and al <= float(flip_buy_price) and lv > 0:
-                    buy_ts = float(ts)
-                    waiting_for = "sell"
-                continue
-            # waiting_for == "sell"
-            if np.isfinite(ah) and ah > 0 and ah >= float(flip_sell_price) and hv > 0:
-                if buy_ts is not None and np.isfinite(buy_ts) and ts > buy_ts:
-                    flip_cycles += 1
-                    flip_cycle_durations_ms.append(float(ts - buy_ts))
-                buy_ts = None
-                waiting_for = "buy"
+        if buy_used_side and sell_used_side:
+            for ts, _, _, ah, al, hv, lv in side_pts:
+                if waiting_for == "buy":
+                    if np.isfinite(al) and al > 0 and al <= float(flip_buy_price) and lv > 0:
+                        buy_ts = float(ts)
+                        waiting_for = "sell"
+                    continue
+                # waiting_for == "sell"
+                if np.isfinite(ah) and ah > 0 and ah >= float(flip_sell_price) and hv > 0:
+                    if buy_ts is not None and np.isfinite(buy_ts) and ts > buy_ts:
+                        flip_cycles += 1
+                        flip_cycle_durations_ms.append(float(ts - buy_ts))
+                    buy_ts = None
+                    waiting_for = "buy"
+        else:
+            for ts, price, vol in pts:
+                if waiting_for == "buy":
+                    if np.isfinite(price) and price > 0 and price <= float(flip_buy_price) and vol > 0:
+                        buy_ts = float(ts)
+                        waiting_for = "sell"
+                    continue
+                if np.isfinite(price) and price > 0 and price >= float(flip_sell_price) and vol > 0:
+                    if buy_ts is not None and np.isfinite(buy_ts) and ts > buy_ts:
+                        flip_cycles += 1
+                        flip_cycle_durations_ms.append(float(ts - buy_ts))
+                    buy_ts = None
+                    waiting_for = "buy"
 
     flip_cycles_per_day: Optional[float] = None
     if flip_cycles > 0 and denom_days > 0:
