@@ -2889,6 +2889,25 @@ const HTML = `<!DOCTYPE html>
       }
 
 			      const baseColumns = [
+              {
+                key: "above_below_profit_24h",
+                header: "Above-Below 24 Profit",
+                value: (row) => {
+                  const diff = row && row.above_below_diff;
+                  const cap = getTradingCap(row);
+                  const vol = getVolume24h(row);
+                  if (
+                    !Number.isFinite(diff) ||
+                    !Number.isFinite(cap) ||
+                    !Number.isFinite(vol)
+                  ) {
+                    return null;
+                  }
+                  const units = Math.min(6 * cap, vol);
+                  return Number.isFinite(units) ? diff * units : null;
+                },
+                format: formatProfitGp
+              },
 			        {
 			          key: "trading_cap",
 			          header: "Trading Volume Cap",
