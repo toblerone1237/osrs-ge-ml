@@ -206,6 +206,7 @@ def compute_catching_peaks_metric(
     above_mean_avg_price: Optional[float] = None
     below_mean_avg_price: Optional[float] = None
     above_below_diff: Optional[float] = None
+    mean_crossings: Optional[int] = None
     if np.isfinite(mean_price) and mean_price > 0:
         above_mask = prices > mean_price
         below_mask = prices < mean_price
@@ -220,6 +221,12 @@ def compute_catching_peaks_metric(
             and np.isfinite(below_mean_avg_price)
         ):
             above_below_diff = float(above_mean_avg_price - below_mean_avg_price)
+
+        # Count sign changes in (price - mean), ignoring exact equals.
+        signs = np.sign(prices - mean_price)
+        signs = signs[signs != 0]
+        if signs.size >= 2:
+            mean_crossings = int(np.sum(signs[1:] != signs[:-1]))
     variance = (
         float(np.mean(np.sqrt(np.abs(prices - mean_price))))
         if np.isfinite(mean_price)
@@ -677,6 +684,7 @@ def compute_catching_peaks_metric(
         "above_mean_avg_price": above_mean_avg_price,
         "below_mean_avg_price": below_mean_avg_price,
         "above_below_diff": above_below_diff,
+        "mean_crossings": mean_crossings,
         "low_avg_price": low_avg,
         "peak_avg_price": peak_avg,
         "pct_difference": pct_diff,

@@ -2938,6 +2938,12 @@ const HTML = `<!DOCTYPE html>
 				          value: (row) => row.above_below_diff,
 				          format: formatProfitGp
 				        },
+                {
+                  key: "mean_crossings",
+                  header: "Mean Crossings",
+                  value: (row) => row.mean_crossings,
+                  format: formatCount
+                },
 				        {
 				          key: "low_avg_price",
 				          header: "Low Average Price",
