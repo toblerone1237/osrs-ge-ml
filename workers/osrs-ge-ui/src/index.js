@@ -589,6 +589,7 @@ const HTML = `<!DOCTYPE html>
 				                <button id="peaksSearchClearBtn" type="button">Clear</button>
 				              </div>
 				              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show Rank%</button>
+                      <button id="peaksOutlierMaskBtn" type="button" class="peaks-toggle-btn" hidden>Outlier mask</button>
 				            </div>
 				            <div class="range-filter">
 				              <label for="peaksVolumeCoverageMinPct">Min non-zero volume coverage (history window):</label>
@@ -628,7 +629,6 @@ const HTML = `<!DOCTYPE html>
 	        <button type="button" class="peaks-toggle-btn" data-series-toggle="avgLow">Avg low</button>
 	        <button type="button" class="peaks-toggle-btn" data-series-toggle="highVol">High vol</button>
 	        <button type="button" class="peaks-toggle-btn" data-series-toggle="lowVol">Low vol</button>
-          <button type="button" class="peaks-toggle-btn" id="peaksOutlierMaskBtn" hidden>Outlier mask</button>
 	      </div>
 	      <div class="chart-wrapper">
 	        <canvas id="priceChart"></canvas>
@@ -745,8 +745,6 @@ const HTML = `<!DOCTYPE html>
 			    let peaksBaselineHalfWindowDays = null;
           let peaksMidOutlierAboveMeanMult = null;
           let peaksOutlierMaskEnabled = true;
-          let lastPriceSeriesArgs = null;
-          let currentPriceSeriesOutlier = null;
 			    let peaksSortKey = "sharpness";
 			    let peaksSortDir = "desc";
 			    const DEFAULT_PEAK_WEIGHT = 100;
@@ -1288,76 +1286,72 @@ const HTML = `<!DOCTYPE html>
           } catch (_) {}
         }
 
+        function getPeaksMetric(row, key) {
+          if (!row || typeof row !== "object" || typeof key !== "string") return null;
+          if (peaksOutlierMaskEnabled) {
+            const maskedKey = key + "_masked";
+            if (maskedKey in row) return row[maskedKey];
+          }
+          return row[key];
+        }
+
+        function buildPeaksPriceSeriesOpts(row) {
+          if (!row) return { showForecast: false };
+          return {
+            showForecast: false,
+            highlightPeaks: true,
+            peakBaselinePrice: getPeaksMetric(row, "low_avg_price"),
+            peakBaselineHalfWindowDays: peaksBaselineHalfWindowDays,
+            peakExpectedCount: getPeaksMetric(row, "peaks_count"),
+            peakWindowDays: peaksWindowDays,
+            midOutlierThreshold: row.mid_outlier_threshold,
+            midOutlierAboveMeanMult: peaksMidOutlierAboveMeanMult,
+            midOutlierRefAboveMeanAvgPrice: row.mid_outlier_ref_above_mean_avg_price
+          };
+        }
+
+        function reloadSelectedPeaksChart() {
+          if (activeTab !== "peaks") return;
+          if (selectedItemId == null) return;
+          const itemId = Number(selectedItemId);
+          if (!Number.isFinite(itemId) || itemId <= 0) return;
+          if (!Array.isArray(peaksItems) || !peaksItems.length) return;
+          const row = peaksItems.find((r) => Number(r && r.item_id) === itemId);
+          if (!row) return;
+          loadPriceSeries(itemId, row.name || ("Item " + itemId), buildPeaksPriceSeriesOpts(row));
+        }
+
         function updatePeaksOutlierMaskButton() {
           if (!peaksOutlierMaskBtn) return;
 
           const configured =
-            (Number.isFinite(peaksMidOutlierAboveMeanMult) && peaksMidOutlierAboveMeanMult > 0) ||
-            (currentPriceSeriesOutlier && currentPriceSeriesOutlier.configured);
+            Number.isFinite(peaksMidOutlierAboveMeanMult) &&
+            peaksMidOutlierAboveMeanMult > 0;
           const shouldShow = activeTab === "peaks" && configured;
           peaksOutlierMaskBtn.hidden = !shouldShow;
           if (!shouldShow) return;
 
-          const canMask = Boolean(currentPriceSeriesOutlier && currentPriceSeriesOutlier.canMask);
-          const isOn = canMask && peaksOutlierMaskEnabled;
-          peaksOutlierMaskBtn.disabled = !canMask;
-          peaksOutlierMaskBtn.classList.toggle("active", isOn);
-          peaksOutlierMaskBtn.textContent = canMask
-            ? isOn
-              ? "Outlier mask: on"
-              : "Outlier mask: off"
-            : "Outlier mask: n/a";
-
-          if (!canMask) {
-            peaksOutlierMaskBtn.title =
-              selectedItemId == null
-                ? "Select an item in Catching Peaks to enable the outlier mask."
-                : "No outlier buckets to mask for this item.";
-            return;
-          }
-
-          const thr = currentPriceSeriesOutlier ? currentPriceSeriesOutlier.threshold : null;
-          const mult = currentPriceSeriesOutlier ? currentPriceSeriesOutlier.mult : null;
-          const ref = currentPriceSeriesOutlier ? currentPriceSeriesOutlier.refAboveMeanAvgPrice : null;
-
-          const thrText =
-            thr != null && Number.isFinite(thr)
-              ? Math.round(thr).toLocaleString("en-US")
-              : "?";
-          let title = "Hide buckets where mid > " + thrText + " gp.";
-          if (mult != null && Number.isFinite(mult) && mult > 0 && ref != null && Number.isFinite(ref) && ref > 0) {
-            title =
-              "Hide buckets where mid > " +
-              mult +
-              "× above-mean avg (" +
-              Math.round(ref).toLocaleString("en-US") +
-              " gp) ≈ " +
-              thrText +
-              " gp.";
-          }
-          peaksOutlierMaskBtn.title = title;
+          peaksOutlierMaskBtn.disabled = false;
+          peaksOutlierMaskBtn.classList.toggle("active", peaksOutlierMaskEnabled);
+          peaksOutlierMaskBtn.textContent = peaksOutlierMaskEnabled
+            ? "Outlier filter: on"
+            : "Outlier filter: off";
+          peaksOutlierMaskBtn.title =
+            "When on: exclude buckets where mid > " +
+            peaksMidOutlierAboveMeanMult +
+            "× above-mean avg from Catching Peaks metrics, and blank those sections on the chart.";
         }
 
         peaksOutlierMaskEnabled = loadPeaksOutlierMaskEnabled();
         updatePeaksOutlierMaskButton();
         if (peaksOutlierMaskBtn) {
           peaksOutlierMaskBtn.addEventListener("click", () => {
-            if (peaksOutlierMaskBtn.disabled) return;
             peaksOutlierMaskEnabled = !peaksOutlierMaskEnabled;
             savePeaksOutlierMaskEnabled(peaksOutlierMaskEnabled);
             updatePeaksOutlierMaskButton();
-
-            if (
-              lastPriceSeriesArgs &&
-              Number.isFinite(lastPriceSeriesArgs.itemId) &&
-              lastPriceSeriesArgs.itemId > 0
-            ) {
-              loadPriceSeries(
-                lastPriceSeriesArgs.itemId,
-                lastPriceSeriesArgs.name,
-                lastPriceSeriesArgs.opts
-              );
-            }
+            peaksCurrentPage = 1;
+            if (peaksLoaded) schedulePeaksTableRender();
+            reloadSelectedPeaksChart();
           });
         }
 
@@ -2947,11 +2941,11 @@ const HTML = `<!DOCTYPE html>
 
 	      const table = document.createElement("table");
 	      const thead = document.createElement("thead");
-	      const tbody = document.createElement("tbody");
+      const tbody = document.createElement("tbody");
 
       function getPriceDifference(row) {
-        const low = row && row.low_avg_price;
-        const peak = row && row.peak_avg_price;
+        const low = getPeaksMetric(row, "low_avg_price");
+        const peak = getPeaksMetric(row, "peak_avg_price");
         if (!Number.isFinite(low) || !Number.isFinite(peak)) return null;
         return peak - low;
       }
@@ -2967,7 +2961,7 @@ const HTML = `<!DOCTYPE html>
           const dailyVol = volumes24hById.get(itemId);
           if (Number.isFinite(dailyVol)) return dailyVol;
         }
-        const v = row && row.volume_24h;
+        const v = getPeaksMetric(row, "volume_24h");
         return Number.isFinite(v) ? v : null;
       }
 
@@ -2992,7 +2986,7 @@ const HTML = `<!DOCTYPE html>
                 key: "above_below_profit_24h",
                 header: "Above-Below 24 Profit",
                 value: (row) => {
-                  const diff = row && row.above_below_diff;
+                  const diff = getPeaksMetric(row, "above_below_diff");
                   const cap = getTradingCap(row);
                   const vol = getVolume24h(row);
                   if (
@@ -3022,37 +3016,37 @@ const HTML = `<!DOCTYPE html>
 				        {
 				          key: "above_mean_avg_price",
 				          header: "Above Mean Average",
-				          value: (row) => row.above_mean_avg_price,
+				          value: (row) => getPeaksMetric(row, "above_mean_avg_price"),
 				          format: formatProfitGp
 				        },
 				        {
 				          key: "below_mean_avg_price",
 				          header: "Below Mean Average",
-				          value: (row) => row.below_mean_avg_price,
+				          value: (row) => getPeaksMetric(row, "below_mean_avg_price"),
 				          format: formatProfitGp
 				        },
 				        {
 				          key: "above_below_diff",
 				          header: "Above-Below Difference",
-				          value: (row) => row.above_below_diff,
+				          value: (row) => getPeaksMetric(row, "above_below_diff"),
 				          format: formatProfitGp
 				        },
                 {
                   key: "mean_crossings",
                   header: "Mean Crossings",
-                  value: (row) => row.mean_crossings,
+                  value: (row) => getPeaksMetric(row, "mean_crossings"),
                   format: formatCount
                 },
 				        {
 				          key: "low_avg_price",
 				          header: "Low Average Price",
-		          value: (row) => row.low_avg_price,
+		          value: (row) => getPeaksMetric(row, "low_avg_price"),
           format: formatProfitGp
         },
         {
           key: "peak_avg_price",
           header: "Peak Average Price",
-          value: (row) => row.peak_avg_price,
+          value: (row) => getPeaksMetric(row, "peak_avg_price"),
           format: formatProfitGp
         },
         {
@@ -3064,109 +3058,109 @@ const HTML = `<!DOCTYPE html>
         {
           key: "pct_difference",
           header: "% Difference",
-          value: (row) => row.pct_difference,
+          value: (row) => getPeaksMetric(row, "pct_difference"),
           format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
         },
         {
           key: "variance",
           header: "Variance",
-          value: (row) => row.variance,
+          value: (row) => getPeaksMetric(row, "variance"),
           format: formatProfitGp
         },
         {
           key: "variance_pct",
           header: "Variance %",
-          value: (row) => row.variance_pct,
+          value: (row) => getPeaksMetric(row, "variance_pct"),
           format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
         },
         {
           key: "flip_buy_price",
           header: "Flip Buy (p10 low)",
-          value: (row) => row.flip_buy_price,
+          value: (row) => getPeaksMetric(row, "flip_buy_price"),
           format: formatProfitGp
         },
         {
           key: "flip_sell_price",
           header: "Flip Sell (p90 high)",
-          value: (row) => row.flip_sell_price,
+          value: (row) => getPeaksMetric(row, "flip_sell_price"),
           format: formatProfitGp
         },
         {
           key: "flip_edge_gp",
           header: "Flip Edge (gp)",
-          value: (row) => row.flip_edge_gp,
+          value: (row) => getPeaksMetric(row, "flip_edge_gp"),
           format: formatProfitGp
         },
         {
           key: "flip_edge_pct",
           header: "Flip Edge (%)",
-          value: (row) => row.flip_edge_pct,
+          value: (row) => getPeaksMetric(row, "flip_edge_pct"),
           format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
         },
         {
           key: "flip_tail_buy_units_per_day",
           header: "Flip Buy tail units/day",
-          value: (row) => row.flip_tail_buy_units_per_day,
+          value: (row) => getPeaksMetric(row, "flip_tail_buy_units_per_day"),
           format: formatCount
         },
         {
           key: "flip_tail_sell_units_per_day",
           header: "Flip Sell tail units/day",
-          value: (row) => row.flip_tail_sell_units_per_day,
+          value: (row) => getPeaksMetric(row, "flip_tail_sell_units_per_day"),
           format: formatCount
         },
         {
           key: "flip_units_per_day",
           header: "Flip Units/day (min side)",
-          value: (row) => row.flip_units_per_day,
+          value: (row) => getPeaksMetric(row, "flip_units_per_day"),
           format: formatCount
         },
         {
           key: "flip_cap_units_per_day",
           header: "Flip Cap units/day",
-          value: (row) => row.flip_cap_units_per_day,
+          value: (row) => getPeaksMetric(row, "flip_cap_units_per_day"),
           format: formatCount
         },
         {
           key: "flip_flow_balance_pct",
           header: "Flip Tail Balance",
-          value: (row) => row.flip_flow_balance_pct,
+          value: (row) => getPeaksMetric(row, "flip_flow_balance_pct"),
           format: (v) => (Number.isFinite(v) ? v.toFixed(0) + "%" : "-")
         },
         {
           key: "flip_expected_gp_per_day",
           header: "Flip Expected GP/day",
-          value: (row) => row.flip_expected_gp_per_day,
+          value: (row) => getPeaksMetric(row, "flip_expected_gp_per_day"),
           format: formatGpCompact
         },
         {
           key: "spread_pct_mean",
           header: "Spread % (mean)",
-          value: (row) => row.spread_pct_mean,
+          value: (row) => getPeaksMetric(row, "spread_pct_mean"),
           format: (v) => (Number.isFinite(v) ? v.toFixed(2) + "%" : "-")
         },
         {
           key: "flip_cycles_per_day",
           header: "Flip Cycles/day",
-          value: (row) => row.flip_cycles_per_day,
+          value: (row) => getPeaksMetric(row, "flip_cycles_per_day"),
           format: (v) => (Number.isFinite(v) ? v.toFixed(2) : "-")
         },
         {
           key: "flip_cycle_median_hours",
           header: "Flip Cycle (median)",
-          value: (row) => row.flip_cycle_median_hours,
+          value: (row) => getPeaksMetric(row, "flip_cycle_median_hours"),
           format: formatHours
         },
 	        {
 	          key: "sharpness",
 	          header: "Sharpness",
-	          value: (row) => row.score,
+	          value: (row) => getPeaksMetric(row, "score"),
 	          format: (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : "-")
 	        },
         {
           key: "peaks_count",
           header: "Peaks Count",
-          value: (row) => row.peaks_count,
+          value: (row) => getPeaksMetric(row, "peaks_count"),
           format: formatCount
         },
 	        {
@@ -3192,7 +3186,7 @@ const HTML = `<!DOCTYPE html>
 		        {
 		          key: "time_since_last_peak_days",
 		          header: "Time Since Last Peak",
-		          value: (row) => row.time_since_last_peak_days,
+		          value: (row) => getPeaksMetric(row, "time_since_last_peak_days"),
 	          format: formatDays
 	        },
 		        {
@@ -3200,14 +3194,14 @@ const HTML = `<!DOCTYPE html>
 		          header: "Average Time Between Peaks",
 		          value: (row) => {
 		            if (!row) return null;
-		            const peaksCount = row.peaks_count;
+		            const peaksCount = getPeaksMetric(row, "peaks_count");
 		            if (
 		              Number.isFinite(peaksCount) &&
 		              Math.round(peaksCount) <= 1
 		            ) {
 		              return null;
 		            }
-		            return row.avg_time_between_peaks_days;
+		            return getPeaksMetric(row, "avg_time_between_peaks_days");
 		          },
 			          format: formatDays
 			        }
@@ -3454,25 +3448,12 @@ const HTML = `<!DOCTYPE html>
 	        });
 
 			        tr.addEventListener("click", () => {
-			          loadPriceSeries(Number(row.item_id), row.name || ("Item " + row.item_id), {
-			            showForecast: false,
-			            highlightPeaks: true,
-		            peakBaselinePrice: row.low_avg_price,
-		            peakBaselineHalfWindowDays: peaksBaselineHalfWindowDays,
-		            peakExpectedCount: row.peaks_count,
-		            peakWindowDays: peaksWindowDays,
-                midOutlierApplied: Boolean(row && row.mid_outlier_applied),
-                midOutlierThreshold: row ? row.mid_outlier_threshold : null,
-                midOutlierRemovedPoints: row ? row.mid_outlier_removed_points : null,
-                midOutlierAboveMeanMult:
-                  row && typeof row.mid_outlier_above_mean_mult === "number"
-                    ? row.mid_outlier_above_mean_mult
-                    : peaksMidOutlierAboveMeanMult,
-                midOutlierRefAboveMeanAvgPrice: row
-                  ? row.mid_outlier_ref_above_mean_avg_price
-                  : null
-		          });
-		        });
+			          loadPriceSeries(
+			            Number(row.item_id),
+			            row.name || ("Item " + row.item_id),
+			            buildPeaksPriceSeriesOpts(row)
+			          );
+			        });
 
         tbody.appendChild(tr);
       });
@@ -4312,13 +4293,6 @@ const HTML = `<!DOCTYPE html>
 	      setSelectedItem(itemId);
 	      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
 	      priceStatusEl.textContent = "Loading price series...";
-        lastPriceSeriesArgs = {
-          itemId: Number(itemId),
-          name: name,
-          opts: opts && typeof opts === "object" ? Object.assign({}, opts) : null
-        };
-        currentPriceSeriesOutlier = null;
-        updatePeaksOutlierMaskButton();
 
 	      try {
 	        const showForecast = !(opts && opts.showForecast === false);
@@ -4330,8 +4304,6 @@ const HTML = `<!DOCTYPE html>
             priceChart.destroy();
             priceChart = null;
           }
-          currentPriceSeriesOutlier = null;
-          updatePeaksOutlierMaskButton();
 	          setChartScrollVisible(false);
           return;
         }
@@ -4346,8 +4318,6 @@ const HTML = `<!DOCTYPE html>
             priceChart.destroy();
             priceChart = null;
           }
-          currentPriceSeriesOutlier = null;
-          updatePeaksOutlierMaskButton();
 	          setChartScrollVisible(false);
           return;
         }
@@ -4375,7 +4345,6 @@ const HTML = `<!DOCTYPE html>
 		        const starMarkerData = tl.starMarkerData;
 		        const nowMarkerData = tl.nowMarkerData;
 
-          const midOutlierApplied = Boolean(opts && opts.midOutlierApplied);
           const midOutlierThreshold = opts ? Number(opts.midOutlierThreshold) : NaN;
           const midOutlierMultFromRow = opts ? Number(opts.midOutlierAboveMeanMult) : NaN;
           const midOutlierRefAboveMeanAvgPrice = opts
@@ -4386,71 +4355,62 @@ const HTML = `<!DOCTYPE html>
             Number.isFinite(midOutlierMultFromRow) && midOutlierMultFromRow > 0
               ? midOutlierMultFromRow
               : peaksMidOutlierAboveMeanMult;
-          const midOutlierConfigured = Number.isFinite(midOutlierMult) && midOutlierMult > 0;
           const canMaskOutliers =
-            midOutlierConfigured &&
-            midOutlierApplied &&
             Number.isFinite(midOutlierThreshold) &&
             midOutlierThreshold > 0 &&
             Array.isArray(histData);
 
-          currentPriceSeriesOutlier = midOutlierConfigured
-            ? {
-                configured: true,
-                canMask: canMaskOutliers,
-                threshold: canMaskOutliers ? midOutlierThreshold : null,
-                mult: Number.isFinite(midOutlierMult) && midOutlierMult > 0 ? midOutlierMult : null,
-                refAboveMeanAvgPrice:
-                  Number.isFinite(midOutlierRefAboveMeanAvgPrice) && midOutlierRefAboveMeanAvgPrice > 0
-                    ? midOutlierRefAboveMeanAvgPrice
-                    : null
-              }
-            : null;
-          updatePeaksOutlierMaskButton();
-
-          const shouldMaskOutliers = canMaskOutliers && peaksOutlierMaskEnabled;
+          const shouldMaskOutliers =
+            canMaskOutliers && peaksOutlierMaskEnabled && activeTab === "peaks";
           let midOutlierMaskedCount = 0;
+          let midOutlierWouldMaskCount = 0;
           let midOutlierInfoText = "";
           if (canMaskOutliers) {
             const thrText = Math.round(midOutlierThreshold).toLocaleString("en-US");
             const multText =
               Number.isFinite(midOutlierMult) && midOutlierMult > 0 ? midOutlierMult : null;
-            if (shouldMaskOutliers) {
-              for (let i = 0; i < histData.length; i++) {
-                const v = histData[i];
-                if (v != null && Number.isFinite(v) && v > midOutlierThreshold) {
-                  histData[i] = null;
-                  if (Array.isArray(avgHighData) && i < avgHighData.length) {
-                    avgHighData[i] = null;
-                  }
-                  if (Array.isArray(avgLowData) && i < avgLowData.length) {
-                    avgLowData[i] = null;
-                  }
-                  if (Array.isArray(starMarkerData) && i < starMarkerData.length) {
-                    starMarkerData[i] = null;
-                  }
-                  if (Array.isArray(nowMarkerData) && i < nowMarkerData.length) {
-                    nowMarkerData[i] = null;
-                  }
-                  midOutlierMaskedCount += 1;
-                }
-              }
+            const refText =
+              Number.isFinite(midOutlierRefAboveMeanAvgPrice) && midOutlierRefAboveMeanAvgPrice > 0
+                ? Math.round(midOutlierRefAboveMeanAvgPrice).toLocaleString("en-US")
+                : null;
 
-              if (midOutlierMaskedCount > 0) {
-                midOutlierInfoText =
-                  " Outlier mask: on (blanked " +
-                  midOutlierMaskedCount +
-                  " buckets; mid > " +
-                  (multText != null ? multText + "× above-mean avg ≈ " : "") +
-                  thrText +
-                  ").";
+            for (let i = 0; i < histData.length; i++) {
+              const v = histData[i];
+              if (!(v != null && Number.isFinite(v) && v > midOutlierThreshold)) continue;
+              midOutlierWouldMaskCount += 1;
+              if (!shouldMaskOutliers) continue;
+
+              histData[i] = null;
+              if (Array.isArray(avgHighData) && i < avgHighData.length) {
+                avgHighData[i] = null;
               }
-            } else {
-              midOutlierInfoText =
-                " Outlier mask: off (mid > " +
-                (multText != null ? multText + "× above-mean avg ≈ " : "") +
+              if (Array.isArray(avgLowData) && i < avgLowData.length) {
+                avgLowData[i] = null;
+              }
+              if (Array.isArray(starMarkerData) && i < starMarkerData.length) {
+                starMarkerData[i] = null;
+              }
+              if (Array.isArray(nowMarkerData) && i < nowMarkerData.length) {
+                nowMarkerData[i] = null;
+              }
+              midOutlierMaskedCount += 1;
+            }
+
+            if (midOutlierWouldMaskCount > 0) {
+              const base =
+                " Outlier filter: " +
+                (shouldMaskOutliers ? "on" : "off") +
+                " (" +
+                (shouldMaskOutliers
+                  ? "blanked " + midOutlierMaskedCount + " buckets"
+                  : "would blank " + midOutlierWouldMaskCount + " buckets") +
+                "; mid > " +
+                (multText != null && refText != null
+                  ? multText + "× above-mean avg ≈ " + refText + " gp → "
+                  : "") +
                 thrText +
                 ").";
+              midOutlierInfoText = base;
             }
           }
           const breakMaskedGaps = shouldMaskOutliers && midOutlierMaskedCount > 0;
@@ -5051,8 +5011,6 @@ const HTML = `<!DOCTYPE html>
           priceChart.destroy();
           priceChart = null;
         }
-        currentPriceSeriesOutlier = null;
-        updatePeaksOutlierMaskButton();
 	        setChartScrollVisible(false);
       }
     }

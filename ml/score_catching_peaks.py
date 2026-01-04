@@ -730,21 +730,32 @@ def compute_catching_peaks_metric(
     pts.sort(key=lambda x: x[0])
     side_pts.sort(key=lambda x: x[0])
 
+    pts_raw = pts
+    side_pts_raw = side_pts
+
+    metric_raw = _compute_metric_from_pts(
+        pts_raw,
+        side_pts_raw,
+        now_ms=now_ms,
+        cutoff24h_ms=cutoff24h_ms,
+        window_days=window_days,
+        trade_limit_4h=trade_limit_4h,
+        tax_rate=tax_rate,
+    )
+    if metric_raw is None:
+        return None
+
+    out = dict(metric_raw)
+
     outlier_mult = MID_OUTLIER_ABOVE_MEAN_MULT
     if not np.isfinite(outlier_mult) or outlier_mult <= 0:
         outlier_mult = float("nan")
 
-    ref_above_mean_avg_price: Optional[float] = None
-    outlier_threshold: Optional[float] = None
-    outlier_removed_points = 0
-    outlier_applied = False
+    if np.isfinite(outlier_mult):
+        ref_above_mean_avg_price: Optional[float] = None
+        outlier_threshold: Optional[float] = None
+        outlier_removed_points = 0
 
-    pts_raw = pts
-    side_pts_raw = side_pts
-    pts_use = pts_raw
-    side_pts_use = side_pts_raw
-
-    if np.isfinite(outlier_mult) and pts_raw:
         raw_prices = np.array([p for _, p, _ in pts_raw], dtype="float64")
         if raw_prices.size:
             mean_raw = float(np.mean(raw_prices))
@@ -760,61 +771,53 @@ def compute_catching_peaks_metric(
         ):
             outlier_threshold = float(outlier_mult) * float(ref_above_mean_avg_price)
 
+        pts_filtered = pts_raw
+        side_pts_filtered = side_pts_raw
         if outlier_threshold is not None and np.isfinite(outlier_threshold) and outlier_threshold > 0:
-            pts_filtered = [p for p in pts_raw if p[1] <= float(outlier_threshold)]
-            side_pts_filtered = [sp for sp in side_pts_raw if sp[1] <= float(outlier_threshold)]
+            thr = float(outlier_threshold)
+            pts_filtered = [p for p in pts_raw if p[1] <= thr]
+            side_pts_filtered = [sp for sp in side_pts_raw if sp[1] <= thr]
             outlier_removed_points = len(pts_raw) - len(pts_filtered)
-            if outlier_removed_points > 0 and len(pts_filtered) >= 30:
-                pts_use = pts_filtered
-                side_pts_use = side_pts_filtered
-                outlier_applied = True
-            else:
-                outlier_threshold = None
-                outlier_removed_points = 0
 
-    metric = _compute_metric_from_pts(
-        pts_use,
-        side_pts_use,
-        now_ms=now_ms,
-        cutoff24h_ms=cutoff24h_ms,
-        window_days=window_days,
-        trade_limit_4h=trade_limit_4h,
-        tax_rate=tax_rate,
-    )
+        metric_masked = None
+        if (
+            outlier_threshold is not None
+            and np.isfinite(outlier_threshold)
+            and outlier_threshold > 0
+            and len(pts_filtered) >= 30
+        ):
+            metric_masked = _compute_metric_from_pts(
+                pts_filtered,
+                side_pts_filtered,
+                now_ms=now_ms,
+                cutoff24h_ms=cutoff24h_ms,
+                window_days=window_days,
+                trade_limit_4h=trade_limit_4h,
+                tax_rate=tax_rate,
+            )
 
-    if metric is None and outlier_applied:
-        metric = _compute_metric_from_pts(
-            pts_raw,
-            side_pts_raw,
-            now_ms=now_ms,
-            cutoff24h_ms=cutoff24h_ms,
-            window_days=window_days,
-            trade_limit_4h=trade_limit_4h,
-            tax_rate=tax_rate,
-        )
-        outlier_applied = False
-        outlier_threshold = None
-        outlier_removed_points = 0
+        # Always provide _masked keys when the feature is enabled; fall back to raw
+        # metrics if masking produced too few points for a stable estimate.
+        if metric_masked is None:
+            metric_masked = metric_raw
 
-    if metric is None:
-        return None
-
-    if np.isfinite(outlier_mult):
-        metric["mid_outlier_above_mean_mult"] = float(outlier_mult)
-        metric["mid_outlier_ref_above_mean_avg_price"] = (
+        out["mid_outlier_above_mean_mult"] = float(outlier_mult)
+        out["mid_outlier_ref_above_mean_avg_price"] = (
             float(ref_above_mean_avg_price)
             if ref_above_mean_avg_price is not None and np.isfinite(ref_above_mean_avg_price)
             else None
         )
-        metric["mid_outlier_threshold"] = (
+        out["mid_outlier_threshold"] = (
             float(outlier_threshold)
             if outlier_threshold is not None and np.isfinite(outlier_threshold)
             else None
         )
-        metric["mid_outlier_removed_points"] = int(outlier_removed_points)
-        metric["mid_outlier_applied"] = bool(outlier_applied)
+        out["mid_outlier_removed_points"] = int(outlier_removed_points)
 
-    return metric
+        for k, v in metric_masked.items():
+            out[f"{k}_masked"] = v
+
+    return out
 
 
 def load_latest_mapping(s3, bucket) -> Dict[int, Dict[str, Any]]:
