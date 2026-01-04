@@ -628,6 +628,7 @@ const HTML = `<!DOCTYPE html>
 	        <button type="button" class="peaks-toggle-btn" data-series-toggle="avgLow">Avg low</button>
 	        <button type="button" class="peaks-toggle-btn" data-series-toggle="highVol">High vol</button>
 	        <button type="button" class="peaks-toggle-btn" data-series-toggle="lowVol">Low vol</button>
+          <button type="button" class="peaks-toggle-btn" id="peaksOutlierMaskBtn" hidden>Outlier mask</button>
 	      </div>
 	      <div class="chart-wrapper">
 	        <canvas id="priceChart"></canvas>
@@ -664,6 +665,7 @@ const HTML = `<!DOCTYPE html>
     const priceSeriesToggleButtons = Array.from(
       document.querySelectorAll("[data-series-toggle]")
     );
+    const peaksOutlierMaskBtn = document.getElementById("peaksOutlierMaskBtn");
 	    const volumeCoverageMinPctEl = document.getElementById("volumeCoverageMinPct");
 	    const volumeCoverageMinPctValueEl = document.getElementById(
 	      "volumeCoverageMinPctValue"
@@ -704,6 +706,7 @@ const HTML = `<!DOCTYPE html>
 		    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
 		    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
 		    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
+        const PEAKS_OUTLIER_MASK_KEY = "osrs_ge_peaks_outlier_mask_enabled_v1";
         const PEAKS_CONFIGS_KEY = "osrs_ge_peaks_configs_v1";
         const PEAKS_ACTIVE_CONFIG_ID_KEY = "osrs_ge_peaks_active_config_id_v1";
         const PEAKS_CUSTOM_STATE_KEY = "osrs_ge_peaks_custom_state_v1";
@@ -741,6 +744,9 @@ const HTML = `<!DOCTYPE html>
 			    let peaksWindowDays = null;
 			    let peaksBaselineHalfWindowDays = null;
           let peaksMidOutlierAboveMeanMult = null;
+          let peaksOutlierMaskEnabled = true;
+          let lastPriceSeriesArgs = null;
+          let currentPriceSeriesOutlier = null;
 			    let peaksSortKey = "sharpness";
 			    let peaksSortDir = "desc";
 			    const DEFAULT_PEAK_WEIGHT = 100;
@@ -1154,6 +1160,7 @@ const HTML = `<!DOCTYPE html>
 	      }
 	      moveChartToTab(active);
 	      syncForecastVisibilityForTab(active);
+        updatePeaksOutlierMaskButton();
 	      try {
 	        window.localStorage.setItem(ACTIVE_TAB_KEY, active);
 	      } catch (_) {}
@@ -1262,6 +1269,97 @@ const HTML = `<!DOCTYPE html>
 	        });
 	      });
 	    }
+
+        function loadPeaksOutlierMaskEnabled() {
+          try {
+            const raw = window.localStorage.getItem(PEAKS_OUTLIER_MASK_KEY);
+            if (raw == null || raw === "") return true;
+            if (raw === "0" || raw === "false") return false;
+            if (raw === "1" || raw === "true") return true;
+            return true;
+          } catch (_) {
+            return true;
+          }
+        }
+
+        function savePeaksOutlierMaskEnabled(v) {
+          try {
+            window.localStorage.setItem(PEAKS_OUTLIER_MASK_KEY, v ? "1" : "0");
+          } catch (_) {}
+        }
+
+        function updatePeaksOutlierMaskButton() {
+          if (!peaksOutlierMaskBtn) return;
+
+          const configured =
+            (Number.isFinite(peaksMidOutlierAboveMeanMult) && peaksMidOutlierAboveMeanMult > 0) ||
+            (currentPriceSeriesOutlier && currentPriceSeriesOutlier.configured);
+          const shouldShow = activeTab === "peaks" && configured;
+          peaksOutlierMaskBtn.hidden = !shouldShow;
+          if (!shouldShow) return;
+
+          const canMask = Boolean(currentPriceSeriesOutlier && currentPriceSeriesOutlier.canMask);
+          const isOn = canMask && peaksOutlierMaskEnabled;
+          peaksOutlierMaskBtn.disabled = !canMask;
+          peaksOutlierMaskBtn.classList.toggle("active", isOn);
+          peaksOutlierMaskBtn.textContent = canMask
+            ? isOn
+              ? "Outlier mask: on"
+              : "Outlier mask: off"
+            : "Outlier mask: n/a";
+
+          if (!canMask) {
+            peaksOutlierMaskBtn.title =
+              selectedItemId == null
+                ? "Select an item in Catching Peaks to enable the outlier mask."
+                : "No outlier buckets to mask for this item.";
+            return;
+          }
+
+          const thr = currentPriceSeriesOutlier ? currentPriceSeriesOutlier.threshold : null;
+          const mult = currentPriceSeriesOutlier ? currentPriceSeriesOutlier.mult : null;
+          const ref = currentPriceSeriesOutlier ? currentPriceSeriesOutlier.refAboveMeanAvgPrice : null;
+
+          const thrText =
+            thr != null && Number.isFinite(thr)
+              ? Math.round(thr).toLocaleString("en-US")
+              : "?";
+          let title = "Hide buckets where mid > " + thrText + " gp.";
+          if (mult != null && Number.isFinite(mult) && mult > 0 && ref != null && Number.isFinite(ref) && ref > 0) {
+            title =
+              "Hide buckets where mid > " +
+              mult +
+              "× above-mean avg (" +
+              Math.round(ref).toLocaleString("en-US") +
+              " gp) ≈ " +
+              thrText +
+              " gp.";
+          }
+          peaksOutlierMaskBtn.title = title;
+        }
+
+        peaksOutlierMaskEnabled = loadPeaksOutlierMaskEnabled();
+        updatePeaksOutlierMaskButton();
+        if (peaksOutlierMaskBtn) {
+          peaksOutlierMaskBtn.addEventListener("click", () => {
+            if (peaksOutlierMaskBtn.disabled) return;
+            peaksOutlierMaskEnabled = !peaksOutlierMaskEnabled;
+            savePeaksOutlierMaskEnabled(peaksOutlierMaskEnabled);
+            updatePeaksOutlierMaskButton();
+
+            if (
+              lastPriceSeriesArgs &&
+              Number.isFinite(lastPriceSeriesArgs.itemId) &&
+              lastPriceSeriesArgs.itemId > 0
+            ) {
+              loadPriceSeries(
+                lastPriceSeriesArgs.itemId,
+                lastPriceSeriesArgs.name,
+                lastPriceSeriesArgs.opts
+              );
+            }
+          });
+        }
 
 	    function loadVolumeCoverageMinPct() {
 	      try {
@@ -4214,6 +4312,13 @@ const HTML = `<!DOCTYPE html>
 	      setSelectedItem(itemId);
 	      priceTitleEl.textContent = "Price for " + name + " (id " + itemId + ")";
 	      priceStatusEl.textContent = "Loading price series...";
+        lastPriceSeriesArgs = {
+          itemId: Number(itemId),
+          name: name,
+          opts: opts && typeof opts === "object" ? Object.assign({}, opts) : null
+        };
+        currentPriceSeriesOutlier = null;
+        updatePeaksOutlierMaskButton();
 
 	      try {
 	        const showForecast = !(opts && opts.showForecast === false);
@@ -4225,6 +4330,8 @@ const HTML = `<!DOCTYPE html>
             priceChart.destroy();
             priceChart = null;
           }
+          currentPriceSeriesOutlier = null;
+          updatePeaksOutlierMaskButton();
 	          setChartScrollVisible(false);
           return;
         }
@@ -4239,6 +4346,8 @@ const HTML = `<!DOCTYPE html>
             priceChart.destroy();
             priceChart = null;
           }
+          currentPriceSeriesOutlier = null;
+          updatePeaksOutlierMaskButton();
 	          setChartScrollVisible(false);
           return;
         }
@@ -4268,57 +4377,83 @@ const HTML = `<!DOCTYPE html>
 
           const midOutlierApplied = Boolean(opts && opts.midOutlierApplied);
           const midOutlierThreshold = opts ? Number(opts.midOutlierThreshold) : NaN;
-          const midOutlierMult = opts ? Number(opts.midOutlierAboveMeanMult) : NaN;
-          let midOutlierMaskedCount = 0;
-          let midOutlierInfoText = "";
-          if (
+          const midOutlierMultFromRow = opts ? Number(opts.midOutlierAboveMeanMult) : NaN;
+          const midOutlierRefAboveMeanAvgPrice = opts
+            ? Number(opts.midOutlierRefAboveMeanAvgPrice)
+            : NaN;
+
+          const midOutlierMult =
+            Number.isFinite(midOutlierMultFromRow) && midOutlierMultFromRow > 0
+              ? midOutlierMultFromRow
+              : peaksMidOutlierAboveMeanMult;
+          const midOutlierConfigured = Number.isFinite(midOutlierMult) && midOutlierMult > 0;
+          const canMaskOutliers =
+            midOutlierConfigured &&
             midOutlierApplied &&
             Number.isFinite(midOutlierThreshold) &&
             midOutlierThreshold > 0 &&
-            Array.isArray(histData)
-          ) {
-            for (let i = 0; i < histData.length; i++) {
-              const v = histData[i];
-              if (v != null && Number.isFinite(v) && v > midOutlierThreshold) {
-                histData[i] = null;
-                if (Array.isArray(avgHighData) && i < avgHighData.length) {
-                  avgHighData[i] = null;
-                }
-                if (Array.isArray(avgLowData) && i < avgLowData.length) {
-                  avgLowData[i] = null;
-                }
-                if (Array.isArray(starMarkerData) && i < starMarkerData.length) {
-                  starMarkerData[i] = null;
-                }
-                if (Array.isArray(nowMarkerData) && i < nowMarkerData.length) {
-                  nowMarkerData[i] = null;
-                }
-                midOutlierMaskedCount += 1;
-              }
-            }
+            Array.isArray(histData);
 
-            if (midOutlierMaskedCount > 0) {
-              const thr = Math.round(midOutlierThreshold).toLocaleString("en-US");
-              if (Number.isFinite(midOutlierMult) && midOutlierMult > 0) {
+          currentPriceSeriesOutlier = midOutlierConfigured
+            ? {
+                configured: true,
+                canMask: canMaskOutliers,
+                threshold: canMaskOutliers ? midOutlierThreshold : null,
+                mult: Number.isFinite(midOutlierMult) && midOutlierMult > 0 ? midOutlierMult : null,
+                refAboveMeanAvgPrice:
+                  Number.isFinite(midOutlierRefAboveMeanAvgPrice) && midOutlierRefAboveMeanAvgPrice > 0
+                    ? midOutlierRefAboveMeanAvgPrice
+                    : null
+              }
+            : null;
+          updatePeaksOutlierMaskButton();
+
+          const shouldMaskOutliers = canMaskOutliers && peaksOutlierMaskEnabled;
+          let midOutlierMaskedCount = 0;
+          let midOutlierInfoText = "";
+          if (canMaskOutliers) {
+            const thrText = Math.round(midOutlierThreshold).toLocaleString("en-US");
+            const multText =
+              Number.isFinite(midOutlierMult) && midOutlierMult > 0 ? midOutlierMult : null;
+            if (shouldMaskOutliers) {
+              for (let i = 0; i < histData.length; i++) {
+                const v = histData[i];
+                if (v != null && Number.isFinite(v) && v > midOutlierThreshold) {
+                  histData[i] = null;
+                  if (Array.isArray(avgHighData) && i < avgHighData.length) {
+                    avgHighData[i] = null;
+                  }
+                  if (Array.isArray(avgLowData) && i < avgLowData.length) {
+                    avgLowData[i] = null;
+                  }
+                  if (Array.isArray(starMarkerData) && i < starMarkerData.length) {
+                    starMarkerData[i] = null;
+                  }
+                  if (Array.isArray(nowMarkerData) && i < nowMarkerData.length) {
+                    nowMarkerData[i] = null;
+                  }
+                  midOutlierMaskedCount += 1;
+                }
+              }
+
+              if (midOutlierMaskedCount > 0) {
                 midOutlierInfoText =
-                  " Outlier mask: removed " +
+                  " Outlier mask: on (blanked " +
                   midOutlierMaskedCount +
-                  " buckets (mid > " +
-                  midOutlierMult +
-                  "× above-mean avg ≈ " +
-                  thr +
-                  ").";
-              } else {
-                midOutlierInfoText =
-                  " Outlier mask: removed " +
-                  midOutlierMaskedCount +
-                  " buckets (mid > " +
-                  thr +
+                  " buckets; mid > " +
+                  (multText != null ? multText + "× above-mean avg ≈ " : "") +
+                  thrText +
                   ").";
               }
+            } else {
+              midOutlierInfoText =
+                " Outlier mask: off (mid > " +
+                (multText != null ? multText + "× above-mean avg ≈ " : "") +
+                thrText +
+                ").";
             }
           }
-          const breakMaskedGaps = midOutlierMaskedCount > 0;
+          const breakMaskedGaps = shouldMaskOutliers && midOutlierMaskedCount > 0;
 
 	        latestVolumeTimeline = Array.isArray(volumeData) ? volumeData.slice() : [];
 	        const volWindow24h = computeBucketVolumeWindow(
@@ -4916,6 +5051,8 @@ const HTML = `<!DOCTYPE html>
           priceChart.destroy();
           priceChart = null;
         }
+        currentPriceSeriesOutlier = null;
+        updatePeaksOutlierMaskButton();
 	        setChartScrollVisible(false);
       }
     }
@@ -5074,6 +5211,7 @@ const HTML = `<!DOCTYPE html>
               }
             if (flipWarning) peaksMetaEl.textContent += flipWarning;
 		        }
+        updatePeaksOutlierMaskButton();
         renderPeaksTable();
       } catch (err) {
         console.error("Error loading catching-peaks overview:", err);
