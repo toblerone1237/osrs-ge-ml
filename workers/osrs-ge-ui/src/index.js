@@ -740,6 +740,7 @@ const HTML = `<!DOCTYPE html>
 			    let peaksLoaded = false;
 			    let peaksWindowDays = null;
 			    let peaksBaselineHalfWindowDays = null;
+          let peaksMidOutlierAboveMeanMult = null;
 			    let peaksSortKey = "sharpness";
 			    let peaksSortDir = "desc";
 			    const DEFAULT_PEAK_WEIGHT = 100;
@@ -3361,7 +3362,17 @@ const HTML = `<!DOCTYPE html>
 		            peakBaselinePrice: row.low_avg_price,
 		            peakBaselineHalfWindowDays: peaksBaselineHalfWindowDays,
 		            peakExpectedCount: row.peaks_count,
-		            peakWindowDays: peaksWindowDays
+		            peakWindowDays: peaksWindowDays,
+                midOutlierApplied: Boolean(row && row.mid_outlier_applied),
+                midOutlierThreshold: row ? row.mid_outlier_threshold : null,
+                midOutlierRemovedPoints: row ? row.mid_outlier_removed_points : null,
+                midOutlierAboveMeanMult:
+                  row && typeof row.mid_outlier_above_mean_mult === "number"
+                    ? row.mid_outlier_above_mean_mult
+                    : peaksMidOutlierAboveMeanMult,
+                midOutlierRefAboveMeanAvgPrice: row
+                  ? row.mid_outlier_ref_above_mean_avg_price
+                  : null
 		          });
 		        });
 
@@ -4255,6 +4266,60 @@ const HTML = `<!DOCTYPE html>
 		        const starMarkerData = tl.starMarkerData;
 		        const nowMarkerData = tl.nowMarkerData;
 
+          const midOutlierApplied = Boolean(opts && opts.midOutlierApplied);
+          const midOutlierThreshold = opts ? Number(opts.midOutlierThreshold) : NaN;
+          const midOutlierMult = opts ? Number(opts.midOutlierAboveMeanMult) : NaN;
+          let midOutlierMaskedCount = 0;
+          let midOutlierInfoText = "";
+          if (
+            midOutlierApplied &&
+            Number.isFinite(midOutlierThreshold) &&
+            midOutlierThreshold > 0 &&
+            Array.isArray(histData)
+          ) {
+            for (let i = 0; i < histData.length; i++) {
+              const v = histData[i];
+              if (v != null && Number.isFinite(v) && v > midOutlierThreshold) {
+                histData[i] = null;
+                if (Array.isArray(avgHighData) && i < avgHighData.length) {
+                  avgHighData[i] = null;
+                }
+                if (Array.isArray(avgLowData) && i < avgLowData.length) {
+                  avgLowData[i] = null;
+                }
+                if (Array.isArray(starMarkerData) && i < starMarkerData.length) {
+                  starMarkerData[i] = null;
+                }
+                if (Array.isArray(nowMarkerData) && i < nowMarkerData.length) {
+                  nowMarkerData[i] = null;
+                }
+                midOutlierMaskedCount += 1;
+              }
+            }
+
+            if (midOutlierMaskedCount > 0) {
+              const thr = Math.round(midOutlierThreshold).toLocaleString("en-US");
+              if (Number.isFinite(midOutlierMult) && midOutlierMult > 0) {
+                midOutlierInfoText =
+                  " Outlier mask: removed " +
+                  midOutlierMaskedCount +
+                  " buckets (mid > " +
+                  midOutlierMult +
+                  "× above-mean avg ≈ " +
+                  thr +
+                  ").";
+              } else {
+                midOutlierInfoText =
+                  " Outlier mask: removed " +
+                  midOutlierMaskedCount +
+                  " buckets (mid > " +
+                  thr +
+                  ").";
+              }
+            }
+          }
+          const breakMaskedGaps = midOutlierMaskedCount > 0;
+
 	        latestVolumeTimeline = Array.isArray(volumeData) ? volumeData.slice() : [];
 	        const volWindow24h = computeBucketVolumeWindow(
 	          labels,
@@ -4403,7 +4468,7 @@ const HTML = `<!DOCTYPE html>
 	          pointRadius: 0,
 	          borderWidth: 2,
 	          tension: 0.15,
-	          spanGaps: true
+	          spanGaps: !breakMaskedGaps
 	        };
 
 	        if (hasPeakSegments) {
@@ -4434,7 +4499,7 @@ const HTML = `<!DOCTYPE html>
 	          pointRadius: 0,
 	          borderWidth: 1.5,
 	          tension: 0.15,
-	          spanGaps: true,
+	          spanGaps: !breakMaskedGaps,
 	          hidden: !priceSeriesToggles.avgHigh
 	        };
 
@@ -4447,7 +4512,7 @@ const HTML = `<!DOCTYPE html>
 	          pointRadius: 0,
 	          borderWidth: 1.5,
 	          tension: 0.15,
-	          spanGaps: true,
+	          spanGaps: !breakMaskedGaps,
 	          hidden: !priceSeriesToggles.avgLow
 	        };
 
@@ -4823,7 +4888,8 @@ const HTML = `<!DOCTYPE html>
 			            lastTimestampText +
 			            volumeInfoText +
 			            " Forecast hidden on Catching Peaks view. Volume shown on right axis." +
-			            peakInfoText;
+			            peakInfoText +
+                  midOutlierInfoText;
 			        } else if (!hasForecast) {
 			          priceStatusEl.textContent =
 			            "No ML forecast for this item (no entry in the latest /signals snapshot). Showing history only. " +
@@ -4950,6 +5016,12 @@ const HTML = `<!DOCTYPE html>
 	        peaksBaselineHalfWindowDays = Number.isFinite(json.baseline_half_window_days)
 	          ? json.baseline_half_window_days
 	          : null;
+          peaksMidOutlierAboveMeanMult =
+            typeof json.mid_outlier_above_mean_mult === "number" &&
+            Number.isFinite(json.mid_outlier_above_mean_mult) &&
+            json.mid_outlier_above_mean_mult > 0
+              ? json.mid_outlier_above_mean_mult
+              : null;
 	        peaksStatusEl.textContent = "";
 		        if (peaksMetaEl) {
 		          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
@@ -4987,13 +5059,19 @@ const HTML = `<!DOCTYPE html>
 		            " days." +
 		            (baselineHalf != null ? " Peak baseline: ±" + baselineHalf + " days." : "") +
 	            (peaksTax != null ? " Tax: " + (peaksTax * 100).toFixed(1) + "%." : "") +
-	            (flipBuyQ != null && flipSellQ != null
-	              ? " Flip tails: buy p" +
-	                Math.round(flipBuyQ * 100) +
-	                " low, sell p" +
-	                Math.round(flipSellQ * 100) +
-	                " high."
-	              : "");
+			            (flipBuyQ != null && flipSellQ != null
+			              ? " Flip tails: buy p" +
+			                Math.round(flipBuyQ * 100) +
+			                " low, sell p" +
+			                Math.round(flipSellQ * 100) +
+			                " high."
+			              : "");
+              if (peaksMidOutlierAboveMeanMult != null) {
+                peaksMetaEl.textContent +=
+                  " Mid outlier mask: >" +
+                  peaksMidOutlierAboveMeanMult +
+                  "× above-mean avg.";
+              }
             if (flipWarning) peaksMetaEl.textContent += flipWarning;
 		        }
         renderPeaksTable();
