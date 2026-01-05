@@ -753,23 +753,46 @@ def compute_catching_peaks_metric(
 
     if np.isfinite(outlier_mult):
         ref_above_mean_avg_price: Optional[float] = None
+        ref_below_mean_avg_price: Optional[float] = None
+        ref_price: Optional[float] = None
+        ref_kind: Optional[str] = None
         outlier_threshold: Optional[float] = None
         outlier_removed_points = 0
 
         raw_prices = np.array([p for _, p, _ in pts_raw], dtype="float64")
+        mean_raw: Optional[float] = None
+        above_count = 0
+        below_count = 0
         if raw_prices.size:
             mean_raw = float(np.mean(raw_prices))
             if np.isfinite(mean_raw) and mean_raw > 0:
                 above_mask = raw_prices > mean_raw
-                if int(above_mask.sum()):
+                below_mask = raw_prices < mean_raw
+                above_count = int(above_mask.sum())
+                below_count = int(below_mask.sum())
+                if above_count:
                     ref_above_mean_avg_price = float(np.mean(raw_prices[above_mask]))
+                if below_count:
+                    ref_below_mean_avg_price = float(np.mean(raw_prices[below_mask]))
 
+        min_above_count = max(10, int(0.05 * int(raw_prices.size)))
         if (
             ref_above_mean_avg_price is not None
             and np.isfinite(ref_above_mean_avg_price)
             and ref_above_mean_avg_price > 0
+            and above_count >= min_above_count
         ):
-            outlier_threshold = float(outlier_mult) * float(ref_above_mean_avg_price)
+            ref_price = float(ref_above_mean_avg_price)
+            ref_kind = "above_mean_avg_price"
+        elif ref_below_mean_avg_price is not None and np.isfinite(ref_below_mean_avg_price) and ref_below_mean_avg_price > 0:
+            ref_price = float(ref_below_mean_avg_price)
+            ref_kind = "below_mean_avg_price"
+        elif mean_raw is not None and np.isfinite(mean_raw) and mean_raw > 0:
+            ref_price = float(mean_raw)
+            ref_kind = "mean_price"
+
+        if ref_price is not None and np.isfinite(ref_price) and ref_price > 0:
+            outlier_threshold = float(outlier_mult) * float(ref_price)
 
         pts_filtered = pts_raw
         side_pts_filtered = side_pts_raw
@@ -807,6 +830,10 @@ def compute_catching_peaks_metric(
             if ref_above_mean_avg_price is not None and np.isfinite(ref_above_mean_avg_price)
             else None
         )
+        out["mid_outlier_ref_price"] = (
+            float(ref_price) if ref_price is not None and np.isfinite(ref_price) else None
+        )
+        out["mid_outlier_ref_kind"] = ref_kind
         out["mid_outlier_threshold"] = (
             float(outlier_threshold)
             if outlier_threshold is not None and np.isfinite(outlier_threshold)

@@ -1305,8 +1305,13 @@ const HTML = `<!DOCTYPE html>
             peakExpectedCount: getPeaksMetric(row, "peaks_count"),
             peakWindowDays: peaksWindowDays,
             midOutlierThreshold: row.mid_outlier_threshold,
-            midOutlierAboveMeanMult: peaksMidOutlierAboveMeanMult,
-            midOutlierRefAboveMeanAvgPrice: row.mid_outlier_ref_above_mean_avg_price
+            midOutlierMult: peaksMidOutlierAboveMeanMult,
+            midOutlierRefPrice:
+              row.mid_outlier_ref_price != null
+                ? row.mid_outlier_ref_price
+                : row.mid_outlier_ref_above_mean_avg_price,
+            midOutlierRefKind:
+              typeof row.mid_outlier_ref_kind === "string" ? row.mid_outlier_ref_kind : null
           };
         }
 
@@ -1339,7 +1344,7 @@ const HTML = `<!DOCTYPE html>
           peaksOutlierMaskBtn.title =
             "When on: exclude buckets where mid > " +
             peaksMidOutlierAboveMeanMult +
-            "× above-mean avg from Catching Peaks metrics, and blank those sections on the chart.";
+            "× ref avg from Catching Peaks metrics, and blank those sections on the chart.";
         }
 
         peaksOutlierMaskEnabled = loadPeaksOutlierMaskEnabled();
@@ -4346,14 +4351,28 @@ const HTML = `<!DOCTYPE html>
 		        const nowMarkerData = tl.nowMarkerData;
 
           const midOutlierThreshold = opts ? Number(opts.midOutlierThreshold) : NaN;
-          const midOutlierMultFromRow = opts ? Number(opts.midOutlierAboveMeanMult) : NaN;
-          const midOutlierRefAboveMeanAvgPrice = opts
-            ? Number(opts.midOutlierRefAboveMeanAvgPrice)
+          const midOutlierMultFromOpts = opts
+            ? Number(
+                opts.midOutlierMult != null
+                  ? opts.midOutlierMult
+                  : opts.midOutlierAboveMeanMult
+              )
             : NaN;
+          const midOutlierRefPrice = opts
+            ? Number(
+                opts.midOutlierRefPrice != null
+                  ? opts.midOutlierRefPrice
+                  : opts.midOutlierRefAboveMeanAvgPrice
+              )
+            : NaN;
+          const midOutlierRefKind =
+            opts && typeof opts.midOutlierRefKind === "string"
+              ? opts.midOutlierRefKind
+              : null;
 
           const midOutlierMult =
-            Number.isFinite(midOutlierMultFromRow) && midOutlierMultFromRow > 0
-              ? midOutlierMultFromRow
+            Number.isFinite(midOutlierMultFromOpts) && midOutlierMultFromOpts > 0
+              ? midOutlierMultFromOpts
               : peaksMidOutlierAboveMeanMult;
           const canMaskOutliers =
             Number.isFinite(midOutlierThreshold) &&
@@ -4370,9 +4389,15 @@ const HTML = `<!DOCTYPE html>
             const multText =
               Number.isFinite(midOutlierMult) && midOutlierMult > 0 ? midOutlierMult : null;
             const refText =
-              Number.isFinite(midOutlierRefAboveMeanAvgPrice) && midOutlierRefAboveMeanAvgPrice > 0
-                ? Math.round(midOutlierRefAboveMeanAvgPrice).toLocaleString("en-US")
+              Number.isFinite(midOutlierRefPrice) && midOutlierRefPrice > 0
+                ? Math.round(midOutlierRefPrice).toLocaleString("en-US")
                 : null;
+            const refLabel =
+              midOutlierRefKind === "below_mean_avg_price"
+                ? "below-mean avg"
+                : midOutlierRefKind === "mean_price"
+                  ? "mean"
+                  : "above-mean avg";
 
             for (let i = 0; i < histData.length; i++) {
               const v = histData[i];
@@ -4406,7 +4431,7 @@ const HTML = `<!DOCTYPE html>
                   : "would blank " + midOutlierWouldMaskCount + " buckets") +
                 "; mid > " +
                 (multText != null && refText != null
-                  ? multText + "× above-mean avg ≈ " + refText + " gp → "
+                  ? multText + "× " + refLabel + " ≈ " + refText + " gp → "
                   : "") +
                 thrText +
                 ").";
@@ -5165,7 +5190,7 @@ const HTML = `<!DOCTYPE html>
                 peaksMetaEl.textContent +=
                   " Mid outlier mask: >" +
                   peaksMidOutlierAboveMeanMult +
-                  "× above-mean avg.";
+                  "× ref avg.";
               }
             if (flipWarning) peaksMetaEl.textContent += flipWarning;
 		        }
