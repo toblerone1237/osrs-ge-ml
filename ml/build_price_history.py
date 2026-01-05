@@ -1,6 +1,8 @@
 import os
 import json
 import math
+import random
+import time
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +20,10 @@ OLDER_INTERVAL_MIN = 30
 
 # Number of concurrent fetches for 5m snapshots
 SNAPSHOT_FETCH_WORKERS = int(os.environ.get("SNAPSHOT_FETCH_WORKERS", "8"))
+# Snapshot fetch retry behavior (helps with transient R2 streaming disconnects)
+SNAPSHOT_FETCH_ATTEMPTS = int(os.environ.get("SNAPSHOT_FETCH_ATTEMPTS", "5"))
+SNAPSHOT_FETCH_RETRY_BASE_S = float(os.environ.get("SNAPSHOT_FETCH_RETRY_BASE_S", "0.25"))
+SNAPSHOT_FETCH_RETRY_MAX_S = float(os.environ.get("SNAPSHOT_FETCH_RETRY_MAX_S", "4.0"))
 
 # Metadata key to track the last processed snapshot
 HISTORY_META_KEY = "history/_meta.json"
@@ -323,10 +329,42 @@ def load_existing_histories(s3, bucket: str, cutoff_oldest_unix: int, cutoff_rec
 
 
 def fetch_snapshot(s3, bucket: str, key: str):
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    snap = json.loads(obj["Body"].read())
-    five = snap.get("five_minute") or {}
-    return five
+    attempts = max(1, int(SNAPSHOT_FETCH_ATTEMPTS))
+    base_delay_s = float(SNAPSHOT_FETCH_RETRY_BASE_S) if SNAPSHOT_FETCH_RETRY_BASE_S > 0 else 0.25
+    max_delay_s = float(SNAPSHOT_FETCH_RETRY_MAX_S) if SNAPSHOT_FETCH_RETRY_MAX_S > 0 else 4.0
+
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        body = None
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            body = obj.get("Body")
+            raw = body.read() if body is not None else obj["Body"].read()
+            snap = json.loads(raw)
+            five = snap.get("five_minute") or {}
+            return five
+        except Exception as e:
+            last_err = e
+            if attempt >= attempts:
+                break
+
+            # Exponential backoff + jitter to reduce thundering-herd retries.
+            delay_s = min(max_delay_s, base_delay_s * (2 ** (attempt - 1)))
+            delay_s += random.random() * base_delay_s
+            print(
+                f"... snapshot fetch failed for {key} (attempt {attempt}/{attempts}): {type(e).__name__}: {e}; retrying in {delay_s:.2f}s"
+            )
+            time.sleep(delay_s)
+        finally:
+            try:
+                if body is not None:
+                    body.close()
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        f"Failed to fetch snapshot {key} after {attempts} attempts: {type(last_err).__name__}: {last_err}"
+    ) from last_err
 
 
 def apply_new_snapshots(
