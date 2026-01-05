@@ -23,7 +23,7 @@ except Exception:
     MID_OUTLIER_ABOVE_MEAN_MULT = float("nan")
 
 try:
-    MID_OUTLIER_REF_CAP_MULT = float(os.getenv("PEAKS_MID_OUTLIER_REF_CAP_MULT", "50"))
+    MID_OUTLIER_REF_CAP_MULT = float(os.getenv("PEAKS_MID_OUTLIER_REF_CAP_MULT", "20"))
 except Exception:
     MID_OUTLIER_REF_CAP_MULT = float("nan")
 
