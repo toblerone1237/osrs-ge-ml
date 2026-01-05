@@ -18,7 +18,7 @@ TAX_RATE = float(os.getenv("PEAKS_TAX_RATE", "0.02"))
 FLIP_BUY_Q = float(os.getenv("PEAKS_FLIP_BUY_Q", "0.10"))
 FLIP_SELL_Q = float(os.getenv("PEAKS_FLIP_SELL_Q", "0.90"))
 try:
-    MID_OUTLIER_ABOVE_MEAN_MULT = float(os.getenv("PEAKS_MID_OUTLIER_ABOVE_MEAN_MULT", "0"))
+    MID_OUTLIER_ABOVE_MEAN_MULT = float(os.getenv("PEAKS_MID_OUTLIER_ABOVE_MEAN_MULT", "3"))
 except Exception:
     MID_OUTLIER_ABOVE_MEAN_MULT = float("nan")
 
