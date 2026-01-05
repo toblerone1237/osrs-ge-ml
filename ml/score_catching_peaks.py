@@ -22,6 +22,11 @@ try:
 except Exception:
     MID_OUTLIER_ABOVE_MEAN_MULT = float("nan")
 
+try:
+    MID_OUTLIER_REF_CAP_MULT = float(os.getenv("PEAKS_MID_OUTLIER_REF_CAP_MULT", "50"))
+except Exception:
+    MID_OUTLIER_REF_CAP_MULT = float("nan")
+
 
 def _compute_metric_from_pts(
     pts: List[Tuple[float, float, float]],
@@ -791,6 +796,29 @@ def compute_catching_peaks_metric(
             ref_price = float(mean_raw)
             ref_kind = "mean_price"
 
+        cap_mult = MID_OUTLIER_REF_CAP_MULT
+        if not np.isfinite(cap_mult) or cap_mult <= 0:
+            cap_mult = float("nan")
+        low_avg_for_cap = metric_raw.get("low_avg_price")
+        try:
+            low_avg_for_cap_f = float(low_avg_for_cap) if low_avg_for_cap is not None else float("nan")
+        except Exception:
+            low_avg_for_cap_f = float("nan")
+        if (
+            np.isfinite(cap_mult)
+            and cap_mult > 0
+            and np.isfinite(low_avg_for_cap_f)
+            and low_avg_for_cap_f > 0
+            and ref_price is not None
+            and np.isfinite(ref_price)
+            and ref_price > float(cap_mult) * float(low_avg_for_cap_f)
+        ):
+            ref_price = float(cap_mult) * float(low_avg_for_cap_f)
+            if ref_kind is None:
+                ref_kind = "capped_low_avg_price"
+            elif "capped" not in ref_kind:
+                ref_kind = ref_kind + "_capped_low_avg_price"
+
         if ref_price is not None and np.isfinite(ref_price) and ref_price > 0:
             outlier_threshold = float(outlier_mult) * float(ref_price)
 
@@ -834,6 +862,11 @@ def compute_catching_peaks_metric(
             float(ref_price) if ref_price is not None and np.isfinite(ref_price) else None
         )
         out["mid_outlier_ref_kind"] = ref_kind
+        out["mid_outlier_ref_cap_mult"] = (
+            float(MID_OUTLIER_REF_CAP_MULT)
+            if np.isfinite(MID_OUTLIER_REF_CAP_MULT) and MID_OUTLIER_REF_CAP_MULT > 0
+            else None
+        )
         out["mid_outlier_threshold"] = (
             float(outlier_threshold)
             if outlier_threshold is not None and np.isfinite(outlier_threshold)
