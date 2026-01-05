@@ -743,7 +743,7 @@ const HTML = `<!DOCTYPE html>
 			    let peaksLoaded = false;
 			    let peaksWindowDays = null;
 			    let peaksBaselineHalfWindowDays = null;
-          let peaksMidOutlierAboveMeanMult = null;
+          let peaksMidOutlierAboveMedianMult = null;
           let peaksOutlierMaskEnabled = true;
 			    let peaksSortKey = "sharpness";
 			    let peaksSortDir = "desc";
@@ -1305,11 +1305,13 @@ const HTML = `<!DOCTYPE html>
             peakExpectedCount: getPeaksMetric(row, "peaks_count"),
             peakWindowDays: peaksWindowDays,
             midOutlierThreshold: row.mid_outlier_threshold,
-            midOutlierMult: peaksMidOutlierAboveMeanMult,
+            midOutlierMult: peaksMidOutlierAboveMedianMult,
             midOutlierRefPrice:
               row.mid_outlier_ref_price != null
                 ? row.mid_outlier_ref_price
-                : row.mid_outlier_ref_above_mean_avg_price,
+                : row.mid_outlier_ref_above_median_avg_price != null
+                  ? row.mid_outlier_ref_above_median_avg_price
+                  : row.mid_outlier_ref_above_mean_avg_price,
             midOutlierRefKind:
               typeof row.mid_outlier_ref_kind === "string" ? row.mid_outlier_ref_kind : null
           };
@@ -1330,8 +1332,8 @@ const HTML = `<!DOCTYPE html>
           if (!peaksOutlierMaskBtn) return;
 
           const configured =
-            Number.isFinite(peaksMidOutlierAboveMeanMult) &&
-            peaksMidOutlierAboveMeanMult > 0;
+            Number.isFinite(peaksMidOutlierAboveMedianMult) &&
+            peaksMidOutlierAboveMedianMult > 0;
           const shouldShow = activeTab === "peaks" && configured;
           peaksOutlierMaskBtn.hidden = !shouldShow;
           if (!shouldShow) return;
@@ -1343,7 +1345,7 @@ const HTML = `<!DOCTYPE html>
             : "Outlier filter: off";
           peaksOutlierMaskBtn.title =
             "When on: exclude buckets where mid > " +
-            peaksMidOutlierAboveMeanMult +
+            peaksMidOutlierAboveMedianMult +
             "× ref avg from Catching Peaks metrics, and blank those sections on the chart.";
         }
 
@@ -4355,14 +4357,18 @@ const HTML = `<!DOCTYPE html>
             ? Number(
                 opts.midOutlierMult != null
                   ? opts.midOutlierMult
-                  : opts.midOutlierAboveMeanMult
+                  : opts.midOutlierAboveMedianMult != null
+                    ? opts.midOutlierAboveMedianMult
+                    : opts.midOutlierAboveMeanMult
               )
             : NaN;
           const midOutlierRefPrice = opts
             ? Number(
                 opts.midOutlierRefPrice != null
                   ? opts.midOutlierRefPrice
-                  : opts.midOutlierRefAboveMeanAvgPrice
+                  : opts.midOutlierRefAboveMedianAvgPrice != null
+                    ? opts.midOutlierRefAboveMedianAvgPrice
+                    : opts.midOutlierRefAboveMeanAvgPrice
               )
             : NaN;
           const midOutlierRefKind =
@@ -4373,7 +4379,7 @@ const HTML = `<!DOCTYPE html>
           const midOutlierMult =
             Number.isFinite(midOutlierMultFromOpts) && midOutlierMultFromOpts > 0
               ? midOutlierMultFromOpts
-              : peaksMidOutlierAboveMeanMult;
+              : peaksMidOutlierAboveMedianMult;
           const canMaskOutliers =
             Number.isFinite(midOutlierThreshold) &&
             midOutlierThreshold > 0 &&
@@ -4392,12 +4398,22 @@ const HTML = `<!DOCTYPE html>
               Number.isFinite(midOutlierRefPrice) && midOutlierRefPrice > 0
                 ? Math.round(midOutlierRefPrice).toLocaleString("en-US")
                 : null;
-            const refLabel =
-              midOutlierRefKind === "below_mean_avg_price"
-                ? "below-mean avg"
-                : midOutlierRefKind === "mean_price"
-                  ? "mean"
-                  : "above-mean avg";
+            let refLabel = "ref avg";
+            if (typeof midOutlierRefKind === "string") {
+              if (midOutlierRefKind.startsWith("below_median_avg_price")) {
+                refLabel = "below-median avg";
+              } else if (midOutlierRefKind.startsWith("median_price")) {
+                refLabel = "median";
+              } else if (midOutlierRefKind.startsWith("above_median_avg_price")) {
+                refLabel = "above-median avg";
+              } else if (midOutlierRefKind.startsWith("below_mean_avg_price")) {
+                refLabel = "below-mean avg";
+              } else if (midOutlierRefKind.startsWith("mean_price")) {
+                refLabel = "mean";
+              } else if (midOutlierRefKind.startsWith("above_mean_avg_price")) {
+                refLabel = "above-mean avg";
+              }
+            }
 
             for (let i = 0; i < histData.length; i++) {
               const v = histData[i];
@@ -5136,12 +5152,16 @@ const HTML = `<!DOCTYPE html>
 	        peaksBaselineHalfWindowDays = Number.isFinite(json.baseline_half_window_days)
 	          ? json.baseline_half_window_days
 	          : null;
-          peaksMidOutlierAboveMeanMult =
-            typeof json.mid_outlier_above_mean_mult === "number" &&
-            Number.isFinite(json.mid_outlier_above_mean_mult) &&
-            json.mid_outlier_above_mean_mult > 0
-              ? json.mid_outlier_above_mean_mult
-              : null;
+          peaksMidOutlierAboveMedianMult =
+            typeof json.mid_outlier_above_median_mult === "number" &&
+            Number.isFinite(json.mid_outlier_above_median_mult) &&
+            json.mid_outlier_above_median_mult > 0
+              ? json.mid_outlier_above_median_mult
+              : typeof json.mid_outlier_above_mean_mult === "number" &&
+                  Number.isFinite(json.mid_outlier_above_mean_mult) &&
+                  json.mid_outlier_above_mean_mult > 0
+                ? json.mid_outlier_above_mean_mult
+                : null;
 	        peaksStatusEl.textContent = "";
 		        if (peaksMetaEl) {
 		          const baselineHalf = Number.isFinite(json.baseline_half_window_days)
@@ -5186,10 +5206,10 @@ const HTML = `<!DOCTYPE html>
 			                Math.round(flipSellQ * 100) +
 			                " high."
 			              : "");
-              if (peaksMidOutlierAboveMeanMult != null) {
+              if (peaksMidOutlierAboveMedianMult != null) {
                 peaksMetaEl.textContent +=
                   " Mid outlier mask: >" +
-                  peaksMidOutlierAboveMeanMult +
+                  peaksMidOutlierAboveMedianMult +
                   "× ref avg.";
               }
             if (flipWarning) peaksMetaEl.textContent += flipWarning;

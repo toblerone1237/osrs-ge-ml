@@ -18,9 +18,14 @@ TAX_RATE = float(os.getenv("PEAKS_TAX_RATE", "0.02"))
 FLIP_BUY_Q = float(os.getenv("PEAKS_FLIP_BUY_Q", "0.10"))
 FLIP_SELL_Q = float(os.getenv("PEAKS_FLIP_SELL_Q", "0.90"))
 try:
-    MID_OUTLIER_ABOVE_MEAN_MULT = float(os.getenv("PEAKS_MID_OUTLIER_ABOVE_MEAN_MULT", "3"))
+    MID_OUTLIER_ABOVE_MEDIAN_MULT = float(
+        os.getenv(
+            "PEAKS_MID_OUTLIER_ABOVE_MEDIAN_MULT",
+            os.getenv("PEAKS_MID_OUTLIER_ABOVE_MEAN_MULT", "3"),
+        )
+    )
 except Exception:
-    MID_OUTLIER_ABOVE_MEAN_MULT = float("nan")
+    MID_OUTLIER_ABOVE_MEDIAN_MULT = float("nan")
 
 try:
     MID_OUTLIER_REF_CAP_MULT = float(os.getenv("PEAKS_MID_OUTLIER_REF_CAP_MULT", "20"))
@@ -752,49 +757,53 @@ def compute_catching_peaks_metric(
 
     out = dict(metric_raw)
 
-    outlier_mult = MID_OUTLIER_ABOVE_MEAN_MULT
+    outlier_mult = MID_OUTLIER_ABOVE_MEDIAN_MULT
     if not np.isfinite(outlier_mult) or outlier_mult <= 0:
         outlier_mult = float("nan")
 
     if np.isfinite(outlier_mult):
-        ref_above_mean_avg_price: Optional[float] = None
-        ref_below_mean_avg_price: Optional[float] = None
+        ref_above_median_avg_price: Optional[float] = None
+        ref_below_median_avg_price: Optional[float] = None
         ref_price: Optional[float] = None
         ref_kind: Optional[str] = None
         outlier_threshold: Optional[float] = None
         outlier_removed_points = 0
 
         raw_prices = np.array([p for _, p, _ in pts_raw], dtype="float64")
-        mean_raw: Optional[float] = None
+        median_raw: Optional[float] = None
         above_count = 0
         below_count = 0
         if raw_prices.size:
-            mean_raw = float(np.mean(raw_prices))
-            if np.isfinite(mean_raw) and mean_raw > 0:
-                above_mask = raw_prices > mean_raw
-                below_mask = raw_prices < mean_raw
+            median_raw = float(np.median(raw_prices))
+            if np.isfinite(median_raw) and median_raw > 0:
+                above_mask = raw_prices > median_raw
+                below_mask = raw_prices < median_raw
                 above_count = int(above_mask.sum())
                 below_count = int(below_mask.sum())
                 if above_count:
-                    ref_above_mean_avg_price = float(np.mean(raw_prices[above_mask]))
+                    ref_above_median_avg_price = float(np.mean(raw_prices[above_mask]))
                 if below_count:
-                    ref_below_mean_avg_price = float(np.mean(raw_prices[below_mask]))
+                    ref_below_median_avg_price = float(np.mean(raw_prices[below_mask]))
 
         min_above_count = max(10, int(0.05 * int(raw_prices.size)))
         if (
-            ref_above_mean_avg_price is not None
-            and np.isfinite(ref_above_mean_avg_price)
-            and ref_above_mean_avg_price > 0
+            ref_above_median_avg_price is not None
+            and np.isfinite(ref_above_median_avg_price)
+            and ref_above_median_avg_price > 0
             and above_count >= min_above_count
         ):
-            ref_price = float(ref_above_mean_avg_price)
-            ref_kind = "above_mean_avg_price"
-        elif ref_below_mean_avg_price is not None and np.isfinite(ref_below_mean_avg_price) and ref_below_mean_avg_price > 0:
-            ref_price = float(ref_below_mean_avg_price)
-            ref_kind = "below_mean_avg_price"
-        elif mean_raw is not None and np.isfinite(mean_raw) and mean_raw > 0:
-            ref_price = float(mean_raw)
-            ref_kind = "mean_price"
+            ref_price = float(ref_above_median_avg_price)
+            ref_kind = "above_median_avg_price"
+        elif (
+            ref_below_median_avg_price is not None
+            and np.isfinite(ref_below_median_avg_price)
+            and ref_below_median_avg_price > 0
+        ):
+            ref_price = float(ref_below_median_avg_price)
+            ref_kind = "below_median_avg_price"
+        elif median_raw is not None and np.isfinite(median_raw) and median_raw > 0:
+            ref_price = float(median_raw)
+            ref_kind = "median_price"
 
         cap_mult = MID_OUTLIER_REF_CAP_MULT
         if not np.isfinite(cap_mult) or cap_mult <= 0:
@@ -852,12 +861,15 @@ def compute_catching_peaks_metric(
         if metric_masked is None:
             metric_masked = metric_raw
 
-        out["mid_outlier_above_mean_mult"] = float(outlier_mult)
-        out["mid_outlier_ref_above_mean_avg_price"] = (
-            float(ref_above_mean_avg_price)
-            if ref_above_mean_avg_price is not None and np.isfinite(ref_above_mean_avg_price)
+        out["mid_outlier_above_median_mult"] = float(outlier_mult)
+        out["mid_outlier_ref_above_median_avg_price"] = (
+            float(ref_above_median_avg_price)
+            if ref_above_median_avg_price is not None and np.isfinite(ref_above_median_avg_price)
             else None
         )
+        # Backwards-compatible keys (pre median ref).
+        out["mid_outlier_above_mean_mult"] = float(outlier_mult)
+        out["mid_outlier_ref_above_mean_avg_price"] = out["mid_outlier_ref_above_median_avg_price"]
         out["mid_outlier_ref_price"] = (
             float(ref_price) if ref_price is not None and np.isfinite(ref_price) else None
         )
@@ -1042,8 +1054,12 @@ def main():
         "tax_rate": TAX_RATE,
         "flip_buy_quantile": FLIP_BUY_Q,
         "flip_sell_quantile": FLIP_SELL_Q,
-        "mid_outlier_above_mean_mult": float(MID_OUTLIER_ABOVE_MEAN_MULT)
-        if np.isfinite(MID_OUTLIER_ABOVE_MEAN_MULT) and MID_OUTLIER_ABOVE_MEAN_MULT > 0
+        "mid_outlier_above_median_mult": float(MID_OUTLIER_ABOVE_MEDIAN_MULT)
+        if np.isfinite(MID_OUTLIER_ABOVE_MEDIAN_MULT) and MID_OUTLIER_ABOVE_MEDIAN_MULT > 0
+        else None,
+        # Backwards-compatible key (pre median ref).
+        "mid_outlier_above_mean_mult": float(MID_OUTLIER_ABOVE_MEDIAN_MULT)
+        if np.isfinite(MID_OUTLIER_ABOVE_MEDIAN_MULT) and MID_OUTLIER_ABOVE_MEDIAN_MULT > 0
         else None,
         "items_scanned": len(keys),
         "items": results,
