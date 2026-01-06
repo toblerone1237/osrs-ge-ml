@@ -363,10 +363,89 @@ const HTML = `<!DOCTYPE html>
           gap: 0.35rem;
           flex-wrap: wrap;
         }
-	    .peaks-weight-row {
-	      display: flex;
-	      flex-direction: column;
-	      gap: 0.25rem;
+        .peaks-columns-details {
+          margin-top: 0.6rem;
+          padding-top: 0.55rem;
+          border-top: 1px solid #1f2937;
+        }
+        .peaks-columns-details summary {
+          cursor: pointer;
+          user-select: none;
+          font-size: 0.85rem;
+          color: #e5e7eb;
+        }
+        .peaks-columns-details summary::-webkit-details-marker {
+          display: none;
+        }
+        .peaks-columns-details summary:before {
+          content: "▸";
+          display: inline-block;
+          margin-right: 0.35rem;
+          color: #9ca3af;
+        }
+        .peaks-columns-details[open] summary:before {
+          content: "▾";
+        }
+        .peaks-columns-list {
+          margin-top: 0.4rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+          max-height: 240px;
+          overflow-y: auto;
+          padding-right: 0.2rem;
+        }
+        .peaks-column-row {
+          display: flex;
+          align-items: center;
+          gap: 0.35rem;
+          padding: 0.25rem 0.35rem;
+          border: 1px solid #1f2937;
+          border-radius: 0.35rem;
+          background: rgba(17,24,39,0.35);
+        }
+        .peaks-column-row.hidden {
+          opacity: 0.65;
+        }
+        .peaks-column-row.drag-over {
+          border-color: #6b7280;
+          background: rgba(17,24,39,0.65);
+        }
+        .peaks-column-row.dragging {
+          opacity: 0.5;
+        }
+        .peaks-column-handle {
+          cursor: grab;
+          user-select: none;
+          color: #9ca3af;
+          font-size: 0.9rem;
+          line-height: 1;
+        }
+        .peaks-column-label {
+          flex: 1;
+          min-width: 0;
+          font-size: 0.8rem;
+          color: #e5e7eb;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .peaks-columns-actions {
+          margin-top: 0.4rem;
+          display: flex;
+          gap: 0.35rem;
+          flex-wrap: wrap;
+        }
+        th.draggable-col {
+          cursor: grab;
+        }
+        th.draggable-col.drag-over {
+          box-shadow: inset 0 -2px 0 rgba(250,204,21,0.65);
+        }
+		    .peaks-weight-row {
+		      display: flex;
+		      flex-direction: column;
+		      gap: 0.25rem;
 	      margin-bottom: 0.7rem;
 	    }
 	    .peaks-weight-label {
@@ -603,15 +682,16 @@ const HTML = `<!DOCTYPE html>
 	          <div id="peaksChartMount"></div>
 	        </div>
 
-	        <div class="peaks-tab-side">
-	          <div class="card peaks-sort-card">
-		            <h3>Sort &amp; filter</h3>
+		        <div class="peaks-tab-side">
+		          <div class="card peaks-sort-card">
+			            <h3>Sort &amp; filter</h3>
                 <div id="peaksConfigPane"></div>
-	            <div id="peaksSortPane"></div>
-	          </div>
-	        </div>
-	      </div>
-	    </div>
+                <div id="peaksColumnsPane"></div>
+		            <div id="peaksSortPane"></div>
+		          </div>
+		        </div>
+		      </div>
+		    </div>
 
 	    <div id="priceCard" class="card">
 	      <h2>Price history &amp; forecast</h2>
@@ -683,14 +763,15 @@ const HTML = `<!DOCTYPE html>
     const searchResultsEl = document.getElementById("searchResults");
     const pinnedListEl = document.getElementById("pinnedList");
 
-			    const peaksStatusEl = document.getElementById("peaksStatus");
-			    const peaksMetaEl = document.getElementById("peaksMeta");
-			    const peaksTableContainer = document.getElementById("peaksTableContainer");
-          const peaksConfigPaneEl = document.getElementById("peaksConfigPane");
-			    const peaksSortPaneEl = document.getElementById("peaksSortPane");
-			    const peaksSearchInput = document.getElementById("peaksSearchInput");
-			    const peaksSearchClearBtn = document.getElementById("peaksSearchClearBtn");
-			    const peaksSearchStatusEl = document.getElementById("peaksSearchStatus");
+				    const peaksStatusEl = document.getElementById("peaksStatus");
+				    const peaksMetaEl = document.getElementById("peaksMeta");
+				    const peaksTableContainer = document.getElementById("peaksTableContainer");
+	          const peaksConfigPaneEl = document.getElementById("peaksConfigPane");
+            const peaksColumnsPaneEl = document.getElementById("peaksColumnsPane");
+				    const peaksSortPaneEl = document.getElementById("peaksSortPane");
+				    const peaksSearchInput = document.getElementById("peaksSearchInput");
+				    const peaksSearchClearBtn = document.getElementById("peaksSearchClearBtn");
+				    const peaksSearchStatusEl = document.getElementById("peaksSearchStatus");
 			    const peaksShowAsPctBtn = document.getElementById("peaksShowAsPctBtn");
 			    const standardChartMount = document.getElementById("standardChartMount");
 			    const peaksChartMount = document.getElementById("peaksChartMount");
@@ -702,14 +783,15 @@ const HTML = `<!DOCTYPE html>
 		    const PIN_KEY = "osrs_ge_pins_v3";
 		    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
 		    const PRICE_SERIES_TOGGLES_KEY = "osrs_ge_price_series_toggles_v1";
-		    const VOLUME_COVERAGE_MIN_KEY = "osrs_ge_volume_coverage_min_pct_v1";
-		    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
-		    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
-		    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
-        const PEAKS_OUTLIER_MASK_KEY = "osrs_ge_peaks_outlier_mask_enabled_v1";
-        const PEAKS_CONFIGS_KEY = "osrs_ge_peaks_configs_v1";
-        const PEAKS_ACTIVE_CONFIG_ID_KEY = "osrs_ge_peaks_active_config_id_v1";
-        const PEAKS_CUSTOM_STATE_KEY = "osrs_ge_peaks_custom_state_v1";
+			    const VOLUME_COVERAGE_MIN_KEY = "osrs_ge_volume_coverage_min_pct_v1";
+			    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
+			    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
+          const PEAKS_COLUMNS_KEY = "osrs_ge_peaks_columns_v1";
+			    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
+	        const PEAKS_OUTLIER_MASK_KEY = "osrs_ge_peaks_outlier_mask_enabled_v1";
+	        const PEAKS_CONFIGS_KEY = "osrs_ge_peaks_configs_v1";
+	        const PEAKS_ACTIVE_CONFIG_ID_KEY = "osrs_ge_peaks_active_config_id_v1";
+	        const PEAKS_CUSTOM_STATE_KEY = "osrs_ge_peaks_custom_state_v1";
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -747,14 +829,19 @@ const HTML = `<!DOCTYPE html>
           let peaksOutlierMaskEnabled = true;
 			    let peaksSortKey = "sharpness";
 			    let peaksSortDir = "desc";
-			    const DEFAULT_PEAK_WEIGHT = 100;
-			    let peaksPercentWeights = {};
-			    let peaksColumnFilters = {};
-          let peaksConfigs = [];
-          let peaksActiveConfigId = null; // null => "Custom"
-			    let peaksSortPaneMode = "weights";
-			    let peaksSortPaneSignature = "";
-				    let peaksShowAsPercent = false;
+				    const DEFAULT_PEAK_WEIGHT = 100;
+				    let peaksPercentWeights = {};
+				    let peaksColumnFilters = {};
+            let peaksColumnPrefs = { order: [], hidden: {} };
+            let peaksColumnMeta = [];
+            let peaksColumnMetaSignature = "";
+            let peaksColumnsDetailsOpen = false;
+            let peaksColumnDragKey = null;
+	          let peaksConfigs = [];
+	          let peaksActiveConfigId = null; // null => "Custom"
+				    let peaksSortPaneMode = "weights";
+				    let peaksSortPaneSignature = "";
+					    let peaksShowAsPercent = false;
 				    let peaksSearchQuery = "";
 				    let peaksTableRenderScheduled = false;
 			    // Latest volume timeline for the active chart (aligned to labels)
@@ -1470,24 +1557,95 @@ const HTML = `<!DOCTYPE html>
 		      return {};
 		    }
 
-			    function savePeaksFilters(filters) {
-			      try {
-			        window.localStorage.setItem(
-			          PEAKS_FILTERS_KEY,
-			          JSON.stringify(filters || {})
-			        );
-			      } catch (err) {
-			        console.warn("Failed to save peaks filters:", err);
-			      }
-			    }
+				    function savePeaksFilters(filters) {
+				      try {
+				        window.localStorage.setItem(
+				          PEAKS_FILTERS_KEY,
+				          JSON.stringify(filters || {})
+				        );
+				      } catch (err) {
+				        console.warn("Failed to save peaks filters:", err);
+				      }
+				    }
 
-				    peaksPercentWeights = loadPeaksWeights();
-				    peaksColumnFilters = loadPeaksFilters();
-
-            function clampInt(v, lo, hi) {
-              const n = Math.round(clampNumber(v, lo, hi));
-              return Number.isFinite(n) ? n : lo;
+            function loadPeaksColumnPrefs() {
+              try {
+                const raw = window.localStorage.getItem(PEAKS_COLUMNS_KEY);
+                if (!raw) return { order: [], hidden: {} };
+                const obj = JSON.parse(raw);
+                if (!obj || typeof obj !== "object") return { order: [], hidden: {} };
+                return {
+                  order: Array.isArray(obj.order) ? obj.order : [],
+                  hidden: obj.hidden
+                };
+              } catch (err) {
+                console.warn("Failed to parse peaks columns:", err);
+              }
+              return { order: [], hidden: {} };
             }
+
+            function savePeaksColumnPrefs(prefs) {
+              try {
+                const obj = prefs && typeof prefs === "object" ? prefs : {};
+                window.localStorage.setItem(PEAKS_COLUMNS_KEY, JSON.stringify(obj));
+              } catch (err) {
+                console.warn("Failed to save peaks columns:", err);
+              }
+            }
+
+            function normalizePeaksColumnPrefs(rawPrefs, columnKeys) {
+              const keys = Array.isArray(columnKeys)
+                ? columnKeys.filter((k) => typeof k === "string" && k)
+                : [];
+              const keySet = new Set(keys);
+
+              const rawOrder =
+                rawPrefs && Array.isArray(rawPrefs.order) ? rawPrefs.order : [];
+              const seen = new Set();
+              const order = [];
+              rawOrder.forEach((k) => {
+                const key = typeof k === "string" ? k : "";
+                if (!key || !keySet.has(key) || seen.has(key)) return;
+                seen.add(key);
+                order.push(key);
+              });
+              keys.forEach((k) => {
+                if (seen.has(k)) return;
+                seen.add(k);
+                order.push(k);
+              });
+
+              const hiddenKeys = new Set();
+              const rawHidden = rawPrefs ? rawPrefs.hidden : null;
+              if (Array.isArray(rawHidden)) {
+                rawHidden.forEach((k) => {
+                  const key = typeof k === "string" ? k : "";
+                  if (key && keySet.has(key)) hiddenKeys.add(key);
+                });
+              } else if (rawHidden && typeof rawHidden === "object") {
+                Object.entries(rawHidden).forEach(([k, v]) => {
+                  const key = typeof k === "string" ? k : "";
+                  if (!key || !keySet.has(key) || !v) return;
+                  hiddenKeys.add(key);
+                });
+              }
+
+              const hidden = {};
+              keys.forEach((k) => {
+                if (hiddenKeys.has(k)) hidden[k] = true;
+              });
+
+              return { order, hidden };
+            }
+
+					    peaksPercentWeights = loadPeaksWeights();
+					    peaksColumnFilters = loadPeaksFilters();
+              peaksColumnPrefs = loadPeaksColumnPrefs();
+
+	            function clampInt(v, lo, hi) {
+	              const n = Math.round(clampNumber(v, lo, hi));
+	              return Number.isFinite(n) ? n : lo;
+	            }
 
             function cloneJsonSafe(obj) {
               try {
@@ -1882,21 +2040,22 @@ const HTML = `<!DOCTYPE html>
 
             peaksConfigs = loadPeaksConfigs();
             peaksActiveConfigId = loadPeaksActiveConfigId();
-            if (peaksActiveConfigId) {
-              const cfg = peaksConfigs.find((c) => c.id === peaksActiveConfigId);
-              if (cfg) {
-                applyPeaksState(cfg, { rerender: false });
-              } else {
-                peaksActiveConfigId = null;
-                savePeaksActiveConfigId("");
-              }
-            }
-            renderPeaksConfigPane();
+	            if (peaksActiveConfigId) {
+	              const cfg = peaksConfigs.find((c) => c.id === peaksActiveConfigId);
+	              if (cfg) {
+	                applyPeaksState(cfg, { rerender: false });
+	              } else {
+	                peaksActiveConfigId = null;
+	                savePeaksActiveConfigId("");
+	              }
+	            }
+	            renderPeaksConfigPane();
+            renderPeaksColumnsPane();
 
-				    function loadPeaksShowAsPercent() {
-				      try {
-				        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
-			      } catch (_) {
+					    function loadPeaksShowAsPercent() {
+					      try {
+					        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
+				      } catch (_) {
 		        return false;
 		      }
 		    }
@@ -2676,13 +2835,195 @@ const HTML = `<!DOCTYPE html>
 
       container.appendChild(right);
 
-      return container;
-	    }
+	      return container;
+		    }
 
-		    function renderPeaksSortPane({ displayColumns, percentColumns }) {
-		      if (!peaksSortPaneEl) return;
+        function reorderKeyList(order, movingKey, targetKey, after = false) {
+          const src = typeof movingKey === "string" ? movingKey : "";
+          const dst = typeof targetKey === "string" ? targetKey : "";
+          if (!src || !dst || src === dst) {
+            return Array.isArray(order) ? order.slice() : [];
+          }
 
-		      const mode = peaksSortPaneMode === "filters" ? "filters" : "weights";
+          const list = Array.isArray(order)
+            ? order.filter((k) => typeof k === "string" && k)
+            : [];
+          const without = list.filter((k) => k !== src);
+          const idx = without.indexOf(dst);
+          if (idx < 0) {
+            without.push(src);
+            return without;
+          }
+          without.splice(after ? idx + 1 : idx, 0, src);
+          return without;
+        }
+
+        function renderPeaksColumnsPane() {
+          if (!peaksColumnsPaneEl) return;
+          peaksColumnsPaneEl.innerHTML = "";
+
+          const details = document.createElement("details");
+          details.className = "peaks-columns-details";
+          details.open = Boolean(peaksColumnsDetailsOpen);
+          details.addEventListener("toggle", () => {
+            peaksColumnsDetailsOpen = Boolean(details.open);
+          });
+
+          const summary = document.createElement("summary");
+          summary.textContent = "Columns";
+          details.appendChild(summary);
+
+          const noteEl = document.createElement("div");
+          noteEl.className = "small";
+          noteEl.style.marginTop = "0.35rem";
+          noteEl.textContent = "Drag to reorder. Uncheck to hide.";
+          details.appendChild(noteEl);
+
+          if (!Array.isArray(peaksColumnMeta) || !peaksColumnMeta.length) {
+            const placeholder = document.createElement("div");
+            placeholder.className = "small";
+            placeholder.style.marginTop = "0.35rem";
+            placeholder.textContent = "Open Catching Peaks to load columns.";
+            details.appendChild(placeholder);
+            peaksColumnsPaneEl.appendChild(details);
+            return;
+          }
+
+          const defaultKeys = peaksColumnMeta.map((c) => c.key);
+          const metaByKey = new Map();
+          peaksColumnMeta.forEach((c) => {
+            metaByKey.set(c.key, c);
+          });
+          peaksColumnPrefs = normalizePeaksColumnPrefs(peaksColumnPrefs, defaultKeys);
+
+          const listEl = document.createElement("div");
+          listEl.className = "peaks-columns-list";
+          details.appendChild(listEl);
+
+          peaksColumnPrefs.order.forEach((key) => {
+            const meta = metaByKey.get(key);
+            if (!meta) return;
+
+            const rowEl = document.createElement("div");
+            rowEl.className = "peaks-column-row";
+            rowEl.classList.toggle("hidden", Boolean(peaksColumnPrefs.hidden[key]));
+            rowEl.draggable = true;
+            rowEl.dataset.colKey = key;
+
+            const handle = document.createElement("span");
+            handle.className = "peaks-column-handle";
+            handle.textContent = "⋮⋮";
+            rowEl.appendChild(handle);
+
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = !peaksColumnPrefs.hidden[key];
+            checkbox.setAttribute("aria-label", "Toggle column " + meta.header);
+            checkbox.addEventListener("change", () => {
+              if (checkbox.checked) {
+                delete peaksColumnPrefs.hidden[key];
+              } else {
+                peaksColumnPrefs.hidden[key] = true;
+              }
+              savePeaksColumnPrefs(peaksColumnPrefs);
+              renderPeaksColumnsPane();
+              if (peaksLoaded) renderPeaksTable();
+            });
+            rowEl.appendChild(checkbox);
+
+            const label = document.createElement("span");
+            label.className = "peaks-column-label";
+            label.textContent = meta.header;
+            rowEl.appendChild(label);
+
+            rowEl.addEventListener("dragstart", (ev) => {
+              peaksColumnDragKey = key;
+              rowEl.classList.add("dragging");
+              try {
+                ev.dataTransfer.effectAllowed = "move";
+                ev.dataTransfer.setData("text/plain", key);
+              } catch (_) {}
+            });
+            rowEl.addEventListener("dragend", () => {
+              peaksColumnDragKey = null;
+              rowEl.classList.remove("dragging");
+              Array.from(listEl.querySelectorAll(".drag-over")).forEach((el) => {
+                el.classList.remove("drag-over");
+              });
+            });
+            rowEl.addEventListener("dragover", (ev) => {
+              if (!peaksColumnDragKey || peaksColumnDragKey === key) return;
+              ev.preventDefault();
+              rowEl.classList.add("drag-over");
+              try {
+                ev.dataTransfer.dropEffect = "move";
+              } catch (_) {}
+            });
+            rowEl.addEventListener("dragleave", () => {
+              rowEl.classList.remove("drag-over");
+            });
+            rowEl.addEventListener("drop", (ev) => {
+              ev.preventDefault();
+              rowEl.classList.remove("drag-over");
+
+              let fromKey = peaksColumnDragKey;
+              try {
+                const txt = ev.dataTransfer.getData("text/plain");
+                if (txt) fromKey = txt;
+              } catch (_) {}
+              if (!fromKey || fromKey === key) return;
+
+              const rect = rowEl.getBoundingClientRect();
+              const after = ev.clientY > rect.top + rect.height / 2;
+              peaksColumnPrefs.order = reorderKeyList(
+                peaksColumnPrefs.order,
+                fromKey,
+                key,
+                after
+              );
+              savePeaksColumnPrefs(peaksColumnPrefs);
+              renderPeaksColumnsPane();
+              if (peaksLoaded) renderPeaksTable();
+            });
+
+            listEl.appendChild(rowEl);
+          });
+
+          const actions = document.createElement("div");
+          actions.className = "peaks-columns-actions";
+
+          const showAllBtn = document.createElement("button");
+          showAllBtn.type = "button";
+          showAllBtn.className = "peaks-toggle-btn";
+          showAllBtn.textContent = "Show all";
+          showAllBtn.addEventListener("click", () => {
+            peaksColumnPrefs.hidden = {};
+            savePeaksColumnPrefs(peaksColumnPrefs);
+            renderPeaksColumnsPane();
+            if (peaksLoaded) renderPeaksTable();
+          });
+          actions.appendChild(showAllBtn);
+
+          const resetBtn = document.createElement("button");
+          resetBtn.type = "button";
+          resetBtn.className = "peaks-toggle-btn";
+          resetBtn.textContent = "Reset order";
+          resetBtn.addEventListener("click", () => {
+            peaksColumnPrefs.order = defaultKeys.slice();
+            savePeaksColumnPrefs(peaksColumnPrefs);
+            renderPeaksColumnsPane();
+            if (peaksLoaded) renderPeaksTable();
+          });
+          actions.appendChild(resetBtn);
+
+          details.appendChild(actions);
+          peaksColumnsPaneEl.appendChild(details);
+        }
+
+			    function renderPeaksSortPane({ displayColumns, percentColumns }) {
+			      if (!peaksSortPaneEl) return;
+
+			      const mode = peaksSortPaneMode === "filters" ? "filters" : "weights";
 		      const columns = mode === "filters" ? displayColumns : percentColumns;
 		      if (!Array.isArray(columns)) return;
 
@@ -3210,15 +3551,28 @@ const HTML = `<!DOCTYPE html>
 		            }
 		            return getPeaksMetric(row, "avg_time_between_peaks_days");
 		          },
-			          format: formatDays
-			        }
-			      ];
+				          format: formatDays
+				        }
+				      ];
 
-		      const invertPercentKeys = new Set([
-		        "low_avg_price",
-          "spread_pct_mean",
-          "flip_cycle_median_hours",
-		        "time_since_last_peak_days",
+              const baseColumnKeys = baseColumns.map((c) => c.key);
+              const nextMetaSig = baseColumnKeys.join("|");
+              if (nextMetaSig !== peaksColumnMetaSignature) {
+                peaksColumnMetaSignature = nextMetaSig;
+                peaksColumnMeta = baseColumns.map((c) => ({
+                  key: c.key,
+                  header: c.header
+                }));
+                peaksColumnPrefs = normalizePeaksColumnPrefs(peaksColumnPrefs, baseColumnKeys);
+                savePeaksColumnPrefs(peaksColumnPrefs);
+                renderPeaksColumnsPane();
+              }
+
+			      const invertPercentKeys = new Set([
+			        "low_avg_price",
+	          "spread_pct_mean",
+	          "flip_cycle_median_hours",
+			        "time_since_last_peak_days",
 		        "avg_time_between_peaks_days"
 		      ]);
 
@@ -3387,25 +3741,97 @@ const HTML = `<!DOCTYPE html>
 	        return 0;
 	      }
 
-	      rows.sort((a, b) => {
-	        const cmp = compareValues(getSortValue(a), getSortValue(b));
-	        return peaksSortDir === "asc" ? cmp : -cmp;
-	      });
+		      rows.sort((a, b) => {
+		        const cmp = compareValues(getSortValue(a), getSortValue(b));
+		        return peaksSortDir === "asc" ? cmp : -cmp;
+		      });
 
-			      const displayColumns = baseColumns;
+              const colByKey = new Map();
+              baseColumns.forEach((c) => {
+                if (c && typeof c.key === "string") colByKey.set(c.key, c);
+              });
+              const hidden =
+                peaksColumnPrefs &&
+                peaksColumnPrefs.hidden &&
+                typeof peaksColumnPrefs.hidden === "object"
+                  ? peaksColumnPrefs.hidden
+                  : {};
+              const orderedKeys =
+                peaksColumnPrefs &&
+                Array.isArray(peaksColumnPrefs.order) &&
+                peaksColumnPrefs.order.length
+                  ? peaksColumnPrefs.order
+                  : baseColumnKeys;
+              const displayColumns = orderedKeys
+                .map((k) => colByKey.get(k))
+                .filter((c) => c && !hidden[c.key]);
 
-			      const trHead = document.createElement("tr");
-			      const headerDefs = [{ key: "rank", header: "#" }, { key: "item", header: "Item" }].concat(
-			        displayColumns.map((c) => ({ key: c.key, header: c.header }))
-			      );
-			      headerDefs.forEach((h) => {
-			        const th = document.createElement("th");
-			        th.textContent = h.header;
-              if (h.key === "rank") th.classList.add("rank-cell");
-              if (h.key === "item") th.classList.add("item-name-header");
-			        trHead.appendChild(th);
-			      });
-			      thead.appendChild(trHead);
+				      const trHead = document.createElement("tr");
+				      const headerDefs = [{ key: "rank", header: "#", draggable: false }, { key: "item", header: "Item", draggable: false }].concat(
+				        displayColumns.map((c) => ({ key: c.key, header: c.header, draggable: true }))
+				      );
+				      headerDefs.forEach((h) => {
+				        const th = document.createElement("th");
+				        th.textContent = h.header;
+	              if (h.key === "rank") th.classList.add("rank-cell");
+	              if (h.key === "item") th.classList.add("item-name-header");
+                if (h.draggable) {
+                  th.draggable = true;
+                  th.classList.add("draggable-col");
+                  th.dataset.colKey = h.key;
+                  th.addEventListener("dragstart", (ev) => {
+                    peaksColumnDragKey = h.key;
+                    th.classList.add("dragging");
+                    try {
+                      ev.dataTransfer.effectAllowed = "move";
+                      ev.dataTransfer.setData("text/plain", h.key);
+                    } catch (_) {}
+                  });
+                  th.addEventListener("dragend", () => {
+                    peaksColumnDragKey = null;
+                    th.classList.remove("dragging");
+                    Array.from(trHead.querySelectorAll(".drag-over")).forEach((el) => {
+                      el.classList.remove("drag-over");
+                    });
+                  });
+                  th.addEventListener("dragover", (ev) => {
+                    if (!peaksColumnDragKey || peaksColumnDragKey === h.key) return;
+                    ev.preventDefault();
+                    th.classList.add("drag-over");
+                    try {
+                      ev.dataTransfer.dropEffect = "move";
+                    } catch (_) {}
+                  });
+                  th.addEventListener("dragleave", () => {
+                    th.classList.remove("drag-over");
+                  });
+                  th.addEventListener("drop", (ev) => {
+                    ev.preventDefault();
+                    th.classList.remove("drag-over");
+
+                    let fromKey = peaksColumnDragKey;
+                    try {
+                      const txt = ev.dataTransfer.getData("text/plain");
+                      if (txt) fromKey = txt;
+                    } catch (_) {}
+                    if (!fromKey || fromKey === h.key) return;
+
+                    const rect = th.getBoundingClientRect();
+                    const after = ev.clientX > rect.left + rect.width / 2;
+                    peaksColumnPrefs.order = reorderKeyList(
+                      peaksColumnPrefs.order,
+                      fromKey,
+                      h.key,
+                      after
+                    );
+                    savePeaksColumnPrefs(peaksColumnPrefs);
+                    renderPeaksColumnsPane();
+                    renderPeaksTable();
+                  });
+                }
+				        trHead.appendChild(th);
+				      });
+				      thead.appendChild(trHead);
 
 	      const totalRows = rows.length;
 	      const totalPages = totalRows > 0 ? Math.ceil(totalRows / pageSize) : 1;
