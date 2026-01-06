@@ -771,14 +771,6 @@ def compute_catching_peaks_metric(
         outlier_threshold: Optional[float] = None
         outlier_removed_points = 0
 
-        raw_prices = np.array([p for _, p, _ in pts_raw], dtype="float64")
-        if raw_prices.size:
-            mean_raw = float(np.mean(raw_prices))
-            if np.isfinite(mean_raw) and mean_raw > 0:
-                ref_total_avg_price = float(mean_raw)
-                ref_price = float(mean_raw)
-                ref_kind = "mean_price"
-
         cap_mult = MID_OUTLIER_REF_CAP_MULT
         if not np.isfinite(cap_mult) or cap_mult <= 0:
             cap_mult = float("nan")
@@ -787,20 +779,47 @@ def compute_catching_peaks_metric(
             low_avg_for_cap_f = float(low_avg_for_cap) if low_avg_for_cap is not None else float("nan")
         except Exception:
             low_avg_for_cap_f = float("nan")
-        if (
-            np.isfinite(cap_mult)
-            and cap_mult > 0
-            and np.isfinite(low_avg_for_cap_f)
-            and low_avg_for_cap_f > 0
-            and ref_price is not None
-            and np.isfinite(ref_price)
-            and ref_price > float(cap_mult) * float(low_avg_for_cap_f)
-        ):
-            ref_price = float(cap_mult) * float(low_avg_for_cap_f)
-            if ref_kind is None:
-                ref_kind = "capped_low_avg_price"
-            elif "capped" not in ref_kind:
-                ref_kind = ref_kind + "_capped_low_avg_price"
+        raw_prices = np.array([p for _, p, _ in pts_raw], dtype="float64")
+        if raw_prices.size:
+            # Derive a stable reference mean that matches the post-mask "avg" line by
+            # iteratively removing buckets where mid > (mult * mean).
+            prices_for_mean = raw_prices[np.isfinite(raw_prices) & (raw_prices > 0)]
+            if prices_for_mean.size:
+                mean_est = float(np.mean(prices_for_mean))
+                if np.isfinite(mean_est) and mean_est > 0:
+                    ref_kind = "mean_price"
+                    for _ in range(6):
+                        mean_prev = float(mean_est)
+                        ref_price_candidate = float(mean_prev)
+                        if (
+                            np.isfinite(cap_mult)
+                            and cap_mult > 0
+                            and np.isfinite(low_avg_for_cap_f)
+                            and low_avg_for_cap_f > 0
+                        ):
+                            cap_price = float(cap_mult) * float(low_avg_for_cap_f)
+                            if ref_price_candidate > cap_price:
+                                ref_price_candidate = cap_price
+                                ref_kind = "mean_price_capped_low_avg_price"
+
+                        thr_candidate = float(outlier_mult) * float(ref_price_candidate)
+                        if not (np.isfinite(thr_candidate) and thr_candidate > 0):
+                            break
+
+                        kept = prices_for_mean[prices_for_mean <= thr_candidate]
+                        if kept.size < 10:
+                            break
+
+                        mean_est = float(np.mean(kept))
+                        if not (np.isfinite(mean_est) and mean_est > 0):
+                            break
+
+                        rel_delta = abs(mean_est - mean_prev) / max(mean_prev, 1e-12)
+                        if rel_delta < 1e-6:
+                            break
+
+                    ref_total_avg_price = float(mean_est)
+                    ref_price = float(mean_est)
 
         if ref_price is not None and np.isfinite(ref_price) and ref_price > 0:
             outlier_threshold = float(outlier_mult) * float(ref_price)
