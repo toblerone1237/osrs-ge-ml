@@ -23,7 +23,7 @@ try:
             "PEAKS_MID_OUTLIER_TOTAL_AVG_MULT",
             os.getenv(
                 "PEAKS_MID_OUTLIER_ABOVE_MEDIAN_MULT",
-                os.getenv("PEAKS_MID_OUTLIER_ABOVE_MEAN_MULT", "5"),
+                os.getenv("PEAKS_MID_OUTLIER_ABOVE_MEAN_MULT", "2.5"),
             ),
         )
     )
