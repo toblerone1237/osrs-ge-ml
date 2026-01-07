@@ -454,6 +454,39 @@ const HTML = `<!DOCTYPE html>
 	      font-size: 0.8rem;
 	      color: #9ca3af;
 	    }
+        .peaks-option-right {
+          display: flex;
+          align-items: center;
+          gap: 0.35rem;
+        }
+        .peaks-eye-btn {
+          appearance: none;
+          border: none;
+          background: transparent;
+          color: #9ca3af;
+          cursor: pointer;
+          padding: 0.05rem 0.15rem;
+          line-height: 1;
+          display: inline-flex;
+          align-items: center;
+        }
+        .peaks-eye-btn:hover {
+          color: #e5e7eb;
+        }
+        .peaks-eye-btn svg {
+          width: 14px;
+          height: 14px;
+          display: block;
+        }
+        .peaks-weight-row.invisible,
+        .peaks-filter-row.invisible {
+          opacity: 0.45;
+        }
+        .peaks-sort-visibility-row {
+          display: flex;
+          justify-content: flex-end;
+          margin-bottom: 0.5rem;
+        }
 		    .peaks-weight-row input[type="range"] {
 		      width: 100%;
 		    }
@@ -813,19 +846,27 @@ const HTML = `<!DOCTYPE html>
 	    const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
 
-		    const PIN_KEY = "osrs_ge_pins_v3";
+	    const PIN_KEY = "osrs_ge_pins_v3";
 		    const ACTIVE_TAB_KEY = "osrs_ge_active_tab_v1";
 		    const PRICE_SERIES_TOGGLES_KEY = "osrs_ge_price_series_toggles_v1";
 			    const VOLUME_COVERAGE_MIN_KEY = "osrs_ge_volume_coverage_min_pct_v1";
 			    const PEAKS_WEIGHTS_KEY = "osrs_ge_peaks_weights_v1";
 			    const PEAKS_FILTERS_KEY = "osrs_ge_peaks_filters_v1";
           const PEAKS_COLUMNS_KEY = "osrs_ge_peaks_columns_v1";
+          const PEAKS_SORT_OPTION_VISIBILITY_KEY =
+            "osrs_ge_peaks_sort_option_visibility_v1";
+          const PEAKS_SORT_SHOW_INVISIBLE_KEY =
+            "osrs_ge_peaks_sort_show_invisible_v1";
 			    const PEAKS_SHOW_AS_PCT_KEY = "osrs_ge_peaks_show_as_pct_v1";
 	        const PEAKS_OUTLIER_MASK_KEY = "osrs_ge_peaks_outlier_mask_enabled_v1";
 	        const PEAKS_CONFIGS_KEY = "osrs_ge_peaks_configs_v1";
 	        const PEAKS_ACTIVE_CONFIG_ID_KEY = "osrs_ge_peaks_active_config_id_v1";
 	        const PEAKS_CUSTOM_STATE_KEY = "osrs_ge_peaks_custom_state_v1";
           const CASH_AVAILABLE_GP_KEY = "osrs_ge_cash_available_gp_v1";
+
+      const PEAKS_CHART_FIXED_START_DATE = new Date(2025, 11, 1); // 01/12/2025
+      const PEAKS_CHART_FIXED_START_MS = PEAKS_CHART_FIXED_START_DATE.getTime();
+      const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -876,6 +917,8 @@ const HTML = `<!DOCTYPE html>
 	          let peaksActiveConfigId = null; // null => "Custom"
 				    let peaksSortPaneMode = "weights";
 				    let peaksSortPaneSignature = "";
+            let peaksSortOptionVisibility = {};
+            let peaksSortShowInvisible = false;
 					    let peaksShowAsPercent = false;
 				    let peaksSearchQuery = "";
 				    let peaksTableRenderScheduled = false;
@@ -883,6 +926,7 @@ const HTML = `<!DOCTYPE html>
 			    let latestVolumeTimeline = [];
 
 			    const CHART_SCROLL_STEPS = 1000;
+          const PEAKS_DATE_TICK_FORMAT = "dd/MM/yyyy";
 
 			    function clampNumber(v, lo, hi) {
 			      const n = Number(v);
@@ -962,6 +1006,140 @@ const HTML = `<!DOCTYPE html>
 			      return Number.isFinite(t) ? t : NaN;
 			    }
 
+          function pickPeaksXAxisUnit(chart, xMin, xMax) {
+            if (!chart || !Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) {
+              return "day";
+            }
+            const width =
+              chart && chart.chartArea && Number.isFinite(chart.chartArea.width)
+                ? chart.chartArea.width
+                : chart && Number.isFinite(chart.width)
+                  ? chart.width
+                  : 0;
+            const rangeDays = Math.ceil((xMax - xMin) / MS_PER_DAY) + 1;
+            const approxLabelPx = 72; // dd/MM/yyyy at ~12px, with padding
+            const maxDailyTicks = Math.max(2, Math.floor(width / approxLabelPx));
+            return rangeDays <= maxDailyTicks ? "day" : "week";
+          }
+
+          function syncPriceChartXAxisForActiveTab(chart) {
+            if (!chart) return;
+            const xScale = chart.scales && chart.scales.x ? chart.scales.x : null;
+            const xOpts =
+              chart.options && chart.options.scales && chart.options.scales.x
+                ? chart.options.scales.x
+                : null;
+            if (!xScale || !xOpts) return;
+
+            const isPeaks = activeTab === "peaks";
+            const wantUnit = isPeaks ? pickPeaksXAxisUnit(chart, xScale.min, xScale.max) : "hour";
+
+            const time = xOpts.time ? xOpts.time : (xOpts.time = {});
+            const ticks = xOpts.ticks ? xOpts.ticks : (xOpts.ticks = {});
+            const grid = xOpts.grid ? xOpts.grid : (xOpts.grid = {});
+            const border = xOpts.border ? xOpts.border : (xOpts.border = {});
+
+            let changed = false;
+
+            if (time.stepSize !== 1) {
+              time.stepSize = 1;
+              changed = true;
+            }
+
+            if (isPeaks) {
+              if (time.unit !== wantUnit) {
+                time.unit = wantUnit;
+                changed = true;
+              }
+              if (time.round !== wantUnit) {
+                time.round = wantUnit;
+                changed = true;
+              }
+
+              const displayFormats = time.displayFormats || {};
+              if (
+                displayFormats.day !== PEAKS_DATE_TICK_FORMAT ||
+                displayFormats.week !== PEAKS_DATE_TICK_FORMAT
+              ) {
+                time.displayFormats = Object.assign({}, displayFormats, {
+                  day: PEAKS_DATE_TICK_FORMAT,
+                  week: PEAKS_DATE_TICK_FORMAT
+                });
+                changed = true;
+              }
+
+              if (ticks.autoSkip !== false) {
+                ticks.autoSkip = false;
+                changed = true;
+              }
+              if (ticks.maxRotation !== 0) {
+                ticks.maxRotation = 0;
+                changed = true;
+              }
+
+              if (grid.drawOnChartArea !== false) {
+                grid.drawOnChartArea = false;
+                changed = true;
+              }
+              if (grid.drawTicks !== true) {
+                grid.drawTicks = true;
+                changed = true;
+              }
+              if (grid.tickLength !== 6) {
+                grid.tickLength = 6;
+                changed = true;
+              }
+
+              if (border.display !== true) {
+                border.display = true;
+                changed = true;
+              }
+            } else {
+              if (time.unit !== wantUnit) {
+                time.unit = wantUnit;
+                changed = true;
+              }
+              if (time.round != null) {
+                delete time.round;
+                changed = true;
+              }
+
+              const displayFormats = time.displayFormats || {};
+              if (displayFormats.hour !== "MM-dd HH:mm") {
+                time.displayFormats = Object.assign({}, displayFormats, {
+                  hour: "MM-dd HH:mm"
+                });
+                changed = true;
+              }
+
+              if (ticks.autoSkip !== true) {
+                ticks.autoSkip = true;
+                changed = true;
+              }
+              if (ticks.maxRotation !== 0) {
+                ticks.maxRotation = 0;
+                changed = true;
+              }
+
+              if (grid.drawOnChartArea === false) {
+                grid.drawOnChartArea = true;
+                changed = true;
+              }
+              if (grid.tickLength === 6) {
+                delete grid.tickLength;
+                changed = true;
+              }
+            }
+
+            if (changed) {
+              try {
+                chart.update("none");
+              } catch (_) {
+                chart.update();
+              }
+            }
+          }
+
 			    function updateChartYForVisibleRange(chart, xMin, xMax, isZoomed) {
 			      if (!chart) return;
 			      const yOpts =
@@ -1037,6 +1215,8 @@ const HTML = `<!DOCTYPE html>
 
 			    function updateChartScrollFromChart(chart) {
 			      if (!chartScrollEl || !chartScrollWrapEl || !chart) return;
+            syncPriceChartXAxisForActiveTab(chart);
+
 			      const x = chart.scales && chart.scales.x ? chart.scales.x : null;
 			      if (!x) return;
 
@@ -1280,6 +1460,10 @@ const HTML = `<!DOCTYPE html>
 	      }
 	      moveChartToTab(active);
 	      syncForecastVisibilityForTab(active);
+        if (priceChart) {
+          syncPriceChartXAxisForActiveTab(priceChart);
+          updateChartScrollFromChart(priceChart);
+        }
         updatePeaksOutlierMaskButton();
 	      try {
 	        window.localStorage.setItem(ACTIVE_TAB_KEY, active);
@@ -1603,6 +1787,52 @@ const HTML = `<!DOCTYPE html>
 				      }
 				    }
 
+            function loadPeaksSortOptionVisibility() {
+              try {
+                const raw = window.localStorage.getItem(PEAKS_SORT_OPTION_VISIBILITY_KEY);
+                if (!raw) return {};
+                const obj = JSON.parse(raw);
+                if (!obj || typeof obj !== "object") return {};
+                const out = {};
+                Object.entries(obj).forEach(([k, v]) => {
+                  const key = typeof k === "string" ? k : "";
+                  if (!key || !v) return;
+                  out[key] = true;
+                });
+                return out;
+              } catch (err) {
+                console.warn("Failed to parse peaks sort visibility:", err);
+              }
+              return {};
+            }
+
+            function savePeaksSortOptionVisibility(obj) {
+              try {
+                window.localStorage.setItem(
+                  PEAKS_SORT_OPTION_VISIBILITY_KEY,
+                  JSON.stringify(obj || {})
+                );
+              } catch (err) {
+                console.warn("Failed to save peaks sort visibility:", err);
+              }
+            }
+
+            function loadPeaksSortShowInvisible() {
+              try {
+                const raw = window.localStorage.getItem(PEAKS_SORT_SHOW_INVISIBLE_KEY);
+                if (raw === "1" || raw === "true") return true;
+                return false;
+              } catch (_) {
+                return false;
+              }
+            }
+
+            function savePeaksSortShowInvisible(v) {
+              try {
+                window.localStorage.setItem(PEAKS_SORT_SHOW_INVISIBLE_KEY, v ? "1" : "0");
+              } catch (_) {}
+            }
+
             function loadPeaksColumnPrefs() {
               try {
                 const raw = window.localStorage.getItem(PEAKS_COLUMNS_KEY);
@@ -1676,6 +1906,8 @@ const HTML = `<!DOCTYPE html>
 					    peaksPercentWeights = loadPeaksWeights();
 					    peaksColumnFilters = loadPeaksFilters();
               peaksColumnPrefs = loadPeaksColumnPrefs();
+              peaksSortOptionVisibility = loadPeaksSortOptionVisibility();
+              peaksSortShowInvisible = loadPeaksSortShowInvisible();
 
 		            function clampInt(v, lo, hi) {
 		              const n = Math.round(clampNumber(v, lo, hi));
@@ -2965,6 +3197,8 @@ const HTML = `<!DOCTYPE html>
 
         function renderPeaksColumnsPane() {
           if (!peaksColumnsPaneEl) return;
+          const prevList = peaksColumnsPaneEl.querySelector(".peaks-columns-list");
+          const prevScrollTop = prevList ? prevList.scrollTop : 0;
           peaksColumnsPaneEl.innerHTML = "";
 
           const details = document.createElement("details");
@@ -3123,6 +3357,9 @@ const HTML = `<!DOCTYPE html>
 
           details.appendChild(actions);
           peaksColumnsPaneEl.appendChild(details);
+          if (prevScrollTop) {
+            listEl.scrollTop = prevScrollTop;
+          }
         }
 
 			    function renderPeaksSortPane({ displayColumns, percentColumns }) {
@@ -3140,6 +3377,72 @@ const HTML = `<!DOCTYPE html>
 		      peaksSortPaneSignature = signature;
 
 		      peaksSortPaneEl.innerHTML = "";
+
+          const EYE_SVG =
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path>' +
+            '<circle cx="12" cy="12" r="3"></circle>' +
+            "</svg>";
+          const EYE_OFF_SVG =
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M3 3l18 18"></path>' +
+            '<path d="M10.6 10.6a3 3 0 0 0 4.2 4.2"></path>' +
+            '<path d="M9.88 5.1A10.94 10.94 0 0 1 12 5c6.5 0 10 7 10 7a19 19 0 0 1-3.2 4.5"></path>' +
+            '<path d="M6.2 6.2C3.6 8.2 2 12 2 12s3.5 7 10 7c1.5 0 2.9-.3 4.2-.8"></path>' +
+            "</svg>";
+
+          function baseKeyForPeaksSortKey(key) {
+            const k = typeof key === "string" ? key : "";
+            const suffix = "_norm_pct";
+            return k.endsWith(suffix) ? k.slice(0, -suffix.length) : k;
+          }
+
+          function makeSortVisibilityEyeButton(baseKey, header) {
+            const key = typeof baseKey === "string" ? baseKey : "";
+            const invisible = Boolean(peaksSortOptionVisibility && peaksSortOptionVisibility[key]);
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "peaks-eye-btn";
+            btn.innerHTML = invisible ? EYE_OFF_SVG : EYE_SVG;
+            btn.title = invisible ? "Invisible (click to show)" : "Visible (click to hide)";
+            btn.setAttribute(
+              "aria-label",
+              (invisible ? "Show " : "Hide ") + (header || "option")
+            );
+            btn.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              if (!key) return;
+              if (peaksSortOptionVisibility[key]) {
+                delete peaksSortOptionVisibility[key];
+              } else {
+                peaksSortOptionVisibility[key] = true;
+              }
+              savePeaksSortOptionVisibility(peaksSortOptionVisibility);
+              peaksSortPaneSignature = "";
+              renderPeaksTable();
+            });
+            return btn;
+          }
+
+          const visibilityRow = document.createElement("div");
+          visibilityRow.className = "peaks-sort-visibility-row";
+          const showInvisibleBtn = document.createElement("button");
+          showInvisibleBtn.type = "button";
+          showInvisibleBtn.className = "peaks-toggle-btn";
+          showInvisibleBtn.textContent = peaksSortShowInvisible
+            ? "Hide invisible"
+            : "Show invisible";
+          showInvisibleBtn.addEventListener("click", () => {
+            peaksSortShowInvisible = !peaksSortShowInvisible;
+            savePeaksSortShowInvisible(peaksSortShowInvisible);
+            peaksSortPaneSignature = "";
+            renderPeaksTable();
+          });
+          visibilityRow.appendChild(showInvisibleBtn);
+          peaksSortPaneEl.appendChild(visibilityRow);
 
 		      const allowedOps = [
 		        { value: "", label: "off" },
@@ -3166,6 +3469,12 @@ const HTML = `<!DOCTYPE html>
 		        peaksSortPaneEl.appendChild(noteEl);
 
 		        columns.forEach((col, idx) => {
+              const baseKey = baseKeyForPeaksSortKey(col.key);
+              const isInvisible =
+                Boolean(baseKey) &&
+                Boolean(peaksSortOptionVisibility && peaksSortOptionVisibility[baseKey]);
+              if (isInvisible && !peaksSortShowInvisible) return;
+
 		          const existing = peaksColumnFilters && peaksColumnFilters[col.key];
 		          const existingOp =
 		            existing && typeof existing.op === "string" ? existing.op : "";
@@ -3174,12 +3483,17 @@ const HTML = `<!DOCTYPE html>
 
 		          const rowEl = document.createElement("div");
 		          rowEl.className = "peaks-filter-row";
+              rowEl.classList.toggle("invisible", isInvisible);
 
 		          const labelEl = document.createElement("div");
 		          labelEl.className = "peaks-weight-label";
 		          const nameSpan = document.createElement("span");
 		          nameSpan.textContent = col.header;
-		          labelEl.appendChild(nameSpan);
+              const rightWrap = document.createElement("span");
+              rightWrap.className = "peaks-option-right";
+              rightWrap.appendChild(makeSortVisibilityEyeButton(baseKey, col.header));
+              labelEl.appendChild(nameSpan);
+              labelEl.appendChild(rightWrap);
 		          rowEl.appendChild(labelEl);
 
 		          const controlsEl = document.createElement("div");
@@ -3285,15 +3599,22 @@ const HTML = `<!DOCTYPE html>
               peaksPercentWeights && Object.keys(peaksPercentWeights).length > 0;
             const defaultMissingWeight = hasAnyWeight ? 0 : DEFAULT_PEAK_WEIGHT;
 
-			      columns.forEach((col, idx) => {
-			        const weightExisting = peaksPercentWeights[col.key];
-			        const weightVal = Number.isFinite(weightExisting)
-			          ? weightExisting
-			          : defaultMissingWeight;
-			        peaksPercentWeights[col.key] = weightVal;
+		      columns.forEach((col, idx) => {
+            const baseKey = baseKeyForPeaksSortKey(col.key);
+            const isInvisible =
+              Boolean(baseKey) &&
+              Boolean(peaksSortOptionVisibility && peaksSortOptionVisibility[baseKey]);
+            if (isInvisible && !peaksSortShowInvisible) return;
+
+		        const weightExisting = peaksPercentWeights[col.key];
+		        const weightVal = Number.isFinite(weightExisting)
+		          ? weightExisting
+		          : defaultMissingWeight;
+		        peaksPercentWeights[col.key] = weightVal;
 
 		        const rowEl = document.createElement("div");
 		        rowEl.className = "peaks-weight-row";
+            rowEl.classList.toggle("invisible", isInvisible);
 
 		        const labelEl = document.createElement("div");
 		        labelEl.className = "peaks-weight-label";
@@ -3301,8 +3622,12 @@ const HTML = `<!DOCTYPE html>
 		        nameSpan.textContent = col.header;
 		        const valueSpan = document.createElement("span");
 		        valueSpan.textContent = String(weightVal);
+            const rightWrap = document.createElement("span");
+            rightWrap.className = "peaks-option-right";
+            rightWrap.appendChild(makeSortVisibilityEyeButton(baseKey, col.header));
+            rightWrap.appendChild(valueSpan);
 		        labelEl.appendChild(nameSpan);
-		        labelEl.appendChild(valueSpan);
+		        labelEl.appendChild(rightWrap);
 
 		        const slider = document.createElement("input");
 		        slider.type = "range";
@@ -5038,6 +5363,8 @@ const HTML = `<!DOCTYPE html>
 		        }
 
 		        let avgPrice = null;
+            let belowMeanAvgPrice = null;
+            let aboveMeanAvgPrice = null;
 		        {
 		          let sum = 0;
 		          let count = 0;
@@ -5050,9 +5377,32 @@ const HTML = `<!DOCTYPE html>
 		            avgPrice = sum / count;
 		          }
 		        }
+            if (avgPrice != null && Number.isFinite(avgPrice) && avgPrice > 0) {
+              let belowSum = 0;
+              let belowCount = 0;
+              let aboveSum = 0;
+              let aboveCount = 0;
+              histData.forEach((v) => {
+                if (!Number.isFinite(v)) return;
+                if (v < avgPrice) {
+                  belowSum += v;
+                  belowCount += 1;
+                } else if (v > avgPrice) {
+                  aboveSum += v;
+                  aboveCount += 1;
+                }
+              });
+              if (belowCount > 0 && Number.isFinite(belowSum)) {
+                belowMeanAvgPrice = belowSum / belowCount;
+              }
+              if (aboveCount > 0 && Number.isFinite(aboveSum)) {
+                aboveMeanAvgPrice = aboveSum / aboveCount;
+              }
+            }
 
 		        const allPrices = []
 		          .concat(histData)
+              .concat([belowMeanAvgPrice, aboveMeanAvgPrice])
 		          .concat(Array.isArray(avgHighData) ? avgHighData : [])
 		          .concat(Array.isArray(avgLowData) ? avgLowData : [])
 		          .concat(showForecast ? oldFcData : [])
@@ -5205,6 +5555,38 @@ const HTML = `<!DOCTYPE html>
 	          hidden: !priceSeriesToggles.avgLow
 	        };
 
+          const meanLineDatasets = [];
+          if (activeTab === "peaks") {
+            if (belowMeanAvgPrice != null && Number.isFinite(belowMeanAvgPrice) && belowMeanAvgPrice > 0) {
+              meanLineDatasets.push({
+                seriesKey: "below_mean_avg",
+                label: "Below mean avg",
+                data: new Array(labels.length).fill(belowMeanAvgPrice),
+                borderColor: "rgba(226,232,240,0.42)",
+                backgroundColor: "rgba(226,232,240,0.0)",
+                pointRadius: 0,
+                borderWidth: 1.5,
+                borderDash: [6, 4],
+                tension: 0,
+                spanGaps: true
+              });
+            }
+            if (aboveMeanAvgPrice != null && Number.isFinite(aboveMeanAvgPrice) && aboveMeanAvgPrice > 0) {
+              meanLineDatasets.push({
+                seriesKey: "above_mean_avg",
+                label: "Above mean avg",
+                data: new Array(labels.length).fill(aboveMeanAvgPrice),
+                borderColor: "rgba(226,232,240,0.65)",
+                backgroundColor: "rgba(226,232,240,0.0)",
+                pointRadius: 0,
+                borderWidth: 1.5,
+                borderDash: [6, 4],
+                tension: 0,
+                spanGaps: true
+              });
+            }
+          }
+
 	        const volumeDataset = {
 	          seriesKey: "volume_total",
 	          label: "Volume (per bucket)",
@@ -5249,6 +5631,7 @@ const HTML = `<!DOCTYPE html>
 
 	        const datasets = [
 	          historyDataset,
+            ...meanLineDatasets,
 	          avgHighDataset,
 	          avgLowDataset,
 	          volumeDataset,
@@ -5333,17 +5716,45 @@ const HTML = `<!DOCTYPE html>
             scales: {
               x: {
                 type: "time",
-                time: {
-                  unit: "hour",
-                  stepSize: 1,
-                  displayFormats: {
-                    hour: "MM-dd HH:mm"
-                  }
-                },
+                min:
+                  activeTab === "peaks" && Number.isFinite(PEAKS_CHART_FIXED_START_MS)
+                    ? PEAKS_CHART_FIXED_START_MS
+                    : undefined,
+                max:
+                  activeTab === "peaks" && labels && labels.length
+                    ? labelToUnixMs(labels[labels.length - 1])
+                    : undefined,
+                time:
+                  activeTab === "peaks"
+                    ? {
+                        unit: "day",
+                        round: "day",
+                        stepSize: 1,
+                        displayFormats: {
+                          day: PEAKS_DATE_TICK_FORMAT,
+                          week: PEAKS_DATE_TICK_FORMAT
+                        }
+                      }
+                    : {
+                        unit: "hour",
+                        stepSize: 1,
+                        displayFormats: {
+                          hour: "MM-dd HH:mm"
+                        }
+                      },
                 ticks: {
                   maxRotation: 0,
-                  autoSkip: true
-                }
+                  autoSkip: activeTab === "peaks" ? false : true
+                },
+                grid:
+                  activeTab === "peaks"
+                    ? {
+                        drawOnChartArea: false,
+                        drawTicks: true,
+                        tickLength: 6
+                      }
+                    : undefined,
+                border: activeTab === "peaks" ? { display: true } : undefined
               },
               y: {
                 beginAtZero: false,
