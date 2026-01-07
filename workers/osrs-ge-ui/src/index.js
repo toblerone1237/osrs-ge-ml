@@ -1051,8 +1051,8 @@ const HTML = `<!DOCTYPE html>
                 time.unit = wantUnit;
                 changed = true;
               }
-              if (time.round !== wantUnit) {
-                time.round = wantUnit;
+              if (time.round != null) {
+                delete time.round;
                 changed = true;
               }
 
@@ -5728,7 +5728,6 @@ const HTML = `<!DOCTYPE html>
                   activeTab === "peaks"
                     ? {
                         unit: "day",
-                        round: "day",
                         stepSize: 1,
                         displayFormats: {
                           day: PEAKS_DATE_TICK_FORMAT,
