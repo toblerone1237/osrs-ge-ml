@@ -3495,17 +3495,24 @@ const HTML = `<!DOCTYPE html>
 				          value: (row) => getPeaksMetric(row, "above_below_diff"),
 				          format: formatProfitGp
 				        },
-                {
-                  key: "mean_crossings",
-                  header: "Mean Crossings",
-                  value: (row) => getPeaksMetric(row, "mean_crossings"),
-                  format: formatCount
-                },
-				        {
-				          key: "low_avg_price",
-				          header: "Low Average Price",
-		          value: (row) => getPeaksMetric(row, "low_avg_price"),
-          format: formatProfitGp
+	                {
+	                  key: "mean_crossings",
+	                  header: "Mean Crossings",
+	                  value: (row) => getPeaksMetric(row, "mean_crossings"),
+	                  format: formatCount
+	                },
+	                {
+	                  key: "mean_crossings_regularity",
+	                  header: "Crossing Regularity",
+	                  value: (row) => getPeaksMetric(row, "mean_crossings_regularity"),
+	                  format: (v) =>
+	                    Number.isFinite(v) ? (v * 100).toFixed(0) + "%" : "-"
+	                },
+					        {
+					          key: "low_avg_price",
+					          header: "Low Average Price",
+			          value: (row) => getPeaksMetric(row, "low_avg_price"),
+	          format: formatProfitGp
         },
         {
           key: "peak_avg_price",

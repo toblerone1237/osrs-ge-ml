@@ -64,6 +64,7 @@ def _compute_metric_from_pts(
     below_mean_avg_price: Optional[float] = None
     above_below_diff: Optional[float] = None
     mean_crossings: Optional[int] = None
+    mean_crossings_regularity: Optional[float] = None
     if np.isfinite(mean_price) and mean_price > 0:
         above_mask = prices > mean_price
         below_mask = prices < mean_price
@@ -80,10 +81,31 @@ def _compute_metric_from_pts(
             above_below_diff = float(above_mean_avg_price - below_mean_avg_price)
 
         # Count sign changes in (price - mean), ignoring exact equals.
-        signs = np.sign(prices - mean_price)
-        signs = signs[signs != 0]
+        signs_full = np.sign(prices - mean_price)
+        nonzero_mask = signs_full != 0
+        signs = signs_full[nonzero_mask]
         if signs.size >= 2:
-            mean_crossings = int(np.sum(signs[1:] != signs[:-1]))
+            changes = signs[1:] != signs[:-1]
+            mean_crossings = int(np.sum(changes))
+            ts_nz = ts_ms[nonzero_mask]
+            crossing_ts = (ts_nz[1:][changes] + ts_nz[:-1][changes]) * 0.5
+            if crossing_ts.size:
+                start_ms = float(ts_ms[0])
+                end_ms = float(ts_ms[-1])
+                if np.isfinite(start_ms) and np.isfinite(end_ms) and end_ms > start_ms:
+                    gaps = np.empty(int(crossing_ts.size) + 1, dtype="float64")
+                    gaps[0] = crossing_ts[0] - start_ms
+                    if crossing_ts.size > 1:
+                        gaps[1:-1] = np.diff(crossing_ts)
+                    gaps[-1] = end_ms - crossing_ts[-1]
+                    gaps = gaps[np.isfinite(gaps) & (gaps >= 0)]
+                    if gaps.size:
+                        mean_gap = float(np.mean(gaps))
+                        std_gap = float(np.std(gaps))
+                        if np.isfinite(mean_gap) and mean_gap > 0 and np.isfinite(std_gap) and std_gap >= 0:
+                            cv = float(std_gap / mean_gap)
+                            if np.isfinite(cv) and cv >= 0:
+                                mean_crossings_regularity = float(1.0 / (1.0 + cv))
     variance = (
         float(np.mean(np.sqrt(np.abs(prices - mean_price))))
         if np.isfinite(mean_price)
@@ -542,6 +564,7 @@ def _compute_metric_from_pts(
         "below_mean_avg_price": below_mean_avg_price,
         "above_below_diff": above_below_diff,
         "mean_crossings": mean_crossings,
+        "mean_crossings_regularity": mean_crossings_regularity,
         "low_avg_price": low_avg,
         "peak_avg_price": peak_avg,
         "pct_difference": pct_diff,
