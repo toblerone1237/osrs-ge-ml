@@ -501,18 +501,40 @@ const HTML = `<!DOCTYPE html>
 		      background: #1f2937;
 		    }
 			    .peaks-controls {
-			      display: flex;
-			      align-items: center;
-			      justify-content: space-between;
-			      gap: 0.5rem;
-			      flex-wrap: wrap;
-			      margin-bottom: 0.4rem;
-			    }
+				      display: flex;
+				      align-items: center;
+				      justify-content: space-between;
+				      gap: 0.5rem;
+				      flex-wrap: wrap;
+				      margin-bottom: 0.4rem;
+				    }
+            .peaks-cash-row {
+              display: flex;
+              align-items: center;
+              gap: 0.35rem;
+              flex: 0 0 auto;
+            }
+            .peaks-cash-label {
+              font-size: 0.8rem;
+              color: #9ca3af;
+              user-select: none;
+              white-space: nowrap;
+            }
+            .peaks-cash-row input {
+              width: 140px;
+              max-width: 100%;
+              padding: 0.3rem 0.45rem;
+              border-radius: 0.35rem;
+              border: 1px solid #374151;
+              background: #020617;
+              color: #e5e7eb;
+              font-size: 0.8rem;
+            }
 			    .peaks-search-row {
-			      margin-bottom: 0;
-			      flex: 1;
-			      min-width: 180px;
-			    }
+				      margin-bottom: 0;
+				      flex: 1;
+				      min-width: 180px;
+				    }
 			    .peaks-search-row input {
 			      min-width: 140px;
 			    }
@@ -662,14 +684,24 @@ const HTML = `<!DOCTYPE html>
 				              Sharpness = average % above the local mean (±3 days) at each peak tip.
 				              Variance = average sqrt(|price − mean|); Variance % = variance ÷ mean × 100.
 				            </div>
-				            <div class="peaks-controls">
-				              <div class="search-row peaks-search-row">
-				                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
-				                <button id="peaksSearchClearBtn" type="button">Clear</button>
-				              </div>
-				              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show Rank%</button>
-                      <button id="peaksOutlierMaskBtn" type="button" class="peaks-toggle-btn" hidden>Outlier mask</button>
-				            </div>
+					            <div class="peaks-controls">
+					              <div class="search-row peaks-search-row">
+					                <input id="peaksSearchInput" type="text" placeholder="Filter by item name or id..." />
+					                <button id="peaksSearchClearBtn" type="button">Clear</button>
+					              </div>
+                        <div class="peaks-cash-row">
+                          <label for="peaksCashAvailable" class="peaks-cash-label">Cash Available:</label>
+                          <input
+                            id="peaksCashAvailable"
+                            type="text"
+                            inputmode="numeric"
+                            autocomplete="off"
+                            placeholder="0"
+                          />
+                        </div>
+					              <button id="peaksShowAsPctBtn" type="button" class="peaks-toggle-btn">Show Rank%</button>
+	                      <button id="peaksOutlierMaskBtn" type="button" class="peaks-toggle-btn" hidden>Outlier mask</button>
+					            </div>
 				            <div class="range-filter">
 				              <label for="peaksVolumeCoverageMinPct">Min non-zero volume coverage (history window):</label>
 				              <input id="peaksVolumeCoverageMinPct" type="range" min="0" max="100" value="0" step="1" />
@@ -772,12 +804,13 @@ const HTML = `<!DOCTYPE html>
 				    const peaksSearchInput = document.getElementById("peaksSearchInput");
 				    const peaksSearchClearBtn = document.getElementById("peaksSearchClearBtn");
 				    const peaksSearchStatusEl = document.getElementById("peaksSearchStatus");
-			    const peaksShowAsPctBtn = document.getElementById("peaksShowAsPctBtn");
-			    const standardChartMount = document.getElementById("standardChartMount");
-			    const peaksChartMount = document.getElementById("peaksChartMount");
-			    const priceCardEl = document.getElementById("priceCard");
-    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
-    const tabStandardEl = document.getElementById("tab-standard");
+				    const peaksShowAsPctBtn = document.getElementById("peaksShowAsPctBtn");
+            const peaksCashAvailableEl = document.getElementById("peaksCashAvailable");
+				    const standardChartMount = document.getElementById("standardChartMount");
+				    const peaksChartMount = document.getElementById("peaksChartMount");
+				    const priceCardEl = document.getElementById("priceCard");
+	    const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
+	    const tabStandardEl = document.getElementById("tab-standard");
     const tabPeaksEl = document.getElementById("tab-peaks");
 
 		    const PIN_KEY = "osrs_ge_pins_v3";
@@ -792,6 +825,7 @@ const HTML = `<!DOCTYPE html>
 	        const PEAKS_CONFIGS_KEY = "osrs_ge_peaks_configs_v1";
 	        const PEAKS_ACTIVE_CONFIG_ID_KEY = "osrs_ge_peaks_active_config_id_v1";
 	        const PEAKS_CUSTOM_STATE_KEY = "osrs_ge_peaks_custom_state_v1";
+          const CASH_AVAILABLE_GP_KEY = "osrs_ge_cash_available_gp_v1";
 
 	    let overviewSignals = [];
 	    let dailySnapshot = null;
@@ -832,11 +866,12 @@ const HTML = `<!DOCTYPE html>
 				    const DEFAULT_PEAK_WEIGHT = 100;
 				    let peaksPercentWeights = {};
 				    let peaksColumnFilters = {};
-            let peaksColumnPrefs = { order: [], hidden: {} };
+				    let peaksColumnPrefs = { order: [], hidden: {} };
             let peaksColumnMeta = [];
             let peaksColumnMetaSignature = "";
             let peaksColumnsDetailsOpen = false;
             let peaksColumnDragKey = null;
+            let cashAvailableGp = 0;
 	          let peaksConfigs = [];
 	          let peaksActiveConfigId = null; // null => "Custom"
 				    let peaksSortPaneMode = "weights";
@@ -1642,10 +1677,10 @@ const HTML = `<!DOCTYPE html>
 					    peaksColumnFilters = loadPeaksFilters();
               peaksColumnPrefs = loadPeaksColumnPrefs();
 
-	            function clampInt(v, lo, hi) {
-	              const n = Math.round(clampNumber(v, lo, hi));
-	              return Number.isFinite(n) ? n : lo;
-	            }
+		            function clampInt(v, lo, hi) {
+		              const n = Math.round(clampNumber(v, lo, hi));
+		              return Number.isFinite(n) ? n : lo;
+		            }
 
             function cloneJsonSafe(obj) {
               try {
@@ -2056,37 +2091,107 @@ const HTML = `<!DOCTYPE html>
 					      try {
 					        return window.localStorage.getItem(PEAKS_SHOW_AS_PCT_KEY) === "1";
 				      } catch (_) {
-		        return false;
-		      }
-		    }
-
-		    function savePeaksShowAsPercent(v) {
-		      try {
-		        window.localStorage.setItem(PEAKS_SHOW_AS_PCT_KEY, v ? "1" : "0");
-		      } catch (_) {}
-		    }
-
-		    function updatePeaksShowAsPercentButton() {
-		      if (!peaksShowAsPctBtn) return;
-		      peaksShowAsPctBtn.classList.toggle("active", peaksShowAsPercent);
-		      peaksShowAsPctBtn.textContent = peaksShowAsPercent ? "Show Raw" : "Show Rank%";
-		    }
-
-		    peaksShowAsPercent = loadPeaksShowAsPercent();
-		    updatePeaksShowAsPercentButton();
-			    if (peaksShowAsPctBtn) {
-			      peaksShowAsPctBtn.addEventListener("click", () => {
-			        peaksShowAsPercent = !peaksShowAsPercent;
-			        savePeaksShowAsPercent(peaksShowAsPercent);
-			        updatePeaksShowAsPercentButton();
-			        peaksCurrentPage = 1;
-			        renderPeaksTable();
-			      });
+			        return false;
+			      }
 			    }
 
-			    function normalizePeaksSearchQuery(q) {
-			      return (q || "").trim().toLowerCase();
+			    function savePeaksShowAsPercent(v) {
+			      try {
+			        window.localStorage.setItem(PEAKS_SHOW_AS_PCT_KEY, v ? "1" : "0");
+			      } catch (_) {}
 			    }
+
+          function parseGpAmount(raw) {
+            const s = String(raw == null ? "" : raw)
+              .trim()
+              .toLowerCase()
+              .replace(/[, _]/g, "");
+            if (!s) return 0;
+
+            const m = s.match(/^([0-9]*\.?[0-9]+)([kmb])?$/);
+            if (!m) {
+              const nFallback = Number(s);
+              return Number.isFinite(nFallback) && nFallback > 0 ? Math.floor(nFallback) : 0;
+            }
+
+            const n = Number(m[1]);
+            if (!Number.isFinite(n) || n <= 0) return 0;
+            const suffix = m[2] || "";
+            const mult = suffix === "b" ? 1_000_000_000 : suffix === "m" ? 1_000_000 : suffix === "k" ? 1_000 : 1;
+            const out = Math.floor(n * mult);
+            return Number.isFinite(out) && out > 0 ? out : 0;
+          }
+
+          function loadCashAvailableGp() {
+            try {
+              const raw = window.localStorage.getItem(CASH_AVAILABLE_GP_KEY);
+              if (!raw) return 0;
+              return parseGpAmount(raw);
+            } catch (_) {
+              return 0;
+            }
+          }
+
+          function saveCashAvailableGp(v) {
+            try {
+              const n = Number(v);
+              if (!Number.isFinite(n) || n <= 0) {
+                window.localStorage.removeItem(CASH_AVAILABLE_GP_KEY);
+                return;
+              }
+              window.localStorage.setItem(CASH_AVAILABLE_GP_KEY, String(Math.floor(n)));
+            } catch (_) {}
+          }
+
+			    function updatePeaksShowAsPercentButton() {
+			      if (!peaksShowAsPctBtn) return;
+			      peaksShowAsPctBtn.classList.toggle("active", peaksShowAsPercent);
+			      peaksShowAsPctBtn.textContent = peaksShowAsPercent ? "Show Raw" : "Show Rank%";
+			    }
+
+			    peaksShowAsPercent = loadPeaksShowAsPercent();
+			    updatePeaksShowAsPercentButton();
+				    if (peaksShowAsPctBtn) {
+				      peaksShowAsPctBtn.addEventListener("click", () => {
+				        peaksShowAsPercent = !peaksShowAsPercent;
+				        savePeaksShowAsPercent(peaksShowAsPercent);
+				        updatePeaksShowAsPercentButton();
+				        peaksCurrentPage = 1;
+				        renderPeaksTable();
+				      });
+				    }
+
+            cashAvailableGp = loadCashAvailableGp();
+            if (peaksCashAvailableEl) {
+              peaksCashAvailableEl.value = cashAvailableGp > 0 ? cashAvailableGp.toLocaleString("en-US") : "";
+              peaksCashAvailableEl.addEventListener("input", () => {
+                cashAvailableGp = parseGpAmount(peaksCashAvailableEl.value);
+                saveCashAvailableGp(cashAvailableGp);
+                peaksCurrentPage = 1;
+                schedulePeaksTableRender();
+              });
+              peaksCashAvailableEl.addEventListener("keydown", (ev) => {
+                if (ev.key === "Enter") {
+                  cashAvailableGp = parseGpAmount(peaksCashAvailableEl.value);
+                  saveCashAvailableGp(cashAvailableGp);
+                  peaksCurrentPage = 1;
+                  renderPeaksTable();
+                  try {
+                    peaksCashAvailableEl.blur();
+                  } catch (_) {}
+                }
+              });
+              peaksCashAvailableEl.addEventListener("blur", () => {
+                cashAvailableGp = parseGpAmount(peaksCashAvailableEl.value);
+                saveCashAvailableGp(cashAvailableGp);
+                peaksCashAvailableEl.value =
+                  cashAvailableGp > 0 ? cashAvailableGp.toLocaleString("en-US") : "";
+              });
+            }
+
+				    function normalizePeaksSearchQuery(q) {
+				      return (q || "").trim().toLowerCase();
+				    }
 
 			    function setPeaksSearchQuery(q) {
 			      peaksSearchQuery = normalizePeaksSearchQuery(q);
@@ -3303,19 +3408,29 @@ const HTML = `<!DOCTYPE html>
         return mapEntry && Number.isFinite(mapEntry.limit) ? mapEntry.limit : null;
       }
 
-      function getVolume24h(row) {
-        const itemId = Number(row && row.item_id);
-        if (Number.isFinite(itemId)) {
-          const dailyVol = volumes24hById.get(itemId);
-          if (Number.isFinite(dailyVol)) return dailyVol;
-        }
-        const v = getPeaksMetric(row, "volume_24h");
-        return Number.isFinite(v) ? v : null;
-      }
-
-	      function formatCount(v) {
-	        return Number.isFinite(v) ? Math.round(v).toLocaleString("en-US") : "-";
+	      function getVolume24h(row) {
+	        const itemId = Number(row && row.item_id);
+	        if (Number.isFinite(itemId)) {
+	          const dailyVol = volumes24hById.get(itemId);
+	          if (Number.isFinite(dailyVol)) return dailyVol;
+	        }
+	        const v = getPeaksMetric(row, "volume_24h");
+	        return Number.isFinite(v) ? v : null;
 	      }
+
+        function getCashUnitsLimit(row) {
+          if (!(cashAvailableGp && Number.isFinite(cashAvailableGp) && cashAvailableGp > 0)) {
+            return null;
+          }
+          const lowAvg = getPeaksMetric(row, "low_avg_price");
+          if (!Number.isFinite(lowAvg) || !(lowAvg > 0)) return null;
+          const units = Math.floor(cashAvailableGp / lowAvg);
+          return Number.isFinite(units) && units >= 0 ? units : null;
+        }
+
+		      function formatCount(v) {
+		        return Number.isFinite(v) ? Math.round(v).toLocaleString("en-US") : "-";
+		      }
 
 	      function formatDays(v) {
 	        return Number.isFinite(v) ? v.toFixed(1) : "-";
@@ -3333,22 +3448,31 @@ const HTML = `<!DOCTYPE html>
               {
                 key: "above_below_profit_24h",
                 header: "Above-Below 24 Profit",
-                value: (row) => {
-                  const diff = getPeaksMetric(row, "above_below_diff");
-                  const cap = getTradingCap(row);
-                  const vol = getVolume24h(row);
-                  if (
-                    !Number.isFinite(diff) ||
-                    !Number.isFinite(cap) ||
-                    !Number.isFinite(vol)
-                  ) {
-                    return null;
-                  }
-                  const units = Math.min(6 * cap, vol);
-                  return Number.isFinite(units) ? diff * units : null;
-                },
-                format: formatProfitGp
-              },
+	                value: (row) => {
+	                  const diff = getPeaksMetric(row, "above_below_diff");
+	                  const cap = getTradingCap(row);
+	                  const vol = getVolume24h(row);
+	                  if (
+	                    !Number.isFinite(diff) ||
+	                    !Number.isFinite(cap) ||
+	                    !Number.isFinite(vol)
+	                  ) {
+	                    return null;
+	                  }
+		                  let units = Math.min(6 * cap, vol);
+		                  if (cashAvailableGp && Number.isFinite(cashAvailableGp) && cashAvailableGp > 0) {
+		                    const lowAvg = getPeaksMetric(row, "low_avg_price");
+		                    if (Number.isFinite(lowAvg) && lowAvg > 0) {
+		                      const cashUnits = Math.floor(cashAvailableGp / lowAvg);
+		                      if (Number.isFinite(cashUnits) && cashUnits >= 0) {
+		                        units = Math.min(units, cashUnits);
+		                      }
+		                    }
+		                  }
+		                  return Number.isFinite(units) ? diff * units : null;
+		                },
+	                format: formatProfitGp
+	              },
 			        {
 			          key: "trading_cap",
 			          header: "Trading Volume Cap",
@@ -3514,23 +3638,27 @@ const HTML = `<!DOCTYPE html>
 	        {
 	          key: "profit_24h",
 	          header: "24 Trading Profit",
-	          value: (row) => {
+		          value: (row) => {
+		            const diff = getPriceDifference(row);
+		            const vol = getVolume24h(row);
+                const cashUnits = getCashUnitsLimit(row);
+                const units = Math.min(vol, cashUnits != null ? cashUnits : Infinity);
+		            return Number.isFinite(diff) && Number.isFinite(units) ? diff * units : null;
+			          },
+			          format: formatProfitGp
+			        },
+		        {
+		          key: "profit_cap",
+		          header: "Cap Trading Profit",
+		          value: (row) => {
 	            const diff = getPriceDifference(row);
-	            const vol = getVolume24h(row);
-	            return Number.isFinite(diff) && Number.isFinite(vol) ? diff * vol : null;
+	            const cap = getTradingCap(row);
+              const cashUnits = getCashUnitsLimit(row);
+              const units = Math.min(cap, cashUnits != null ? cashUnits : Infinity);
+	            return Number.isFinite(diff) && Number.isFinite(units) ? diff * units : null;
 		          },
 		          format: formatProfitGp
 		        },
-	        {
-	          key: "profit_cap",
-	          header: "Cap Trading Profit",
-	          value: (row) => {
-            const diff = getPriceDifference(row);
-            const cap = getTradingCap(row);
-            return Number.isFinite(diff) && Number.isFinite(cap) ? diff * cap : null;
-	          },
-	          format: formatProfitGp
-	        },
 		        {
 		          key: "time_since_last_peak_days",
 		          header: "Time Since Last Peak",
