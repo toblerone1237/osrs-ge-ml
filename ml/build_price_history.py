@@ -9,8 +9,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from features import get_r2_client, list_keys_with_prefix
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return value if value > 0 else default
+
+
 # How far back to build history (in days)
-MAX_HISTORY_DAYS = 14
+MAX_HISTORY_DAYS = _env_int("MAX_HISTORY_DAYS", 14)
 
 # Keep full 5m resolution for this many hours, then downsample older data
 RECENT_WINDOW_HOURS = 24

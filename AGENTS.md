@@ -82,7 +82,7 @@ Analytics & QA (ml/analyse_sigma_buckets.py, ml/backtest*.py, ml/check_recent_ac
 - **Inputs:** R2 `5m` snapshots (iterating over recent days), existing `history/{item}.json` files, and `history/_meta.json` to resume from the last processed key.
 - **Outputs / Side Effects:** Writes `history/{item_id}.json` with ordered `{"timestamp_iso","price"}` arrays and updates `history/_meta.json` (tracks `last_processed_key` and generation time). Updates only files that change.
 - **External Dependencies:** Same Python + R2 credential stack; uses `ThreadPoolExecutor` for concurrent downloads/writes.
-- **Configuration:** Constants for retention (`MAX_HISTORY_DAYS=14`), resolutions (`RECENT_WINDOW_HOURS=24`, `OLDER_INTERVAL_MIN=30`), worker counts via env (`SNAPSHOT_FETCH_WORKERS`, `HISTORY_FETCH_WORKERS`, `HISTORY_WRITE_WORKERS`).
+- **Configuration:** Retention (`MAX_HISTORY_DAYS`, default 14), resolutions (`RECENT_WINDOW_HOURS=24`, `OLDER_INTERVAL_MIN=30`), worker counts via env (`SNAPSHOT_FETCH_WORKERS`, `HISTORY_FETCH_WORKERS`, `HISTORY_WRITE_WORKERS`).
 - **Interactions:** `osrs-ge-ui` relies on these history files to render past prices and only falls back to pure 5m data if missing. The `_meta` checkpoint prevents reprocessing old snapshots.
 - **Caveats / Notes:** A missing or stale `_meta` triggers a full rebuild, which can be expensive because it downloads every stored `5m` file. Snapshots are assumed to exist for every 5-minute bucket; gaps produce sparse histories.
 
