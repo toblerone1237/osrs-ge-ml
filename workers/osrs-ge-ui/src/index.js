@@ -3422,9 +3422,9 @@ const HTML = `<!DOCTYPE html>
           if (!(cashAvailableGp && Number.isFinite(cashAvailableGp) && cashAvailableGp > 0)) {
             return null;
           }
-          const lowAvg = getPeaksMetric(row, "low_avg_price");
-          if (!Number.isFinite(lowAvg) || !(lowAvg > 0)) return null;
-          const units = Math.floor(cashAvailableGp / lowAvg);
+          const belowMeanAvg = getPeaksMetric(row, "below_mean_avg_price");
+          if (!Number.isFinite(belowMeanAvg) || !(belowMeanAvg > 0)) return null;
+          const units = Math.floor(cashAvailableGp / belowMeanAvg);
           return Number.isFinite(units) && units >= 0 ? units : null;
         }
 
@@ -3452,27 +3452,19 @@ const HTML = `<!DOCTYPE html>
 	                  const diff = getPeaksMetric(row, "above_below_diff");
 	                  const cap = getTradingCap(row);
 	                  const vol = getVolume24h(row);
-	                  if (
-	                    !Number.isFinite(diff) ||
-	                    !Number.isFinite(cap) ||
-	                    !Number.isFinite(vol)
-	                  ) {
-	                    return null;
-	                  }
-		                  let units = Math.min(6 * cap, vol);
-		                  if (cashAvailableGp && Number.isFinite(cashAvailableGp) && cashAvailableGp > 0) {
-		                    const lowAvg = getPeaksMetric(row, "low_avg_price");
-		                    if (Number.isFinite(lowAvg) && lowAvg > 0) {
-		                      const cashUnits = Math.floor(cashAvailableGp / lowAvg);
-		                      if (Number.isFinite(cashUnits) && cashUnits >= 0) {
-		                        units = Math.min(units, cashUnits);
-		                      }
-		                    }
+		                  if (
+		                    !Number.isFinite(diff) ||
+		                    !Number.isFinite(cap) ||
+		                    !Number.isFinite(vol)
+		                  ) {
+		                    return null;
 		                  }
-		                  return Number.isFinite(units) ? diff * units : null;
-		                },
-	                format: formatProfitGp
-	              },
+                      const cashUnits = getCashUnitsLimit(row);
+			                  const units = Math.min(6 * cap, vol, cashUnits != null ? cashUnits : Infinity);
+			                  return Number.isFinite(units) ? diff * units : null;
+			                },
+		                format: formatProfitGp
+		              },
 			        {
 			          key: "trading_cap",
 			          header: "Trading Volume Cap",
